@@ -1,0 +1,45 @@
+# Local-only files — design docs, handoff prompts, anything not for distribution
+_private/
+.claude/
+
+# Ansible
+*.retry
+.vault-pass
+.vault_pass
+ansible.log
+
+# Rendered seed-ISO contents (per-VM, generated)
+ansible/files/rendered/
+ansible/files/*-seed.iso
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local logs
+logs/
+*.log
+
+# Local override files (per-user)
+inventory/local.yml
+group_vars/local.yml
+
+# VM data should NEVER be in this repo — it lives at /home/madmin/vm-lab/
+# But just in case:
+*.qcow2
+*.iso
+disks/
+seed-iso/
+backups/
+snapshots/
