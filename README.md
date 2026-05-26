@@ -152,7 +152,7 @@ ansible-playbook playbooks/site.yml
 
 ## Project status
 
-🚧 **Phase 0 (design + docs) complete. Phase 1 (implementation) in progress.**
+🚧 **Under Construction**
 
 This README will be updated as implementation lands. For up-to-date design rationale and architectural decisions, see the `docs/` directory in this repository.
 
