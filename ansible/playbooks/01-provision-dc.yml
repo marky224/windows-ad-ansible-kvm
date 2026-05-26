@@ -13,12 +13,7 @@
   vars:
     vm_name: ADDC01-corp
     vm_mac: "52:54:00:00:00:10"                            # matches static IP last octet for cleanliness
-    # BLOCKER: current Server 2025 eval ISO copy fails BCD parse at bootmgr
-    # (status 0xc000014c on \EFI\Microsoft\Boot\BCD). Win 11 ISO with the same
-    # VM config boots Setup cleanly, so the firmware/storage stack is OK; the
-    # ISO BCD itself is the problem. Action: re-download from MS Evaluation
-    # Center and verify SHA256 before the next playbook run. See handoff.
-    vm_install_iso: "{{ iso_paths.windows_server_2025 }}"
+    vm_install_iso: "{{ iso_paths.windows_server_2025 }}"   # pristine source; role re-masters into per-VM custom ISO
     vm_wim_image_name: "Windows Server 2025 SERVERSTANDARD"
     vm_static_ip: "{{ corp_subnet.dc_ip }}"
     vm_default_gateway: "{{ corp_subnet.gateway }}"

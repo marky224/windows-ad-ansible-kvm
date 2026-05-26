@@ -1,15 +1,26 @@
 ---
-# Generic Windows VM provisioner (ADR-018, ADR-020, ADR-021, ADR-024).
+# Generic Windows VM provisioner (ADR-018, ADR-020, ADR-021, ADR-024 + new ADRs
+# pending for the milestone-2 unblock work).
 #
 # Expects (set by caller):
 #   vm_name, vm_install_iso, vm_wim_image_name
 # Optional (Autounattend static-IP block conditional):
 #   vm_static_ip, vm_default_gateway, vm_dns_servers
 #
+# Architecture (post-milestone-2 unblock):
+#   Server 2025's redesigned 24H2 ("windlp") installer does NOT auto-scan
+#   separate removable media for Autounattend.xml the way classic Setup did.
+#   We re-master the install ISO per-VM to embed Autounattend.xml at root +
+#   a $WinpeDriver$ folder for vioscsi/viostor (WinPE auto-loads anything in
+#   $WinpeDriver$, eliminating the chicken-and-egg "load driver to see disk"
+#   problem). BOOTX64.EFI is also swapped for cdboot_noprompt.efi so the
+#   "Press any key to boot from CD" prompt is bypassed unattended.
+#
 # Idempotency:
-#   - disk allocation: `creates:` guard on qemu-img
-#   - libvirt define: virt module is idempotent for matching XML
-#   - seed ISO + bootstrap.ps1: always regenerated (cheap, deterministic)
+#   - shared install-iso extraction + driver injection: creates: guards
+#   - per-VM custom install ISO: rebuilt every run (Autounattend can change)
+#   - disk allocation: creates: on qemu-img
+#   - libvirt define: virsh list pre-check + community.libvirt.virt is idempotent
 
 - name: "kvm_windows_vm | sanity-check required inputs"
   ansible.builtin.assert:
@@ -19,7 +30,63 @@
       - vm_wim_image_name is defined
     fail_msg: "kvm_windows_vm needs vm_name, vm_install_iso, vm_wim_image_name"
 
-- name: "kvm_windows_vm | ensure VM data dirs exist"
+# === Shared install-iso stage (built once, reused across all VMs) ============
+
+- name: "kvm_windows_vm | ensure shared install-iso stage dir exists"
+  ansible.builtin.file:
+    path: "{{ vm_install_stage_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: "kvm_windows_vm | ensure ISO loop-mount point exists"
+  become: true
+  ansible.builtin.file:
+    path: "{{ vm_install_stage_mount }}"
+    state: directory
+    mode: '0755'
+
+# Server 2025 install ISO is UDF-primary with only an ISO9660 stub; xorriso
+# osirrox-extract sees only README.TXT. Loop-mount + rsync gets us the full
+# UDF tree reliably. set -eu + trap ensures the mount is always released.
+- name: "kvm_windows_vm | extract pristine install ISO to shared stage (loop-mount + rsync)"
+  become: true
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      if mountpoint -q {{ vm_install_stage_mount | quote }}; then
+        umount {{ vm_install_stage_mount | quote }}
+      fi
+      mount -o loop,ro {{ vm_install_iso | quote }} {{ vm_install_stage_mount | quote }}
+      trap 'umount {{ vm_install_stage_mount | quote }}' EXIT
+      rsync -a --no-perms --no-owner --no-group --chmod=u=rwX,g=rX,o=rX \
+        {{ vm_install_stage_mount | quote }}/ {{ vm_install_stage_dir | quote }}/
+      chown -R "${SUDO_USER:-root}:${SUDO_USER:-root}" {{ vm_install_stage_dir | quote }}
+    creates: "{{ vm_install_stage_dir }}/setup.exe"
+    executable: /bin/bash
+
+- name: "kvm_windows_vm | inject virtio storage drivers into shared stage's $WinpeDriver$"
+  ansible.builtin.command:
+    argv:
+      - xorriso
+      - -osirrox
+      - 'on'
+      - -indev
+      - "{{ vm_virtio_win_iso }}"
+      - -extract
+      - /amd64/2k25
+      - "{{ vm_install_stage_dir }}/$WinpeDriver$"
+    creates: "{{ vm_install_stage_dir }}/$WinpeDriver$/vioscsi.inf"
+
+- name: "kvm_windows_vm | swap BOOTX64.EFI for cdboot_noprompt.efi (skip CD-boot prompt)"
+  ansible.builtin.copy:
+    src: "{{ vm_install_stage_dir }}/efi/microsoft/boot/cdboot_noprompt.efi"
+    dest: "{{ vm_install_stage_dir }}/efi/boot/bootx64.efi"
+    remote_src: true
+    mode: '0644'
+
+# === Per-VM ==================================================================
+
+- name: "kvm_windows_vm | ensure per-VM data dirs exist"
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
@@ -40,26 +107,56 @@
     name: "{{ vm_disk_pool }}"
     command: refresh
 
-- name: "kvm_windows_vm | render Autounattend.xml into staging"
+- name: "kvm_windows_vm | render Autounattend.xml into per-VM staging"
   ansible.builtin.template:
     src: Autounattend.xml.j2
     dest: "{{ vm_seed_staging_dir }}/Autounattend.xml"
     mode: '0644'
 
-- name: "kvm_windows_vm | render bootstrap.ps1 into staging"
+- name: "kvm_windows_vm | render bootstrap.ps1 into per-VM staging"
   ansible.builtin.template:
     src: bootstrap.ps1.j2
     dest: "{{ vm_seed_staging_dir }}/bootstrap.ps1"
     mode: '0644'
 
-- name: "kvm_windows_vm | build seed ISO {{ vm_seed_iso_path }}"
+- name: "kvm_windows_vm | build per-VM custom install ISO {{ vm_custom_install_iso_path }}"
   ansible.builtin.command:
-    cmd: >-
-      xorriso -as mkisofs
-      -o {{ vm_seed_iso_path }}
-      -V WINUNATTEND
-      -r -J -joliet-long
-      {{ vm_seed_staging_dir }}/
+    argv:
+      - xorriso
+      - -as
+      - mkisofs
+      - -o
+      - "{{ vm_custom_install_iso_path }}"
+      - -iso-level
+      - "4"
+      - -joliet
+      - -joliet-long
+      - -rock
+      - -V
+      - "{{ vm_install_iso_volid }}"
+      - -no-emul-boot                                       # UEFI El Torito: hand efisys_noprompt.bin to firmware
+      - -e
+      - efi/microsoft/boot/efisys_noprompt.bin              # path inside output ISO (no leading /)
+      - -graft-points
+      - "/={{ vm_install_stage_dir }}"
+      - "/Autounattend.xml={{ vm_seed_staging_dir }}/Autounattend.xml"
+  changed_when: true
+
+- name: "kvm_windows_vm | build per-VM seed ISO {{ vm_seed_iso_path }} (bootstrap.ps1 only)"
+  ansible.builtin.command:
+    argv:
+      - xorriso
+      - -as
+      - mkisofs
+      - -o
+      - "{{ vm_seed_iso_path }}"
+      - -V
+      - WINUNATTEND
+      - -r
+      - -J
+      - -joliet-long
+      - -graft-points
+      - "/bootstrap.ps1={{ vm_seed_staging_dir }}/bootstrap.ps1"
   changed_when: true
 
 - name: "kvm_windows_vm | refresh corp-iso pool"
@@ -70,8 +167,8 @@
 # Ubuntu's OVMF won't auto-add removable media to BootOrder on fresh NVRAM, so
 # the VM drops to UEFI Interactive Shell instead of booting the install ISO.
 # Pre-enroll BootOrder pointing at the standard fallback EFI loader path
-# (\EFI\BOOT\BOOTX64.EFI) — OVMF walks each storage device looking for that
-# path and finds it on the Windows install ISO's EFI partition.
+# (\EFI\BOOT\BOOTX64.EFI) — which the custom-install-ISO build has swapped
+# to cdboot_noprompt.efi for unattended boot.
 - name: "kvm_windows_vm | pre-enroll BootOrder in per-VM NVRAM {{ vm_nvram_path }}"
   ansible.builtin.shell:
     cmd: >-
@@ -86,8 +183,9 @@
   changed_when: false
   check_mode: false
 
-# virt-install defines + starts in one step. Per-device boot.order on the
-# install ISO drives boot once the pre-enrolled NVRAM BootOrder is in place.
+# virt-install defines + starts in one step. Custom install ISO carries the
+# Autounattend + $WinpeDriver$; virtio-win CD-ROM stays attached so post-OS
+# roles (guest-tools install, etc.) can find it.
 - name: "kvm_windows_vm | provision libvirt domain {{ vm_name }} via virt-install"
   ansible.builtin.command:
     cmd: >-
@@ -102,7 +200,7 @@
       {% if vm_enable_tpm | bool %}--tpm model=tpm-crb,backend.type=emulator,backend.version={{ vm_tpm_version }}{% else %}--tpm none{% endif %}
       --controller scsi,model=virtio-scsi
       --disk path={{ vm_disk_path }},bus=scsi,format=qcow2
-      --disk path={{ vm_install_iso }},device=cdrom,bus=scsi,boot.order=1
+      --disk path={{ vm_custom_install_iso_path }},device=cdrom,bus=scsi,boot.order=1
       --disk path={{ vm_virtio_win_iso }},device=cdrom,bus=sata
       --disk path={{ vm_seed_iso_path }},device=cdrom,bus=sata
       --network network={{ vm_network }},model=virtio{% if vm_mac is defined %},mac={{ vm_mac }}{% endif %}

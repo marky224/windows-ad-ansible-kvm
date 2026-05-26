@@ -30,22 +30,9 @@
                xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
 
-      <!-- Tell Setup where to find virtio-scsi drivers on the secondary CD-ROM. -->
-      <!-- Letters vary; we list common Windows-side mounts that Setup will scan. -->
-      <DriverPaths>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="1">
-          <Path>E:\amd64\2k25</Path>
-        </PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="2">
-          <Path>E:\amd64\2k22</Path>
-        </PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="3">
-          <Path>F:\amd64\2k25</Path>
-        </PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="4">
-          <Path>F:\amd64\2k22</Path>
-        </PathAndCredentials>
-      </DriverPaths>
+      <!-- DriverPaths intentionally omitted: virtio-scsi drivers live in the
+           install ISO's $WinpeDriver$ folder, which WinPE auto-loads before
+           Autounattend is processed. No drive-letter guessing required. -->
 
       <DiskConfiguration>
         <WillShowUI>OnError</WillShowUI>

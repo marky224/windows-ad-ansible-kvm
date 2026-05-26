@@ -38,6 +38,18 @@ vm_keyboard_layout: "0409:00000409"
 vm_virtio_win_iso: "{{ iso_paths.virtio_win }}"
 vm_seed_iso_dir: "{{ seed_iso_dir }}"     # output dir for the per-VM Autounattend ISO
 
+# --- Custom install ISO (Server 2025's redesigned 24H2 "windlp" installer
+# does NOT auto-scan separate removable media for Autounattend.xml. Empirical
+# evidence: windlp.state.xml has no reference to a seed-ISO Autounattend even
+# when present at the volume root. Workaround: re-master the install ISO per-VM
+# with Autounattend.xml at its root + $WinpeDriver$ folder for vioscsi/viostor
+# (WinPE auto-loads anything in $WinpeDriver$). Shared stage is built once,
+# per-VM ISO is built every run since Autounattend has per-VM content.
+vm_install_stage_dir: "{{ vm_lab_root }}/install-iso-stage"
+vm_install_stage_mount: "/mnt/install-iso-pristine"     # ephemeral loop mount
+vm_custom_install_iso_path: "{{ vm_seed_iso_dir }}/{{ vm_name }}-install.iso"
+vm_install_iso_volid: "WINSRV2025_CORPLAB"
+
 # --- WinRM wait (post-boot) ---
 vm_wait_for_winrm: true
 vm_winrm_port: 5986
