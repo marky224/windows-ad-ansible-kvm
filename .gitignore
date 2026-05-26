@@ -34,8 +34,10 @@ logs/
 # Local override files (per-user)
 inventory/local.yml
 group_vars/local.yml
+# Per-host overrides for the KVM host running this playbook; copy from .example.
+ansible/inventory/host_vars/localhost.yml
 
-# VM data should NEVER be in this repo — it lives at /home/madmin/vm-lab/
+# VM data should NEVER be in this repo — it lives outside, at $HOME/vm-lab by default.
 # But just in case:
 *.qcow2
 *.iso

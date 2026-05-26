@@ -1,0 +1,16 @@
+---
+# Per-host overrides for the KVM host that runs this playbook.
+#
+# Copy this file to localhost.yml (without the .example suffix) and edit if
+# the defaults in group_vars/all/main.yml don't fit your layout. The actual
+# `localhost.yml` is gitignored so your per-deployment paths stay private.
+#
+# Usage:
+#   cp inventory/host_vars/localhost.yml.example inventory/host_vars/localhost.yml
+#   $EDITOR inventory/host_vars/localhost.yml
+
+# Where VM disks, ISOs, seed ISOs, backups, snapshots live.
+# Default in group_vars/all/main.yml is "{{ lookup('env', 'HOME') }}/vm-lab"
+# (i.e. ~/vm-lab for whoever runs ansible-playbook).
+#
+# vm_lab_root: /srv/lab/kvm

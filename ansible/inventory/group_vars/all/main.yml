@@ -1,5 +1,5 @@
 ---
-# Shared lab constants. Loaded for every host. See group_vars/all/vault.yml for secrets.
+# Shared lab constants. Loaded for every host. See inventory/group_vars/all/vault.yml for secrets.
 
 # --- Forest / domain ---
 forest:
@@ -20,11 +20,13 @@ corp_subnet:
 
 # --- libvirt storage pools (ADR-024) ---
 libvirt_pools:
-  disks: corp-disks    # /home/madmin/vm-lab/disks
-  iso: corp-iso        # /home/madmin/vm-lab/iso
+  disks: corp-disks    # backed by {{ vm_lab_root }}/disks
+  iso: corp-iso        # backed by {{ vm_lab_root }}/iso
 
 # --- Host paths (control node = same host as KVM hypervisor) ---
-vm_lab_root: /home/madmin/vm-lab
+# Default resolves to $HOME/vm-lab on the control node.
+# Override in inventory/host_vars/localhost.yml if a different layout is needed.
+vm_lab_root: "{{ lookup('env', 'HOME') }}/vm-lab"
 iso_dir: "{{ vm_lab_root }}/iso"
 seed_iso_dir: "{{ vm_lab_root }}/seed-iso"
 backups_dir: "{{ vm_lab_root }}/backups"

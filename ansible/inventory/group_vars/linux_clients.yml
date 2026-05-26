@@ -1,9 +1,9 @@
 ---
-# Linux client connection (cloud-init provisions an initial 'madmin' user; ad_join
-# adds realmd/sssd and joins the realm).
+# Linux client connection (cloud-init provisions an initial 'labadmin' user; the
+# domain_join_linux role adds realmd/sssd and joins the realm).
 
 ansible_connection: ssh
-ansible_user: madmin
+ansible_user: labadmin
 ansible_become: true
 ansible_become_method: sudo
 
