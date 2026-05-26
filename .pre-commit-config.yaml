@@ -1,0 +1,9 @@
+# Pre-commit hooks. Install with:  pre-commit install
+# Docs: https://pre-commit.com
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        # Default entry: `gitleaks git --pre-commit --redact --staged --verbose`
+        # Only scans what's about to be committed — fast, blocks the commit on a hit.

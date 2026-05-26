@@ -1,0 +1,27 @@
+# Gitleaks configuration — extends the built-in ruleset.
+# Docs: https://github.com/gitleaks/gitleaks#configuration
+
+[extend]
+useDefault = true
+
+# Repo-wide allowlist. Anything matched here is ignored by every rule.
+[allowlist]
+description = "Lab-repo allowlist: Ansible vault placeholders, example/template files, and rendered fixtures."
+
+paths = [
+  # Local-only design docs and handoff prompts (already gitignored, belt-and-suspenders).
+  '''^_private/''',
+  # Example files are documentation, not real config.
+  '''\.example$''',
+  '''\.example\.ya?ml$''',
+  # Per-VM rendered seed-ISO contents are generated, never committed, but ignore if they ever leak in.
+  '''^ansible/files/rendered/''',
+]
+
+regexes = [
+  # Ansible vault variable references: "{{ vault_anything }}" — never a real secret.
+  '''\{\{\s*vault_[a-zA-Z0-9_]+\s*\}\}''',
+  # Common lab placeholder passwords used in docs/examples.
+  '''ChangeMe[!0-9A-Za-z]*''',
+  '''P@ssw0rd[!0-9A-Za-z]*''',
+]
