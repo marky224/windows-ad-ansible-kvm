@@ -1,0 +1,25 @@
+---
+# Ansible Galaxy collections required for the AD lab.
+# Install: ansible-galaxy collection install -r requirements.yml
+# Versions current as of 2026-05-26 (see _private/handoff/2026-05-26-step3-complete.md).
+
+collections:
+  # AD provisioning + management. v1.11.0 added cs_authority + cs_template (AD CS partly native).
+  - name: microsoft.ad
+    version: ">=1.11.0"
+
+  # Generic Windows modules (win_powershell, win_command, win_copy, win_reboot, etc.).
+  - name: ansible.windows
+    version: ">=2.2.0"
+
+  # Extra community-maintained Windows modules (DNS partial, registry helpers, etc.).
+  - name: community.windows
+
+  # libvirt domain / network / storage management for the KVM host.
+  - name: community.libvirt
+
+  # firewalld, mount, sysctl, etc. for the Ubuntu control node and UBUNTU01-corp.
+  - name: ansible.posix
+
+  # General-purpose modules (archive, ini_file, password generation, etc.).
+  - name: community.general

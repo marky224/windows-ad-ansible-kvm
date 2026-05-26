@@ -1,0 +1,18 @@
+---
+# DC-specific overrides. The Administrator credential post-promotion is the
+# domain Administrator (CORP\Administrator), not the local one.
+ansible_user: "CORP\\Administrator"
+ansible_password: "{{ vault_domain_admin_password }}"
+
+# DC role markers — consumed by ad_* roles.
+dc_role:
+  primary: true
+  hold_fsmo_roles: true
+  install_dhcp: true
+  install_dns: true
+  install_ad_cs: true
+  install_wsus: true
+  is_pdc_time_source: true
+
+# DSRM (Directory Services Restore Mode) password — required by domain.
+safe_mode_password: "{{ vault_safe_mode_password }}"

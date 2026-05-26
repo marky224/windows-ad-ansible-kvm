@@ -1,0 +1,27 @@
+---
+# Static inventory for the corp AD lab.
+# Groups:
+#   - windows (parent): WinRM connection vars in group_vars/windows.yml
+#     - dc: the domain controller (gets ad_* roles)
+#     - clients: domain-joined Win 11 workstations
+#   - linux_clients: domain-joined Ubuntu hosts (SSH)
+# IPs match _private/docs/NETWORK.md (DC owns DHCP, clients have MAC-tied reservations).
+
+all:
+  children:
+    windows:
+      children:
+        dc:
+          hosts:
+            ADDC01-corp:
+              ansible_host: 10.10.0.10
+        clients:
+          hosts:
+            CLIENT01-corp:
+              ansible_host: 10.10.0.50
+            CLIENT02-corp:
+              ansible_host: 10.10.0.51
+    linux_clients:
+      hosts:
+        UBUNTU01-corp:
+          ansible_host: 10.10.0.60

@@ -1,0 +1,14 @@
+---
+# Connection settings for all Windows hosts (parent of [dc] and [clients]).
+# WinRM HTTPS listener is bootstrapped inline via Autounattend <FirstLogonCommands> (ADR-021).
+
+ansible_connection: winrm
+ansible_port: 5986
+ansible_winrm_transport: ntlm
+ansible_winrm_scheme: https
+# Lab CA-issued certs aren't yet trusted by the control node on first contact.
+# Tightened to validate=yes once ad_cs role has issued the Ansible-control-node cert.
+ansible_winrm_server_cert_validation: ignore
+
+ansible_user: Administrator
+ansible_password: "{{ vault_local_admin_password }}"

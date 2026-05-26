@@ -1,0 +1,15 @@
+---
+# Client-specific overrides. Pre-join: connect as local Administrator.
+# Post-join (after domain_join_windows role): switch to CORP\Administrator.
+ansible_user: Administrator
+ansible_password: "{{ vault_local_admin_password }}"
+
+# Per-host network reservations (consumed by ad_dhcp role).
+# IPs match inventory ansible_host values + NETWORK.md.
+client_dhcp_reservations:
+  CLIENT01-corp:
+    mac: "52:54:00:11:11:01"
+    ip: 10.10.0.50
+  CLIENT02-corp:
+    mac: "52:54:00:11:11:02"
+    ip: 10.10.0.51

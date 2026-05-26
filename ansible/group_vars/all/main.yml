@@ -1,0 +1,42 @@
+---
+# Shared lab constants. Loaded for every host. See group_vars/all/vault.yml for secrets.
+
+# --- Forest / domain ---
+forest:
+  fqdn: corp.markandrewmarquez.com
+  netbios: CORP
+
+# --- Network (matches _private/docs/NETWORK.md, ADR-005 + ADR-006) ---
+corp_subnet:
+  cidr: 10.10.0.0/24
+  netmask: 255.255.255.0
+  gateway: 10.10.0.1
+  dc_ip: 10.10.0.10
+  dhcp_scope_start: 10.10.0.100
+  dhcp_scope_end: 10.10.0.199
+  libvirt_network_name: corp-lab
+  libvirt_bridge: virbr-corp
+  mac_oui: "52:54:00"  # libvirt-allocated range
+
+# --- libvirt storage pools (ADR-024) ---
+libvirt_pools:
+  disks: corp-disks    # /home/madmin/vm-lab/disks
+  iso: corp-iso        # /home/madmin/vm-lab/iso
+
+# --- Host paths (control node = same host as KVM hypervisor) ---
+vm_lab_root: /home/madmin/vm-lab
+iso_dir: "{{ vm_lab_root }}/iso"
+seed_iso_dir: "{{ vm_lab_root }}/seed-iso"
+backups_dir: "{{ vm_lab_root }}/backups"
+
+# --- Install media (ADR-018: virtio-win pinned to 0.1.271; never use 0.1.285) ---
+iso_paths:
+  windows_server_2025: "{{ iso_dir }}/WindowsServer2025.iso"
+  windows_11_enterprise: "{{ iso_dir }}/Windows11Enterprise.iso"
+  ubuntu_24_04: "{{ iso_dir }}/noble-server-cloudimg-amd64.img"
+  virtio_win: "{{ iso_dir }}/virtio-win-0.1.271.iso"
+
+# --- WIM edition indices (captured 2026-05-26 from each ISO's sources/install.wim) ---
+wim_edition:
+  windows_server_2025: 2     # "Windows Server 2025 SERVERSTANDARD" — Standard Eval + Desktop Experience
+  windows_11_enterprise: 1   # "Windows 11 Enterprise Evaluation"

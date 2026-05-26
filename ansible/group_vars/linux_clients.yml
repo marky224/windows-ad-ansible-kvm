@@ -1,0 +1,13 @@
+---
+# Linux client connection (cloud-init provisions an initial 'madmin' user; ad_join
+# adds realmd/sssd and joins the realm).
+
+ansible_connection: ssh
+ansible_user: madmin
+ansible_become: true
+ansible_become_method: sudo
+
+linux_client_dhcp_reservations:
+  UBUNTU01-corp:
+    mac: "52:54:00:22:22:01"
+    ip: 10.10.0.60
