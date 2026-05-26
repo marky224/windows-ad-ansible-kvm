@@ -1,0 +1,36 @@
+---
+# Build ADDC01-corp: Server 2025 Std + Desktop Experience, q35 + OVMF (Secure
+# Boot) + swtpm 2.0 + virtio-scsi + virtio-net, on the corp-lab libvirt network.
+# Autounattend.xml drives unattended install + sets static 10.10.0.10. Inline
+# WinRM bootstrap (ADR-021) runs from FirstLogonCommands once Windows reaches
+# OOBE.
+#
+# Run: ansible-playbook playbooks/01-provision-dc.yml
+
+- name: "Provision ADDC01-corp (the domain controller VM)"
+  hosts: kvm_host
+  gather_facts: false
+  vars:
+    vm_name: ADDC01-corp
+    vm_mac: "52:54:00:00:00:10"                            # matches static IP last octet for cleanliness
+    vm_install_iso: "{{ iso_paths.windows_server_2025 }}"
+    vm_wim_image_name: "Windows Server 2025 SERVERSTANDARD"
+    vm_static_ip: "{{ corp_subnet.dc_ip }}"
+    vm_default_gateway: "{{ corp_subnet.gateway }}"
+    vm_netmask_prefix: 24
+    # Temporary public resolver until ad_dns role takes over (which is the
+    # next playbook in the sequence). The DC will point at itself as primary
+    # DNS the moment dcpromo completes.
+    vm_dns_servers:
+      - 1.1.1.1
+      - 8.8.8.8
+    # TPM disabled pending swtpm socket-permission fix (Server 2025 installs
+    # fine without it; Win 11 clients will require it later).
+    vm_enable_tpm: false
+    # Secure Boot disabled for the smoke spike — Ubuntu 24.04's OVMF_VARS_4M.ms.fd
+    # appears to lack pre-enrolled Microsoft keys, so OVMF rejects the signed
+    # Windows boot loader as untrusted. Will re-enable once we either generate a
+    # pre-enrolled template or enroll keys explicitly in a setup pass.
+    vm_secure_boot: false
+  roles:
+    - kvm_windows_vm

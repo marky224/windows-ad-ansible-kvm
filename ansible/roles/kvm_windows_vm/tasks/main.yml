@@ -1,0 +1,88 @@
+---
+# Generic Windows VM provisioner (ADR-018, ADR-020, ADR-021, ADR-024).
+#
+# Expects (set by caller):
+#   vm_name, vm_install_iso, vm_wim_image_name
+# Optional (Autounattend static-IP block conditional):
+#   vm_static_ip, vm_default_gateway, vm_dns_servers
+#
+# Idempotency:
+#   - disk allocation: `creates:` guard on qemu-img
+#   - libvirt define: virt module is idempotent for matching XML
+#   - seed ISO + bootstrap.ps1: always regenerated (cheap, deterministic)
+
+- name: "kvm_windows_vm | sanity-check required inputs"
+  ansible.builtin.assert:
+    that:
+      - vm_name is defined
+      - vm_install_iso is defined
+      - vm_wim_image_name is defined
+    fail_msg: "kvm_windows_vm needs vm_name, vm_install_iso, vm_wim_image_name"
+
+- name: "kvm_windows_vm | ensure VM data dirs exist"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ vm_seed_iso_dir }}"
+    - "{{ vm_seed_staging_dir }}"
+
+- name: "kvm_windows_vm | allocate qcow2 disk {{ vm_disk_path }}"
+  ansible.builtin.command:
+    cmd: >-
+      qemu-img create -f qcow2 -o lazy_refcounts=on
+      {{ vm_disk_path }} {{ vm_disk_gb }}G
+    creates: "{{ vm_disk_path }}"
+
+- name: "kvm_windows_vm | refresh corp-disks pool"
+  community.libvirt.virt_pool:
+    name: "{{ vm_disk_pool }}"
+    command: refresh
+
+- name: "kvm_windows_vm | render Autounattend.xml into staging"
+  ansible.builtin.template:
+    src: Autounattend.xml.j2
+    dest: "{{ vm_seed_staging_dir }}/Autounattend.xml"
+    mode: '0644'
+
+- name: "kvm_windows_vm | render bootstrap.ps1 into staging"
+  ansible.builtin.template:
+    src: bootstrap.ps1.j2
+    dest: "{{ vm_seed_staging_dir }}/bootstrap.ps1"
+    mode: '0644'
+
+- name: "kvm_windows_vm | build seed ISO {{ vm_seed_iso_path }}"
+  ansible.builtin.command:
+    cmd: >-
+      xorriso -as mkisofs
+      -o {{ vm_seed_iso_path }}
+      -V WINUNATTEND
+      -r -J -joliet-long
+      {{ vm_seed_staging_dir }}/
+  changed_when: true
+
+- name: "kvm_windows_vm | refresh corp-iso pool"
+  community.libvirt.virt_pool:
+    name: "{{ libvirt_pools.iso }}"
+    command: refresh
+
+- name: "kvm_windows_vm | define libvirt domain {{ vm_name }}"
+  community.libvirt.virt:
+    command: define
+    xml: "{{ lookup('template', 'domain.xml.j2') }}"
+
+- name: "kvm_windows_vm | start libvirt domain {{ vm_name }}"
+  community.libvirt.virt:
+    name: "{{ vm_name }}"
+    state: running
+
+- name: "kvm_windows_vm | wait for WinRM on {{ vm_static_ip | default('the host') }}:{{ vm_winrm_port }}"
+  ansible.builtin.wait_for:
+    host: "{{ vm_static_ip | default(omit) }}"
+    port: "{{ vm_winrm_port }}"
+    timeout: "{{ vm_winrm_timeout }}"
+    delay: 60
+  when:
+    - vm_wait_for_winrm | bool
+    - vm_static_ip is defined

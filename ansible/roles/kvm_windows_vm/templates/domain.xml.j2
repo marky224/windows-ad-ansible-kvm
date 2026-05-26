@@ -1,0 +1,115 @@
+<domain type='kvm'>
+  <name>{{ vm_name }}</name>
+  <memory unit='MiB'>{{ vm_memory_mb }}</memory>
+  <currentMemory unit='MiB'>{{ vm_memory_mb }}</currentMemory>
+  <vcpu placement='static'>{{ vm_vcpus }}</vcpu>
+
+  <os>
+    <type arch='x86_64' machine='{{ vm_machine_type }}'>hvm</type>
+    <loader readonly='yes' secure='{{ "yes" if vm_secure_boot else "no" }}' type='pflash'>{{ vm_uefi_code_path }}</loader>
+    <nvram template='{{ vm_uefi_vars_template }}'>{{ vm_nvram_path }}</nvram>
+    <bootmenu enable='no'/>
+  </os>
+
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+    </hyperv>
+    <vmport state='off'/>
+{% if vm_secure_boot %}
+    <smm state='on'/>
+{% endif %}
+  </features>
+
+  <cpu mode='host-passthrough' check='none' migratable='on'/>
+
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='hypervclock' present='yes'/>
+  </clock>
+
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <!-- virtio-scsi controller for the OS disk (ADR-020). -->
+    <controller type='scsi' index='0' model='virtio-scsi'/>
+
+    <!-- CD-ROM 1: Windows install media. Bootable at first power-on. -->
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{{ vm_install_iso }}'/>
+      <target dev='sda' bus='sata'/>
+      <boot order='1'/>
+      <readonly/>
+    </disk>
+
+    <!-- Primary disk: qcow2 in corp-disks pool, virtio-scsi.
+         Boots second; once Windows installs its EFI loader, OVMF picks this up. -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap'/>
+      <source file='{{ vm_disk_path }}'/>
+      <target dev='sdb' bus='scsi'/>
+      <boot order='2'/>
+    </disk>
+
+    <!-- CD-ROM 2: virtio-win 0.1.271 (vioscsi + virtio-net drivers). -->
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{{ vm_virtio_win_iso }}'/>
+      <target dev='sdc' bus='sata'/>
+      <readonly/>
+    </disk>
+
+    <!-- CD-ROM 3: per-VM seed ISO with Autounattend.xml + bootstrap.ps1. -->
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{{ vm_seed_iso_path }}'/>
+      <target dev='sdd' bus='sata'/>
+      <readonly/>
+    </disk>
+
+    <!-- Network: virtio-net on corp-lab. -->
+    <interface type='network'>
+      <source network='{{ vm_network }}'/>
+{% if vm_mac is defined %}
+      <mac address='{{ vm_mac }}'/>
+{% endif %}
+      <model type='virtio'/>
+    </interface>
+
+{% if vm_enable_tpm | bool %}
+    <!-- TPM 2.0 emulated via swtpm. -->
+    <tpm model='tpm-crb'>
+      <backend type='emulator' version='{{ vm_tpm_version }}'/>
+    </tpm>
+{% endif %}
+
+    <!-- Console + graphics for OOB debugging. -->
+    <serial type='pty'><target type='isa-serial' port='0'/></serial>
+    <console type='pty'><target type='serial' port='0'/></console>
+    <input type='tablet' bus='usb'/>
+    <input type='keyboard' bus='ps2'/>
+    <graphics type='spice' autoport='yes' listen='127.0.0.1'/>
+    <video><model type='qxl' ram='65536' vram='65536' vgamem='16384'/></video>
+
+    <!-- Memory ballooning + RNG (passes onto guest virtio-rng-pci). -->
+    <memballoon model='virtio'/>
+    <rng model='virtio'><backend model='random'>/dev/urandom</backend></rng>
+
+  </devices>
+</domain>

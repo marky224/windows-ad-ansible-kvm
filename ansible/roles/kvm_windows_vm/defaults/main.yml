@@ -1,0 +1,51 @@
+---
+# Required from caller (no default — playbook or host_vars must set):
+#   vm_name                  e.g. ADDC01-corp
+#   vm_install_iso           absolute path to the Windows install ISO
+#   vm_wim_image_name        WIM image name (e.g. "Windows Server 2025 SERVERSTANDARD")
+# Optional from caller:
+#   vm_static_ip             IPv4 address. If set, Autounattend configures static IP.
+#   vm_default_gateway       used with vm_static_ip
+#   vm_dns_servers           list of DNS server IPs; used with vm_static_ip
+#   vm_netmask_prefix        CIDR prefix length (default 24)
+
+# --- Compute / firmware ---
+vm_memory_mb: 8192
+vm_vcpus: 4
+vm_disk_gb: 150
+vm_machine_type: q35
+vm_os_variant: win2k25                    # libosinfo id; controls Hyper-V enlightenments
+
+# OVMF firmware. Use .ms variants when vm_secure_boot=true (Microsoft keys
+# pre-enrolled — required for Windows boot loader signature check).
+vm_secure_boot: true
+vm_uefi_code_path: "/usr/share/OVMF/OVMF_CODE_4M{{ '.ms' if vm_secure_boot else '' }}.fd"
+vm_uefi_vars_template: "/usr/share/OVMF/OVMF_VARS_4M{{ '.ms' if vm_secure_boot else '' }}.fd"
+vm_enable_tpm: true              # set false to skip TPM (e.g. while swtpm perms TBD)
+vm_tpm_version: "2.0"
+
+# --- Network ---
+vm_network: "{{ corp_subnet.libvirt_network_name }}"
+vm_netmask_prefix: 24
+
+# --- Identity / locale ---
+vm_local_admin_password: "{{ vault_local_admin_password }}"
+vm_timezone: "UTC"
+vm_locale: "en-US"
+vm_keyboard_layout: "0409:00000409"
+
+# --- Media ---
+vm_virtio_win_iso: "{{ iso_paths.virtio_win }}"
+vm_seed_iso_dir: "{{ seed_iso_dir }}"     # output dir for the per-VM Autounattend ISO
+
+# --- WinRM wait (post-boot) ---
+vm_wait_for_winrm: true
+vm_winrm_port: 5986
+vm_winrm_timeout: 1800                    # 30 minutes — Server 2025 unattended install + reboots
+
+# --- Internal paths (rarely overridden) ---
+vm_disk_pool: "{{ libvirt_pools.disks }}"
+vm_disk_path: "{{ vm_lab_root }}/disks/{{ vm_name }}.qcow2"
+vm_nvram_path: "{{ vm_lab_root }}/disks/{{ vm_name }}_VARS.fd"
+vm_seed_iso_path: "{{ vm_seed_iso_dir }}/{{ vm_name }}.iso"
+vm_seed_staging_dir: "/tmp/seed-{{ vm_name }}"

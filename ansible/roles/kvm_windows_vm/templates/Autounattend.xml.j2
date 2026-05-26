@@ -1,0 +1,253 @@
+<?xml version="1.0" encoding="utf-8"?>
+{# Autounattend for Windows Server 2025 / Windows 11 on UEFI + virtio-scsi.
+   Inline WinRM bootstrap (ADR-021) is delegated to bootstrap.ps1, also baked
+   onto the seed ISO and invoked from FirstLogonCommands by a CMD wrapper.
+   Vars consumed from role defaults + caller:
+     vm_name, vm_local_admin_password, vm_locale, vm_keyboard_layout, vm_timezone,
+     vm_wim_image_name, vm_static_ip (opt), vm_default_gateway (opt),
+     vm_dns_servers (opt list), vm_netmask_prefix (default 24). #}
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <!-- ============================================================ -->
+  <!--   Pass 1: windowsPE (boot from install media, partition disk, -->
+  <!--   install image).                                              -->
+  <!-- ============================================================ -->
+  <settings pass="windowsPE">
+
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <SetupUILanguage><UILanguage>{{ vm_locale }}</UILanguage></SetupUILanguage>
+      <InputLocale>{{ vm_keyboard_layout }}</InputLocale>
+      <SystemLocale>{{ vm_locale }}</SystemLocale>
+      <UILanguage>{{ vm_locale }}</UILanguage>
+      <UserLocale>{{ vm_locale }}</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+      <!-- Tell Setup where to find virtio-scsi drivers on the secondary CD-ROM. -->
+      <!-- Letters vary; we list common Windows-side mounts that Setup will scan. -->
+      <DriverPaths>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="1">
+          <Path>E:\amd64\2k25</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="2">
+          <Path>E:\amd64\2k22</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="3">
+          <Path>F:\amd64\2k25</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="4">
+          <Path>F:\amd64\2k22</Path>
+        </PathAndCredentials>
+      </DriverPaths>
+
+      <DiskConfiguration>
+        <WillShowUI>OnError</WillShowUI>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Type>EFI</Type>
+              <Size>260</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Type>MSR</Type>
+              <Size>128</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Type>Primary</Type>
+              <Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Format>FAT32</Format>
+              <Label>System</Label>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order>
+              <PartitionID>3</PartitionID>
+              <Format>NTFS</Format>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/NAME</Key>
+              <Value>{{ vm_wim_image_name }}</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+          <WillShowUI>OnError</WillShowUI>
+        </OSImage>
+      </ImageInstall>
+
+      <UserData>
+        <ProductKey>
+          <WillShowUI>Never</WillShowUI>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+        <FullName>Lab Operator</FullName>
+        <Organization>Corp Lab</Organization>
+      </UserData>
+
+    </component>
+  </settings>
+
+  <!-- ============================================================ -->
+  <!--   Pass 4: specialize (first boot post-image, before OOBE).    -->
+  <!--   Set hostname, time zone, static IP if requested.            -->
+  <!-- ============================================================ -->
+  <settings pass="specialize">
+
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <ComputerName>{{ vm_name | upper | replace('-CORP', '') | truncate(15, True, '') }}</ComputerName>
+      <TimeZone>{{ vm_timezone }}</TimeZone>
+      <RegisteredOrganization>Corp Lab</RegisteredOrganization>
+      <RegisteredOwner>Lab Operator</RegisteredOwner>
+    </component>
+
+{% if vm_static_ip is defined %}
+    <component name="Microsoft-Windows-TCPIP" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <Interfaces>
+        <Interface wcm:action="add">
+          <Identifier>Ethernet</Identifier>
+          <UnicastIpAddresses>
+            <IpAddress wcm:action="add" wcm:keyValue="1">{{ vm_static_ip }}/{{ vm_netmask_prefix | default(24) }}</IpAddress>
+          </UnicastIpAddresses>
+          <Routes>
+            <Route wcm:action="add">
+              <Identifier>1</Identifier>
+              <Prefix>0.0.0.0/0</Prefix>
+              <NextHopAddress>{{ vm_default_gateway }}</NextHopAddress>
+            </Route>
+          </Routes>
+          <IPv4Settings>
+            <DhcpEnabled>false</DhcpEnabled>
+            <RouterDiscoveryEnabled>false</RouterDiscoveryEnabled>
+          </IPv4Settings>
+        </Interface>
+      </Interfaces>
+    </component>
+
+    <component name="Microsoft-Windows-DNS-Client" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <Interfaces>
+        <Interface wcm:action="add">
+          <Identifier>Ethernet</Identifier>
+          <DNSServerSearchOrder>
+{% for dns in (vm_dns_servers | default(['1.1.1.1'])) %}
+            <IpAddress wcm:action="add" wcm:keyValue="{{ loop.index }}">{{ dns }}</IpAddress>
+{% endfor %}
+          </DNSServerSearchOrder>
+          <DisableDynamicUpdate>true</DisableDynamicUpdate>
+          <EnableAdapterDomainNameRegistration>false</EnableAdapterDomainNameRegistration>
+        </Interface>
+      </Interfaces>
+    </component>
+{% endif %}
+  </settings>
+
+  <!-- ============================================================ -->
+  <!--   Pass 7: oobeSystem — admin password, skip OOBE,             -->
+  <!--   FirstLogonCommands kicks off WinRM bootstrap.               -->
+  <!-- ============================================================ -->
+  <settings pass="oobeSystem">
+
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <InputLocale>{{ vm_keyboard_layout }}</InputLocale>
+      <SystemLocale>{{ vm_locale }}</SystemLocale>
+      <UILanguage>{{ vm_locale }}</UILanguage>
+      <UserLocale>{{ vm_locale }}</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+      <UserAccounts>
+        <AdministratorPassword>
+          <Value>{{ vm_local_admin_password }}</Value>
+          <PlainText>true</PlainText>
+        </AdministratorPassword>
+      </UserAccounts>
+
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <AutoLogon>
+        <Username>Administrator</Username>
+        <Password>
+          <Value>{{ vm_local_admin_password }}</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <Enabled>true</Enabled>
+        <LogonCount>1</LogonCount>
+      </AutoLogon>
+
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>cmd.exe /c (for %d in (D E F G H I) do if exist %d:\bootstrap.ps1 powershell.exe -ExecutionPolicy Bypass -File %d:\bootstrap.ps1) &gt; C:\Windows\Temp\bootstrap-wrapper.log 2&gt;&amp;1</CommandLine>
+          <Description>Run WinRM bootstrap (locates bootstrap.ps1 on seed ISO)</Description>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <CommandLine>powershell.exe -ExecutionPolicy Bypass -Command "Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'EnableLUA' -Value 1; New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' -Name 'AllowTelemetry' -PropertyType DWord -Value 0 -Force"</CommandLine>
+          <Description>Lab hardening: minimal telemetry</Description>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+
+      <TimeZone>{{ vm_timezone }}</TimeZone>
+      <RegisteredOrganization>Corp Lab</RegisteredOrganization>
+      <RegisteredOwner>Lab Operator</RegisteredOwner>
+    </component>
+  </settings>
+
+</unattend>

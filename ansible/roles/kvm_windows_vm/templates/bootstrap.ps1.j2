@@ -1,0 +1,70 @@
+#Requires -RunAsAdministrator
+# Inline WinRM HTTPS bootstrap script (ADR-021).
+# Invoked from Autounattend.xml's FirstLogonCommands by a small CMD wrapper that
+# walks CD-ROM drive letters looking for this file.
+#
+# Logs to C:\Windows\Temp\bootstrap.log so post-mortem is trivial if WinRM
+# never comes up.
+
+$ErrorActionPreference = 'Stop'
+$logPath = 'C:\Windows\Temp\bootstrap.log'
+function Log($msg) {
+    $stamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')
+    "$stamp $msg" | Out-File -FilePath $logPath -Append -Encoding utf8
+}
+
+try {
+    Log "Bootstrap start (Computer=$env:COMPUTERNAME)"
+
+    Log "Enable-PSRemoting -Force"
+    Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
+
+    Log "Create self-signed cert CN=$env:COMPUTERNAME"
+    $cert = New-SelfSignedCertificate `
+        -CertStoreLocation 'Cert:\LocalMachine\My' `
+        -DnsName $env:COMPUTERNAME `
+        -NotAfter (Get-Date).AddYears(1) `
+        -Provider 'Microsoft Software Key Storage Provider' `
+        -Subject "CN=$env:COMPUTERNAME"
+    Log "Cert thumbprint: $($cert.Thumbprint)"
+
+    Log "Remove any pre-existing HTTPS listeners"
+    Get-ChildItem -Path WSMan:\localhost\Listener |
+        Where-Object { $_.Keys -match 'Transport=HTTPS' } |
+        ForEach-Object { Remove-Item -Path $_.PSPath -Recurse -Force }
+
+    Log "Create HTTPS listener on port {{ vm_winrm_port }}"
+    New-Item -Path 'WSMan:\localhost\Listener' `
+        -Address '*' `
+        -Transport HTTPS `
+        -Port {{ vm_winrm_port }} `
+        -CertificateThumbprint $cert.Thumbprint `
+        -Enabled $true `
+        -Force | Out-Null
+
+    Log "Open Windows firewall TCP {{ vm_winrm_port }}"
+    if (-not (Get-NetFirewallRule -DisplayName 'WinRM HTTPS-In' -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule `
+            -DisplayName 'WinRM HTTPS-In' `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort {{ vm_winrm_port }} `
+            -Action Allow `
+            -Profile Any | Out-Null
+    }
+
+    Log "Enable Basic + NTLM auth for the WinRM service (lab-only)"
+    Set-Item -Path 'WSMan:\localhost\Service\Auth\Basic' -Value $true -Force
+    Set-Item -Path 'WSMan:\localhost\Service\AllowUnencrypted' -Value $false -Force
+
+    Log "Restart WinRM service"
+    Restart-Service -Name WinRM -Force
+
+    Log "Bootstrap COMPLETE — listener summary:"
+    (winrm enumerate winrm/config/listener) | Out-File -FilePath $logPath -Append -Encoding utf8
+}
+catch {
+    Log "BOOTSTRAP FAILED: $($_.Exception.Message)"
+    Log $_.ScriptStackTrace
+    exit 1
+}
