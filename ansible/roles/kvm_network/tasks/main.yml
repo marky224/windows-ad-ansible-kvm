@@ -1,0 +1,16 @@
+---
+- name: "kvm_network | define {{ corp_subnet.libvirt_network_name }}"
+  community.libvirt.virt_net:
+    command: define
+    name: "{{ corp_subnet.libvirt_network_name }}"
+    xml: "{{ lookup('template', 'network.xml.j2') }}"
+
+- name: "kvm_network | autostart {{ corp_subnet.libvirt_network_name }}"
+  community.libvirt.virt_net:
+    autostart: true
+    name: "{{ corp_subnet.libvirt_network_name }}"
+
+- name: "kvm_network | start {{ corp_subnet.libvirt_network_name }}"
+  community.libvirt.virt_net:
+    state: active
+    name: "{{ corp_subnet.libvirt_network_name }}"

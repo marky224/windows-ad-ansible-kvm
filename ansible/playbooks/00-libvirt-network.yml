@@ -1,0 +1,11 @@
+---
+# Define + start the corp-lab libvirt network (10.10.0.0/24, NAT, no DHCP).
+# DC owns DHCP per ADR-007.
+#
+# Run: ansible-playbook playbooks/00-libvirt-network.yml
+
+- name: "Provision corp-lab libvirt network"
+  hosts: kvm_host
+  gather_facts: false
+  roles:
+    - kvm_network

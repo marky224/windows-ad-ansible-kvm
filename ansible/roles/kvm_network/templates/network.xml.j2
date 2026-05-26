@@ -1,0 +1,12 @@
+<network>
+  <name>{{ corp_subnet.libvirt_network_name }}</name>
+  <forward mode='nat'>
+    <nat>
+      <port start='1024' end='65535'/>
+    </nat>
+  </forward>
+  <bridge name='{{ corp_subnet.libvirt_bridge }}' stp='on' delay='0'/>
+  <mac address='52:54:00:f0:00:01'/>
+  <ip address='{{ corp_subnet.gateway }}' netmask='{{ corp_subnet.netmask }}'/>
+  {# DHCP intentionally omitted — DC owns DHCP role per ADR-007. #}
+</network>

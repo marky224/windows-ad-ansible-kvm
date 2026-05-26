@@ -1,0 +1,2 @@
+---
+# This role reads corp_subnet.* from group_vars/all/main.yml — no role-level defaults.

@@ -9,6 +9,13 @@
 
 all:
   children:
+    # The Linux host that runs libvirt + the Ansible control node (same machine).
+    # All kvm_* roles target this group.
+    kvm_host:
+      hosts:
+        localhost:
+          ansible_connection: local
+          ansible_python_interpreter: /usr/bin/python3
     windows:
       children:
         dc:
