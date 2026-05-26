@@ -67,12 +67,53 @@
     name: "{{ libvirt_pools.iso }}"
     command: refresh
 
-- name: "kvm_windows_vm | define libvirt domain {{ vm_name }}"
-  community.libvirt.virt:
-    command: define
-    xml: "{{ lookup('template', 'domain.xml.j2') }}"
+# Ubuntu's OVMF won't auto-add removable media to BootOrder on fresh NVRAM, so
+# the VM drops to UEFI Interactive Shell instead of booting the install ISO.
+# Pre-enroll BootOrder pointing at the standard fallback EFI loader path
+# (\EFI\BOOT\BOOTX64.EFI) — OVMF walks each storage device looking for that
+# path and finds it on the Windows install ISO's EFI partition.
+- name: "kvm_windows_vm | pre-enroll BootOrder in per-VM NVRAM {{ vm_nvram_path }}"
+  ansible.builtin.shell:
+    cmd: >-
+      cp {{ vm_uefi_vars_template }} {{ vm_nvram_path }} &&
+      virt-fw-vars --inplace {{ vm_nvram_path }} --append-boot-filepath '\EFI\BOOT\BOOTX64.EFI'
+    creates: "{{ vm_nvram_path }}"
 
-- name: "kvm_windows_vm | start libvirt domain {{ vm_name }}"
+- name: "kvm_windows_vm | list existing libvirt domains (idempotency check)"
+  ansible.builtin.command:
+    cmd: virsh -c qemu:///system list --all --name
+  register: existing_domains
+  changed_when: false
+  check_mode: false
+
+# virt-install defines + starts in one step. Per-device boot.order on the
+# install ISO drives boot once the pre-enrolled NVRAM BootOrder is in place.
+- name: "kvm_windows_vm | provision libvirt domain {{ vm_name }} via virt-install"
+  ansible.builtin.command:
+    cmd: >-
+      virt-install --connect qemu:///system
+      --name {{ vm_name }}
+      --osinfo {{ vm_os_variant }}
+      --memory {{ vm_memory_mb }}
+      --vcpus {{ vm_vcpus }}
+      --machine {{ vm_machine_type }}
+      --cpu host-passthrough
+      --boot uefi{{ ',firmware.feature0.enabled=no,firmware.feature0.name=secure-boot' if not vm_secure_boot else '' }},nvram={{ vm_nvram_path }}
+      {% if vm_enable_tpm | bool %}--tpm model=tpm-crb,backend.type=emulator,backend.version={{ vm_tpm_version }}{% else %}--tpm none{% endif %}
+      --controller scsi,model=virtio-scsi
+      --disk path={{ vm_disk_path }},bus=scsi,format=qcow2
+      --disk path={{ vm_install_iso }},device=cdrom,bus=scsi,boot.order=1
+      --disk path={{ vm_virtio_win_iso }},device=cdrom,bus=sata
+      --disk path={{ vm_seed_iso_path }},device=cdrom,bus=sata
+      --network network={{ vm_network }},model=virtio{% if vm_mac is defined %},mac={{ vm_mac }}{% endif %}
+      --graphics spice,listen=127.0.0.1
+      --video qxl
+      --noautoconsole
+      --wait 0
+      --install no_install=yes
+  when: vm_name not in existing_domains.stdout_lines
+
+- name: "kvm_windows_vm | ensure libvirt domain {{ vm_name }} is running"
   community.libvirt.virt:
     name: "{{ vm_name }}"
     state: running

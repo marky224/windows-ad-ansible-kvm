@@ -13,6 +13,11 @@
   vars:
     vm_name: ADDC01-corp
     vm_mac: "52:54:00:00:00:10"                            # matches static IP last octet for cleanliness
+    # BLOCKER: current Server 2025 eval ISO copy fails BCD parse at bootmgr
+    # (status 0xc000014c on \EFI\Microsoft\Boot\BCD). Win 11 ISO with the same
+    # VM config boots Setup cleanly, so the firmware/storage stack is OK; the
+    # ISO BCD itself is the problem. Action: re-download from MS Evaluation
+    # Center and verify SHA256 before the next playbook run. See handoff.
     vm_install_iso: "{{ iso_paths.windows_server_2025 }}"
     vm_wim_image_name: "Windows Server 2025 SERVERSTANDARD"
     vm_static_ip: "{{ corp_subnet.dc_ip }}"
@@ -24,13 +29,10 @@
     vm_dns_servers:
       - 1.1.1.1
       - 8.8.8.8
-    # TPM disabled pending swtpm socket-permission fix (Server 2025 installs
-    # fine without it; Win 11 clients will require it later).
+    # TPM still deferred pending swtpm socket-permission fix.
     vm_enable_tpm: false
-    # Secure Boot disabled for the smoke spike — Ubuntu 24.04's OVMF_VARS_4M.ms.fd
-    # appears to lack pre-enrolled Microsoft keys, so OVMF rejects the signed
-    # Windows boot loader as untrusted. Will re-enable once we either generate a
-    # pre-enrolled template or enroll keys explicitly in a setup pass.
-    vm_secure_boot: false
+    # Secure Boot enabled. OVMF_VARS_4M.ms.fd has pre-enrolled MS keys
+    # (verified 2026-05-26 via virt-fw-vars -p).
+    vm_secure_boot: true
   roles:
     - kvm_windows_vm
