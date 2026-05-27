@@ -16,6 +16,19 @@ function Log($msg) {
 try {
     Log "Bootstrap start (Computer=$env:COMPUTERNAME)"
 
+    # Server 2025 24H2 regression: NLA may classify the network as Public
+    # before/during this script's run, which silently disables WinRM rules
+    # scoped to Domain/Private. Force the profile to Private up-front, then
+    # ensure NlaSvc is auto-start (it's disabled by default on Server 2025).
+    # Refs: techcommunity Server 2025 "always shows network as public" regression,
+    # frankysweb, woshub, StefanScherer/packer-windows enable-winrm.ps1.
+    Log "Force network profile Private (defend vs Server 2025 NLA-classifies-Public regression)"
+    Get-NetConnectionProfile | ForEach-Object {
+        Set-NetConnectionProfile -InterfaceAlias $_.InterfaceAlias -NetworkCategory Private
+    }
+    Log "Set NlaSvc StartupType Automatic"
+    Set-Service -Name NlaSvc -StartupType Automatic -ErrorAction SilentlyContinue
+
     Log "Enable-PSRemoting -Force"
     Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
 

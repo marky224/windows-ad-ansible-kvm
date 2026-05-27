@@ -145,6 +145,23 @@
     dest: "{{ vm_seed_staging_dir }}/bootstrap.ps1"
     mode: '0644'
 
+# Windows PowerShell 5.1 (which FirstLogonCommands invokes) reads BOM-less
+# files as CP1252, so a single em-dash, en-dash, curly quote, NBSP, or
+# Unicode minus in the rendered .ps1 silently breaks string parsing and the
+# whole script never runs. Fail fast at template time if any non-ASCII byte
+# slips into the rendered file (regression guard for the 2026-05-27 em-dash
+# bug that took ~30 min of debugging to find).
+- name: "kvm_windows_vm | guard rendered bootstrap.ps1 against non-ASCII chars"
+  ansible.builtin.shell:
+    cmd: |
+      offenders=$(grep -nP '[^\x00-\x7F]' {{ vm_seed_staging_dir }}/bootstrap.ps1 || true)
+      if [ -n "$offenders" ]; then
+        echo "ERROR: non-ASCII char(s) in rendered bootstrap.ps1 (will break PowerShell 5.1 parse):" >&2
+        echo "$offenders" >&2
+        exit 1
+      fi
+  changed_when: false
+
 - name: "kvm_windows_vm | build per-VM custom install ISO {{ vm_custom_install_iso_path }}"
   ansible.builtin.command:
     argv:
