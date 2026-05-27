@@ -38,6 +38,14 @@ iso_paths:
   ubuntu_24_04: "{{ iso_dir }}/noble-server-cloudimg-amd64.img"
   virtio_win: "{{ iso_dir }}/virtio-win-0.1.271.iso"
 
+# SHA256 hashes for known-good install media. Provisioning roles assert against
+# these before baking ISO contents into shared stages. Add an entry whenever
+# you pin a new ISO; leave unset for media we haven't verified.
+iso_checksums:
+  # Server 2025 Std Eval + Desktop Experience, Sept 2024 RTM build 26100.1742,
+  # fetched 2026-05-26 via the official MS fwlink → Azure CDN (5,738,432 KiB).
+  windows_server_2025: d0ef4502e350e3c6c53c15b1b3020d38a5ded011bf04998e950720ac8579b23d
+
 # --- WIM edition indices (captured 2026-05-26 from each ISO's sources/install.wim) ---
 wim_edition:
   windows_server_2025: 2     # "Windows Server 2025 SERVERSTANDARD" — Standard Eval + Desktop Experience

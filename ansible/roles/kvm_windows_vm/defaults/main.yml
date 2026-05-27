@@ -4,14 +4,17 @@
 #   vm_install_iso           absolute path to the Windows install ISO
 #   vm_wim_image_name        WIM image name (e.g. "Windows Server 2025 SERVERSTANDARD")
 # Optional from caller:
+#   vm_install_iso_sha256    expected SHA256 of vm_install_iso. When set, the role
+#                            verifies the ISO before baking its bits into the shared
+#                            stage (one-shot — skipped on subsequent runs).
 #   vm_static_ip             IPv4 address. If set, Autounattend configures static IP.
 #   vm_default_gateway       used with vm_static_ip
 #   vm_dns_servers           list of DNS server IPs; used with vm_static_ip
 #   vm_netmask_prefix        CIDR prefix length (default 24)
 
 # --- Compute / firmware ---
-vm_memory_mb: 8192
-vm_vcpus: 4
+vm_memory_mb: 12288                       # 12 GB — Server 2025 24H2 SafeOS is heavy
+vm_vcpus: 6
 vm_disk_gb: 150
 vm_machine_type: q35
 vm_os_variant: win2k25                    # libosinfo id; controls Hyper-V enlightenments
@@ -54,6 +57,17 @@ vm_install_iso_volid: "WINSRV2025_CORPLAB"
 vm_wait_for_winrm: true
 vm_winrm_port: 5986
 vm_winrm_timeout: 1800                    # 30 minutes — Server 2025 unattended install + reboots
+
+# --- Install CD eject (post-WinPE-pass) ---
+# Without this, OVMF keeps picking the CD on every Setup-internal reboot →
+# WillWipeDisk re-wipes ESP → bootmgfw.efi never persists → infinite loop.
+# We watch the SPICE screen for the install-progress UI → blank-screen
+# transition (= WinPE pass committed bcdboot and queued a reboot), then
+# eject the CD so the firmware boots the disk's freshly-written Windows
+# Boot Manager NVRAM entry on next POST.
+vm_eject_install_cd_after_winpe: true
+vm_install_cd_target_dev: sdb             # SATA port 1 — first CD after the virtio-scsi disk
+vm_eject_wait_max_iters: 120              # 120 × 5s = 10 min max wait for WinPE → reboot signal
 
 # --- Internal paths (rarely overridden) ---
 vm_disk_pool: "{{ libvirt_pools.disks }}"

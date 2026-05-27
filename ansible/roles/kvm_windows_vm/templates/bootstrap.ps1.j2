@@ -60,7 +60,7 @@ try {
     Log "Restart WinRM service"
     Restart-Service -Name WinRM -Force
 
-    Log "Bootstrap COMPLETE — listener summary:"
+    Log "Bootstrap COMPLETE - listener summary:"
     (winrm enumerate winrm/config/listener) | Out-File -FilePath $logPath -Append -Encoding utf8
 }
 catch {

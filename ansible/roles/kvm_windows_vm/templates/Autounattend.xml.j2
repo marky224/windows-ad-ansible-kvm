@@ -25,14 +25,33 @@
       <UserLocale>{{ vm_locale }}</UserLocale>
     </component>
 
+    <!-- Load only the virtio drivers actually needed for windowsPE pass:
+         vioscsi (boot disk), viostor (legacy fallback), NetKVM (NIC). Loading
+         additional virtio drivers from the same CD re-triggers virtio-win bug
+         #1100 ("driver already loaded" 0x80070103) when the install media is
+         on a virtio-scsi controller; we already avoid that root cause by
+         attaching the install CD on SATA, but trimming the path list keeps
+         this defensive. Both D: and E: are listed because the install CD's
+         drive-letter assignment in WinPE depends on SATA port enumeration
+         order; non-existent paths are silently ignored. -->
+    <component name="Microsoft-Windows-PnpCustomizationsWinPE" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <DriverPaths>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="1"><Path>D:\vioscsi\2k25\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="2"><Path>D:\viostor\2k25\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="3"><Path>D:\NetKVM\2k25\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="4"><Path>E:\vioscsi\2k25\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="5"><Path>E:\viostor\2k25\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="6"><Path>E:\NetKVM\2k25\amd64</Path></PathAndCredentials>
+      </DriverPaths>
+    </component>
+
     <component name="Microsoft-Windows-Setup" processorArchitecture="amd64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
                xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-
-      <!-- DriverPaths intentionally omitted: virtio-scsi drivers live in the
-           install ISO's $WinpeDriver$ folder, which WinPE auto-loads before
-           Autounattend is processed. No drive-letter guessing required. -->
 
       <DiskConfiguration>
         <WillShowUI>OnError</WillShowUI>

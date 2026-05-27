@@ -14,6 +14,7 @@
     vm_name: ADDC01-corp
     vm_mac: "52:54:00:00:00:10"                            # matches static IP last octet for cleanliness
     vm_install_iso: "{{ iso_paths.windows_server_2025 }}"   # pristine source; role re-masters into per-VM custom ISO
+    vm_install_iso_sha256: "{{ iso_checksums.windows_server_2025 }}"
     vm_wim_image_name: "Windows Server 2025 SERVERSTANDARD"
     vm_static_ip: "{{ corp_subnet.dc_ip }}"
     vm_default_gateway: "{{ corp_subnet.gateway }}"

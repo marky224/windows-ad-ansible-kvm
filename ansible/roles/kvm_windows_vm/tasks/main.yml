@@ -32,6 +32,38 @@
 
 # === Shared install-iso stage (built once, reused across all VMs) ============
 
+# Check whether the shared stage is already built. Used both to decide whether
+# to verify the install ISO's SHA256 (one-shot before stage rebuild) and as a
+# free pre-existence signal for downstream tasks' `creates:` guards.
+- name: "kvm_windows_vm | stat shared install-iso stage"
+  ansible.builtin.stat:
+    path: "{{ vm_install_stage_dir }}/setup.exe"
+  register: install_stage_stat
+
+# Verify install ISO matches the known-good SHA256 before its bits get baked
+# into the persistent shared stage. Skipped when no hash is provided (other
+# VMs) or when the stage is already built (the bits are committed; re-hashing
+# the original ISO every run wastes ~30s on 5.6 GB).
+- name: "kvm_windows_vm | verify install ISO SHA256 (one-shot before stage build)"
+  when:
+    - vm_install_iso_sha256 is defined
+    - vm_install_iso_sha256 | length > 0
+    - not install_stage_stat.stat.exists
+  block:
+    - name: "kvm_windows_vm | compute install ISO SHA256"
+      ansible.builtin.stat:
+        path: "{{ vm_install_iso }}"
+        checksum_algorithm: sha256
+      register: install_iso_stat
+
+    - name: "kvm_windows_vm | assert install ISO SHA256 matches expected"
+      ansible.builtin.assert:
+        that: install_iso_stat.stat.checksum == vm_install_iso_sha256
+        fail_msg: >-
+          {{ vm_install_iso }} SHA256 is {{ install_iso_stat.stat.checksum }};
+          expected {{ vm_install_iso_sha256 }}. Refusing to bake unknown-provenance
+          bits into the shared install-iso stage.
+
 - name: "kvm_windows_vm | ensure shared install-iso stage dir exists"
   ansible.builtin.file:
     path: "{{ vm_install_stage_dir }}"
@@ -64,18 +96,12 @@
     creates: "{{ vm_install_stage_dir }}/setup.exe"
     executable: /bin/bash
 
-- name: "kvm_windows_vm | inject virtio storage drivers into shared stage's $WinpeDriver$"
-  ansible.builtin.command:
-    argv:
-      - xorriso
-      - -osirrox
-      - 'on'
-      - -indev
-      - "{{ vm_virtio_win_iso }}"
-      - -extract
-      - /amd64/2k25
-      - "{{ vm_install_stage_dir }}/$WinpeDriver$"
-    creates: "{{ vm_install_stage_dir }}/$WinpeDriver$/vioscsi.inf"
+# NB: We don't bake a $WinpeDriver$ folder. Server 2025 24H2 only invokes
+# $WinpeDriver$ AFTER setup.exe launches (per MS Learn limitations doc), which
+# is too late for any chicken-and-egg "WinPE needs vioscsi to see the install
+# media" scenario. We avoid that scenario altogether by attaching the install
+# CD on SATA (see virt-install args below), and let WinPE setup pick up vioscsi
+# for the OS disk via Autounattend's PnpCustomizationsWinPE DriverPaths.
 
 - name: "kvm_windows_vm | swap BOOTX64.EFI for cdboot_noprompt.efi (skip CD-boot prompt)"
   ansible.builtin.copy:
@@ -200,7 +226,7 @@
       {% if vm_enable_tpm | bool %}--tpm model=tpm-crb,backend.type=emulator,backend.version={{ vm_tpm_version }}{% else %}--tpm none{% endif %}
       --controller scsi,model=virtio-scsi
       --disk path={{ vm_disk_path }},bus=scsi,format=qcow2
-      --disk path={{ vm_custom_install_iso_path }},device=cdrom,bus=scsi,boot.order=1
+      --disk path={{ vm_custom_install_iso_path }},device=cdrom,bus=sata,boot.order=1
       --disk path={{ vm_virtio_win_iso }},device=cdrom,bus=sata
       --disk path={{ vm_seed_iso_path }},device=cdrom,bus=sata
       --network network={{ vm_network }},model=virtio{% if vm_mac is defined %},mac={{ vm_mac }}{% endif %}
@@ -215,6 +241,77 @@
   community.libvirt.virt:
     name: "{{ vm_name }}"
     state: running
+
+# Fix for the Server 2025 24H2 CD-boot-loop:
+# After virt-install brings the VM up, the install CD is boot priority 1.
+# WinPE pass completes in ~3 min, writes bootmgfw.efi to ESP via bcdboot,
+# registers a `Windows Boot Manager` NVRAM Boot#### entry, then reboots.
+# But the CD's pre-enrolled \EFI\BOOT\BOOTX64.EFI entry is still first in
+# BootOrder → firmware re-enters fresh WinPE setup → DiskConfiguration's
+# WillWipeDisk=true wipes ESP → next pass repeats forever.
+#
+# Workaround: detect WinPE-completes signal from outside the guest by
+# watching the SPICE screen — install-progress UI (~15 KB PNG) followed
+# by blank-screen (~3 KB PNG) reliably marks "WinPE committed bcdboot
+# and queued reboot." Eject the CD at that exact moment so the firmware
+# POST that follows picks the disk's Windows Boot Manager.
+- name: "kvm_windows_vm | check install CD attached (idempotency for replays)"
+  ansible.builtin.command:
+    cmd: virsh -c qemu:///system domblklist {{ vm_name }}
+  register: domblklist_result
+  changed_when: false
+
+- name: "kvm_windows_vm | post-WinPE CD eject"
+  when:
+    - vm_eject_install_cd_after_winpe | bool
+    - vm_custom_install_iso_path in domblklist_result.stdout
+  block:
+    - name: "kvm_windows_vm | wait for install-progress UI → blank-screen transition (WinPE pass commit)"
+      ansible.builtin.shell:
+        cmd: |
+          set -u
+          probe=/tmp/{{ vm_name }}-screen-probe.png
+          state=WAIT_INSTALL
+          for i in $(seq 1 {{ vm_eject_wait_max_iters }}); do
+            virsh -c qemu:///system screenshot {{ vm_name }} ${probe} >/dev/null 2>&1 || true
+            size=$(stat -c %s ${probe} 2>/dev/null || echo 0)
+            case ${state} in
+              WAIT_INSTALL)
+                if [ "${size}" -gt 10000 ]; then
+                  echo "iter=${i} size=${size}B — install-progress UI detected"
+                  state=WAIT_REBOOT
+                fi
+                ;;
+              WAIT_REBOOT)
+                if [ "${size}" -lt 5000 ]; then
+                  echo "iter=${i} size=${size}B — WinPE → reboot transition detected"
+                  exit 0
+                fi
+                ;;
+            esac
+            sleep 5
+          done
+          echo "ERROR: Timed out waiting for WinPE → reboot transition (last state=${state})" >&2
+          exit 1
+      register: winpe_wait
+      changed_when: false
+
+    - name: "kvm_windows_vm | report WinPE wait result"
+      ansible.builtin.debug:
+        var: winpe_wait.stdout_lines
+
+    # NB: --live only (no --config). --config triggers a domain redefine which
+    # can SIGTERM QEMU if it lands during the guest's ACPI reboot sequence
+    # (observed Run D 2026-05-27). The eject only needs to affect the running
+    # VM — persistence is moot since post-install reboots boot the disk's
+    # Windows Boot Manager NVRAM entry, not the CD device, regardless.
+    - name: "kvm_windows_vm | eject install CD ({{ vm_install_cd_target_dev }}) - force boot from disk"
+      ansible.builtin.command:
+        cmd: >-
+          virsh -c qemu:///system change-media {{ vm_name }}
+          {{ vm_install_cd_target_dev }} --eject --live
+      register: eject_result
+      changed_when: "'ejected' in eject_result.stdout"
 
 - name: "kvm_windows_vm | wait for WinRM on {{ vm_static_ip | default('the host') }}:{{ vm_winrm_port }}"
   ansible.builtin.wait_for:
