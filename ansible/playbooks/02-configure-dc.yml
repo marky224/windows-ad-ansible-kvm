@@ -1,0 +1,63 @@
+---
+# Three-play orchestration of DC bring-up:
+#
+#   Play 1: Promote ADDC01-corp to forest root DC of corp.markandrewmarquez.com.
+#           Connects as LOCAL Administrator (pre-promotion, no domain exists yet).
+#           Calls ad_dc role: win_feature AD-DS + microsoft.ad.domain + reboot
+#           (handled inline by the module) + post-reboot validation
+#           (Get-ADDomain, dcdiag, service health).
+#
+#   Play 2: Create the named domain admin (madmin-da) in OU=Admins, member of
+#           Domain Admins + Enterprise Admins. Connects as the BUILT-IN domain
+#           Administrator via UPN form. Password is the SAME value as Play 1
+#           (vault_dc_admin_password) — dcpromo does not change it per ADR-031.
+#           Calls ad_admins role.
+#
+#   Play 3: Apply Microsoft Appendix D account-flag hardening to RID 500
+#           (NOT_DELEGATED + SMARTCARD_REQUIRED). The smartcard flag has the
+#           side effect of AD randomizing the password to an unknowable value,
+#           making RID 500 a break-glass-only account from this point forward.
+#           Connects as the NAMED admin (madmin-da, from steady-state group_vars/dc.yml).
+#           Calls ad_harden_builtin_admin role.
+#
+# Ordering matters (ADR-033). Play 3 connects AS the named admin. If named-admin
+# authentication doesn't work (group membership lag, DC unhealthy, vault mismatch),
+# Play 3 fails at connection setup BEFORE hardening RID 500. Result: RID 500
+# stays usable, you can debug, re-run. Without the ordering, you could brick
+# admin access to the DC and require DSRM recovery.
+#
+# Run: ansible-playbook -i inventory/lab.yml playbooks/02-configure-dc.yml
+
+- name: "Play 1 — Promote ADDC01-corp to forest root of corp.markandrewmarquez.com"
+  hosts: dc
+  gather_facts: false
+  vars:
+    # ADR-031: pre-promotion the only working identity is local Administrator.
+    # Override group_vars/dc.yml's steady-state named-admin UPN for this play.
+    ansible_user: Administrator
+    ansible_password: "{{ vault_dc_admin_password }}"
+  roles:
+    - ad_dc
+
+- name: "Play 2 — Create named domain admin (connect as built-in domain Administrator)"
+  hosts: dc
+  gather_facts: false
+  vars:
+    # ADR-031: post-promotion, pre-named-admin. Connect as RID 500 via UPN form.
+    # Password is the SAME value as Play 1 — dcpromo preserves it.
+    # Override group_vars/dc.yml's steady-state named-admin UPN for this play
+    # (it doesn't exist yet — that's what this play creates).
+    ansible_user: "Administrator@{{ forest.fqdn }}"
+    ansible_password: "{{ vault_dc_admin_password }}"
+  roles:
+    - ad_admins
+
+- name: "Play 3 — Apply Appendix D RID 500 hardening (connect as named admin)"
+  hosts: dc
+  gather_facts: false
+  # No vars override: use steady-state group_vars/dc.yml identity (madmin-da UPN).
+  # Connecting as madmin-da IS the verification that ad_admins worked correctly.
+  # If named-admin auth is broken, this play fails BEFORE running the hardening,
+  # leaving RID 500 usable for recovery (ADR-033).
+  roles:
+    - ad_harden_builtin_admin

@@ -1,0 +1,20 @@
+---
+# ad_dc role defaults. Override at playbook level or in host_vars if needed.
+
+# microsoft.ad.domain module knobs (see https://docs.ansible.com/ansible/latest/collections/microsoft/ad/domain_module.html)
+ad_dc_install_dns: true            # install DNS Server role + create AD-integrated zone
+ad_dc_reboot_timeout: 1200         # 20 min — generous; first-time DC promotion + reboot can be slow
+
+# Post-promotion validation
+ad_dc_ready_poll_minutes: 5        # how long to wait for Get-ADDomain to return after the reboot
+ad_dc_ready_poll_interval: 10      # seconds between Get-ADDomain attempts
+
+# DNS SRV record registration validation (post-promotion).
+# See "Repl Perform Initial Synchronizations" pre-promotion fix below for why
+# we don't need aggressive self-heal here — the registry key handles it.
+ad_dc_dns_settle_minutes: 3        # total wait window for SRV records to appear
+ad_dc_dns_poll_interval: 10        # seconds between checks
+
+# Expected Windows hostname (set by Autounattend specialize pass — sanity-checked, not changed).
+# This is the Windows ComputerName (ADDC01), NOT the libvirt domain name (ADDC01-corp).
+ad_dc_expected_hostname: ADDC01

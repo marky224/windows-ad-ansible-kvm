@@ -1,0 +1,204 @@
+---
+# Promote a fresh Windows Server VM to the first DC of a new forest.
+#
+# Expected caller state: ADDC01-corp is freshly built by kvm_windows_vm,
+# WinRM HTTPS is reachable, the local Administrator password matches
+# vault_dc_admin_password. The calling play overrides ansible_user to
+# 'Administrator' (local form) and ansible_password to vault_dc_admin_password
+# per ADR-031.
+#
+# ADRs implemented: ADR-006 (forest name), ADR-012 (single-DC topology),
+# ADR-016 (Ansible-native), ADR-031 (single-password lifecycle).
+
+- name: "Sanity-check: Windows ComputerName is {{ ad_dc_expected_hostname }}"
+  ansible.windows.win_command: hostname
+  register: r_hostname
+  changed_when: false
+  failed_when: (r_hostname.stdout | trim) != ad_dc_expected_hostname
+
+- name: "Install AD-Domain-Services Windows feature (with management tools)"
+  ansible.windows.win_feature:
+    name: AD-Domain-Services
+    include_management_tools: true
+    state: present
+  register: r_addsfeature
+
+# Pre-promotion fix for Server 2025 first-DC init-sync gate.
+# Without this, NTDS waits for a (nonexistent) replication partner to confirm
+# initial sync. DNS Server stays in event-4013 "waiting for AD DS sync" loop;
+# AD-integrated DNS zones never become writable; Netlogon's secure dynamic
+# updates of SRV/CNAME records silently fail. Result: a "promoted" DC with
+# only NS + SOA + addc01 A records — no SRV, no _msdcs CNAMEs, broken
+# downstream (client domain joins, Kerberos lookups, dcdiag Connectivity).
+#
+# Setting "Repl Perform Initial Synchronizations" = 0 BEFORE the promotion
+# reboot tells NTDS to skip the gate on first start. The key is removed
+# immediately after promotion succeeds (Microsoft Learn: do not leave it set —
+# it disables a critical FSMO safety check long-term).
+#
+# Source: https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/troubleshoot-dns-event-id-4013
+- name: "Pre-stage: disable initial-sync gate (Server 2025 first-DC fix, MS Learn KB 4013)"
+  ansible.windows.win_powershell:
+    script: |
+      $path = 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
+      if (-not (Test-Path $path)) {
+          New-Item -Path $path -Force | Out-Null
+      }
+      Set-ItemProperty -Path $path -Name 'Repl Perform Initial Synchronizations' -Value 0 -Type DWord
+      $Ansible.Result = @{
+          KeySet = 'Repl Perform Initial Synchronizations'
+          Value  = 0
+          Reason = 'Server 2025 first-DC fix; removed post-promotion (MS Learn 4013)'
+      }
+  register: r_initsync_disable
+
+# Defense-in-depth for the Server 2025 NLA-Public regression. On unpatched
+# Server 2025 (pre-KB5060842), the post-promotion reboot reclassifies the NIC
+# as Public, breaking Netlogon's secure DNS dynamic updates. These three
+# registry keys tell NLA to skip the DC-reachability probe and trust the
+# network is domain-attached. They're durable (survive reboots) and have no
+# side effects on a healthy patched DC. Per ADR-035, the canonical fix is to
+# slipstream the cumulative update into install media; these keys remain as
+# belt-and-suspenders even on patched images.
+#
+# Sources: Pete Long (PeteNetLive), Frankys Web, MS Tech Community.
+- name: "Pre-stage: apply NLA-Public regression durability fix (Server 2025 defense-in-depth)"
+  ansible.windows.win_powershell:
+    script: |
+      $keys = @(
+          @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters';   Name = 'AlwaysExpectDomainController'; Value = 1 },
+          @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name = 'NegativeCachePeriod';          Value = 0 },
+          @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters'; Name = 'MaxNegativeCacheTtl';          Value = 0 }
+      )
+      $set = @()
+      foreach ($k in $keys) {
+          if (-not (Test-Path $k.Path)) { New-Item -Path $k.Path -Force | Out-Null }
+          $current = (Get-ItemProperty -Path $k.Path -Name $k.Name -ErrorAction SilentlyContinue).($k.Name)
+          if ($current -ne $k.Value) {
+              Set-ItemProperty -Path $k.Path -Name $k.Name -Value $k.Value -Type DWord
+              $set += "$($k.Name)=$($k.Value)"
+          }
+      }
+      $Ansible.Changed = ($set.Count -gt 0)
+      $Ansible.Result = @{ AppliedOrAlreadyCorrect = $true; Changed = $set }
+  register: r_nla_durable
+
+- name: "Promote to first DC of {{ forest.fqdn }} (creates new forest)"
+  microsoft.ad.domain:
+    dns_domain_name: "{{ forest.fqdn }}"
+    domain_netbios_name: "{{ forest.netbios }}"
+    safe_mode_password: "{{ safe_mode_password }}"
+    install_dns: "{{ ad_dc_install_dns }}"
+    reboot: true
+    reboot_timeout: "{{ ad_dc_reboot_timeout }}"
+  register: r_promote
+
+- name: "Wait for AD DS to respond to Get-ADDomain (up to {{ ad_dc_ready_poll_minutes }}m)"
+  ansible.windows.win_powershell:
+    script: |
+      $deadline = (Get-Date).AddMinutes({{ ad_dc_ready_poll_minutes }})
+      while ((Get-Date) -lt $deadline) {
+          try {
+              $domain = Get-ADDomain -ErrorAction Stop
+              $forest = Get-ADForest -ErrorAction Stop
+              $Ansible.Result = @{
+                  DNSRoot       = $domain.DNSRoot
+                  NetBIOSName   = $domain.NetBIOSName
+                  DomainMode    = "$($domain.DomainMode)"
+                  ForestMode    = "$($forest.ForestMode)"
+                  PDCEmulator   = $domain.PDCEmulator
+                  RIDMaster     = $domain.RIDMaster
+                  InfrastructureMaster = $domain.InfrastructureMaster
+              }
+              return
+          } catch {
+              Start-Sleep -Seconds {{ ad_dc_ready_poll_interval }}
+          }
+      }
+      throw "Get-ADDomain did not return within {{ ad_dc_ready_poll_minutes }} minutes after promotion reboot"
+  register: r_ad_ready
+  changed_when: false
+
+- name: "Show resolved AD identity"
+  ansible.builtin.debug:
+    var: r_ad_ready.result
+
+# Cleanup pair to the pre-promotion task. MS Learn is explicit that the key
+# must be removed after the first successful boot — otherwise NTDS will keep
+# skipping replication safety checks on all subsequent reboots.
+- name: "Post-promotion cleanup: remove initial-sync gate override"
+  ansible.windows.win_powershell:
+    script: |
+      $path = 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
+      $name = 'Repl Perform Initial Synchronizations'
+      $prop = Get-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue
+      if ($prop) {
+          Remove-ItemProperty -Path $path -Name $name -ErrorAction Stop
+          $Ansible.Result = @{ Removed = $true; Path = $path; Name = $name }
+      } else {
+          $Ansible.Changed = $false
+          $Ansible.Result = @{ Removed = $false; Note = 'Key already absent (idempotent)' }
+      }
+
+- name: "Validate DNS SRV registration (should now succeed — zones loaded post-init-sync-bypass)"
+  ansible.windows.win_powershell:
+    script: |
+      $forest = '{{ forest.fqdn }}'
+      $deadline = (Get-Date).AddMinutes({{ ad_dc_dns_settle_minutes }})
+      $attempt = 0
+      while ((Get-Date) -lt $deadline) {
+          $attempt++
+          $srv = Get-DnsServerResourceRecord -ZoneName $forest -Name '_ldap._tcp' -RRType SRV -ErrorAction SilentlyContinue
+          if ($srv) {
+              $cnameZone = "_msdcs.$forest"
+              $cnames = Get-DnsServerResourceRecord -ZoneName $cnameZone -RRType CName -ErrorAction SilentlyContinue
+              $Ansible.Result = @{
+                  Attempts          = $attempt
+                  LdapSrvRecords    = $srv.Count
+                  MsdcsCnameRecords = @($cnames).Count
+              }
+              return
+          }
+          # Light nudge — restart Netlogon every ~30s to re-trigger registration
+          # in case it didn't catch the zone-loaded transition on first try.
+          if ($attempt -gt 0 -and ($attempt % 3) -eq 0) {
+              Restart-Service Netlogon -Force -ErrorAction SilentlyContinue
+              & nltest /dsregdns | Out-Null
+          }
+          Start-Sleep -Seconds {{ ad_dc_dns_poll_interval }}
+      }
+      throw "_ldap._tcp.$forest SRV records did not register within {{ ad_dc_dns_settle_minutes }} minutes. Init-sync bypass likely didn't take effect — check DNS Server event 4013 and NTDS event log."
+  register: r_dns_srv_registered
+
+- name: "Show DNS registration result"
+  ansible.builtin.debug:
+    var: r_dns_srv_registered.result
+
+- name: "Verify forest health via dcdiag /q"
+  ansible.windows.win_command: dcdiag /q
+  register: r_dcdiag
+  changed_when: false
+  failed_when: r_dcdiag.rc != 0 or (r_dcdiag.stdout_lines | length > 0)
+
+- name: "Show dcdiag output if any tests failed"
+  ansible.builtin.debug:
+    msg: "{{ r_dcdiag.stdout_lines }}"
+  when: r_dcdiag.stdout_lines | length > 0
+
+- name: "Verify core AD services are running"
+  ansible.windows.win_powershell:
+    script: |
+      $required = @('NTDS','DNS','Netlogon','Kdc','W32Time')
+      $bad = @()
+      foreach ($svc in $required) {
+          $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+          if (-not $s -or $s.Status -ne 'Running') {
+              $bad += "$svc=$($s.Status)"
+          }
+      }
+      if ($bad.Count -gt 0) {
+          throw "Required services not Running: $($bad -join ', ')"
+      }
+      $Ansible.Result = @{ Services = ($required -join ', ') + ' all Running' }
+  register: r_services
+  changed_when: false
