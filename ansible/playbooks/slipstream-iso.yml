@@ -1,0 +1,58 @@
+---
+# Operator-triggered, runs only when a new LCU wave needs to be slipstreamed
+# into the Server 2025 install ISO. Not part of the numbered 0N-* full-build
+# sequence; rerun ~quarterly (or on Microsoft cumulative).
+#
+# Prerequisites (one-time per LCU wave):
+#   1. Identify target LCU + checkpoint chain (see role README + ADR-035).
+#   2. Download .msu files to /home/madmin/vm-lab/iso/updates/.
+#   3. Capture SHA256 of each MSU; record in slipstream_msu_files below.
+#   4. Ensure slipstream_dism_host is reachable in pre-promotion state
+#      (WORKGROUP / StandaloneServer; reachable as local Administrator).
+#
+# Run:
+#   ansible-playbook -i inventory/lab.yml --vault-password-file ~/.ansible-vault-pass-corp-lab \
+#     playbooks/slipstream-iso.yml
+#
+# Output:
+#   {{ iso_paths.windows_server_2025 }}  (defaults to WindowsServer2025-patched-<build>.iso)
+#   SHA256 logged at end of run; record in iso_checksums.windows_server_2025
+#   and slipstream_output_iso_sha256 for idempotent re-runs.
+
+- name: "Slipstream Server 2025 cumulative updates into install ISO"
+  hosts: kvm_host
+  gather_facts: false
+  vars:
+    # --- Target LCU wave (refresh per LCU; see role README) ---
+    slipstream_target_build: "26100.32860"
+    slipstream_msu_files:
+      # Foundational checkpoint LCU (Sept 2024). Required by every subsequent
+      # Server 2025 24H2 cumulative; the catalog UI flags it as a prerequisite
+      # when you click Download on any post-checkpoint LCU.
+      - kb: KB5043080
+        filename: "windows11.0-kb5043080-x64_953449672073f8fb99badb4cc6d5d7849b9c83e8.msu"
+        sha256: "819632610a101af11c72907fb13ff05b5fb4222c0e263ee9a03bcc1d1d5f26a4"
+      # Target LCU (May 2026, build 26100.32860). Includes fix for the
+      # Server 2025 RTM Netlogon SRV-registration regression originally
+      # shipped in KB5060842 (June 2025).
+      - kb: KB5087539
+        filename: "windows11.0-kb5087539-x64_f796cb25e32212f8115f26ee8ff22397f09d0036.msu"
+        sha256: "18bcf4eba2d04734b15685b6714fc16104ffc146f4dc77d94df1c03b043ce674"
+
+    # --- ISO inputs/outputs (resolves through group_vars/all/main.yml) ---
+    slipstream_pristine_iso: "{{ iso_paths.windows_server_2025_pristine }}"
+    slipstream_pristine_iso_sha256: "{{ iso_checksums.windows_server_2025_pristine }}"
+    slipstream_output_iso: "{{ iso_paths.windows_server_2025 }}"
+    slipstream_output_iso_sha256: "{{ iso_checksums.windows_server_2025 | default('') }}"
+    slipstream_wim_image_name: "Windows Server 2025 SERVERSTANDARD"
+    slipstream_wim_index: "{{ wim_edition.windows_server_2025 }}"
+
+    # --- DISM worker (ADDC01-corp on vm-built baseline) ---
+    # Override at play level so we connect as the *local* Administrator
+    # (not the domain-admin steady-state that dc.yml advertises). This
+    # playbook always runs against a pre-promotion ADDC01.
+    ansible_user: Administrator
+    ansible_password: "{{ vault_dc_admin_password }}"
+
+  roles:
+    - kvm_iso_slipstream

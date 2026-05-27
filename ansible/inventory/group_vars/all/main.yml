@@ -43,8 +43,14 @@ seed_iso_dir: "{{ vm_lab_root }}/seed-iso"
 backups_dir: "{{ vm_lab_root }}/backups"
 
 # --- Install media (ADR-018: virtio-win pinned to 0.1.271; never use 0.1.285) ---
+# Per ADR-035, Server 2025 has two ISOs: the upstream-pristine RTM media
+# (input to kvm_iso_slipstream) and the patched output (default consumed by
+# kvm_windows_vm). Until kvm_iso_slipstream has produced the patched ISO,
+# windows_server_2025 points at a path that doesn't exist yet — 01-provision-dc.yml
+# will fail fast with a clear "missing patched ISO" error in that case.
 iso_paths:
-  windows_server_2025: "{{ iso_dir }}/WindowsServer2025.iso"
+  windows_server_2025_pristine: "{{ iso_dir }}/WindowsServer2025.iso"
+  windows_server_2025: "{{ iso_dir }}/WindowsServer2025-patched-26100.32860.iso"
   windows_11_enterprise: "{{ iso_dir }}/Windows11Enterprise.iso"
   ubuntu_24_04: "{{ iso_dir }}/noble-server-cloudimg-amd64.img"
   virtio_win: "{{ iso_dir }}/virtio-win-0.1.271.iso"
@@ -55,7 +61,13 @@ iso_paths:
 iso_checksums:
   # Server 2025 Std Eval + Desktop Experience, Sept 2024 RTM build 26100.1742,
   # fetched 2026-05-26 via the official MS fwlink → Azure CDN (5,738,432 KiB).
-  windows_server_2025: d0ef4502e350e3c6c53c15b1b3020d38a5ded011bf04998e950720ac8579b23d
+  windows_server_2025_pristine: d0ef4502e350e3c6c53c15b1b3020d38a5ded011bf04998e950720ac8579b23d
+  # Patched ISO SHA256 — produced 2026-05-27 by playbooks/slipstream-iso.yml
+  # from pristine RTM 26100.1742 + KB5043080 (checkpoint, Sept 2024) +
+  # KB5087539 (target LCU, May 2026, build 26100.32860). Output: 9.13 GB.
+  # Subsequent slipstream runs short-circuit on this hash; 01-provision-dc.yml
+  # asserts against it before building from the patched media.
+  windows_server_2025: 84a05501ba5c018162bb9a0ea9e89bc09175f17abf12f368987bc2f91b613786
 
 # --- WIM edition indices (captured 2026-05-26 from each ISO's sources/install.wim) ---
 wim_edition:

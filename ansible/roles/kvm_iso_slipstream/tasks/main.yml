@@ -1,0 +1,507 @@
+---
+# kvm_iso_slipstream — patch a Windows install ISO at source via DISM
+# Add-WindowsPackage applied to install.wim, then rebuild ISO with xorriso.
+#
+# Workflow:
+#   A. Pre-flight  (localhost) — idempotency + provenance gates
+#   B. Linux extract (localhost) — loop-mount pristine ISO, rsync staging,
+#      pull install.wim out of sources/
+#   C. DISM servicing (delegate_to: slipstream_dism_host) — push WIM + MSUs
+#      to Windows worker via in-VM HTTP fetch (much faster than WinRM-chunked
+#      file copy), Mount-WindowsImage, Add-WindowsPackage on the folder
+#      containing the checkpoint LCU + target LCU (DISM auto-orders),
+#      /Cleanup-Image, Dismount-WindowsImage -Save.
+#   D. Linux repack (localhost) — pull WIM back via SMB share (faster than
+#      ansible.builtin.fetch), swap into staging, xorriso rebuild patched ISO,
+#      compute SHA256, record.
+#
+# Idempotency:
+#   - Output ISO with matching SHA256: skip entire pipeline.
+#   - Pristine ISO + MSU SHA256s verified before any state mutation.
+#
+# ADRs: ADR-035 (slipstream design), ADR-034 (companion workarounds remain in
+# ad_dc), ADR-018 (provenance discipline for ISO/MSU SHA256s).
+
+- name: "kvm_iso_slipstream | sanity-check required inputs"
+  ansible.builtin.assert:
+    that:
+      - slipstream_pristine_iso is defined
+      - slipstream_pristine_iso_sha256 is defined
+      - slipstream_target_build is defined
+      - slipstream_msu_files is defined
+      - slipstream_msu_files | length > 0
+      - slipstream_wim_image_name is defined
+      - slipstream_wim_index is defined
+      - slipstream_output_iso is defined
+    fail_msg: >-
+      kvm_iso_slipstream requires slipstream_pristine_iso, _sha256,
+      _target_build, _msu_files, _wim_image_name, _wim_index, _output_iso.
+
+# =============================================================================
+# PHASE A — Pre-flight
+# =============================================================================
+
+- name: "kvm_iso_slipstream | check if patched output ISO already exists"
+  ansible.builtin.stat:
+    path: "{{ slipstream_output_iso }}"
+    checksum_algorithm: sha256
+  register: existing_output_iso
+
+- name: "kvm_iso_slipstream | short-circuit if output ISO matches expected SHA256"
+  ansible.builtin.set_fact:
+    slipstream_skip: >-
+      {{ existing_output_iso.stat.exists
+         and (slipstream_output_iso_sha256 is defined
+              and slipstream_output_iso_sha256 | length > 0
+              and existing_output_iso.stat.checksum == slipstream_output_iso_sha256) }}
+
+- name: "kvm_iso_slipstream | report skip"
+  ansible.builtin.debug:
+    msg: >-
+      Patched ISO {{ slipstream_output_iso }} already present with matching
+      SHA256 — slipstream pipeline skipped.
+  when: slipstream_skip | bool
+
+- name: "kvm_iso_slipstream | main pipeline (skip if output already current)"
+  when: not (slipstream_skip | bool)
+  block:
+
+    - name: "kvm_iso_slipstream | verify pristine ISO SHA256"
+      ansible.builtin.stat:
+        path: "{{ slipstream_pristine_iso }}"
+        checksum_algorithm: sha256
+      register: pristine_iso_stat
+
+    - name: "kvm_iso_slipstream | assert pristine ISO SHA256 matches"
+      ansible.builtin.assert:
+        that: pristine_iso_stat.stat.checksum == slipstream_pristine_iso_sha256
+        fail_msg: >-
+          {{ slipstream_pristine_iso }} SHA256 is {{ pristine_iso_stat.stat.checksum }};
+          expected {{ slipstream_pristine_iso_sha256 }}. Refusing to slipstream
+          unknown-provenance media.
+
+    - name: "kvm_iso_slipstream | verify each MSU SHA256"
+      ansible.builtin.stat:
+        path: "{{ slipstream_updates_dir }}/{{ item.filename }}"
+        checksum_algorithm: sha256
+      register: msu_stats
+      loop: "{{ slipstream_msu_files }}"
+      loop_control:
+        label: "{{ item.kb }}"
+
+    - name: "kvm_iso_slipstream | assert each MSU SHA256 matches"
+      ansible.builtin.assert:
+        that: item.stat.checksum == item.item.sha256
+        fail_msg: >-
+          {{ item.item.filename }} SHA256 is {{ item.stat.checksum }};
+          expected {{ item.item.sha256 }}.
+      loop: "{{ msu_stats.results }}"
+      loop_control:
+        label: "{{ item.item.kb }}"
+
+    - name: "kvm_iso_slipstream | probe DISM host reachability"
+      ansible.windows.win_ping:
+      delegate_to: "{{ slipstream_dism_host }}"
+
+    # =========================================================================
+    # PHASE B — Linux extract
+    # =========================================================================
+
+    - name: "kvm_iso_slipstream | ensure staging dirs exist"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ slipstream_staging_dir }}"
+
+    - name: "kvm_iso_slipstream | ensure pristine ISO mount point exists"
+      become: true
+      ansible.builtin.file:
+        path: "{{ slipstream_iso_mount }}"
+        state: directory
+        mode: '0755'
+
+    # Server 2025 install ISO is UDF-primary; rsync from loop-mount captures
+    # the full tree (xorriso osirrox-extract on this ISO sees only README.TXT).
+    # Reuses the pattern from kvm_windows_vm.
+    - name: "kvm_iso_slipstream | extract pristine ISO to staging (loop-mount + rsync)"
+      become: true
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          if mountpoint -q {{ slipstream_iso_mount | quote }}; then
+            umount {{ slipstream_iso_mount | quote }}
+          fi
+          mount -o loop,ro {{ slipstream_pristine_iso | quote }} {{ slipstream_iso_mount | quote }}
+          trap 'umount {{ slipstream_iso_mount | quote }}' EXIT
+          rsync -a --no-perms --no-owner --no-group --chmod=u=rwX,g=rX,o=rX \
+            {{ slipstream_iso_mount | quote }}/ {{ slipstream_staging_dir | quote }}/
+          chown -R "${SUDO_USER:-root}:${SUDO_USER:-root}" {{ slipstream_staging_dir | quote }}
+        creates: "{{ slipstream_staging_dir }}/setup.exe"
+        executable: /bin/bash
+
+    - name: "kvm_iso_slipstream | stat staged install.wim"
+      ansible.builtin.stat:
+        path: "{{ slipstream_wim_local_path }}"
+      register: wim_local_stat
+
+    - name: "kvm_iso_slipstream | fail if install.wim missing from staging"
+      ansible.builtin.assert:
+        that: wim_local_stat.stat.exists
+        fail_msg: "{{ slipstream_wim_local_path }} not found after rsync — pristine ISO layout unexpected."
+
+    # =========================================================================
+    # PHASE C — DISM servicing
+    # =========================================================================
+    #
+    # Push files via HTTP (Linux server) + pull via SMB share (Windows host).
+    # Both transports run at LAN-native speed over virtio-net. WinRM/PSRP
+    # chunked file transfer would take ~30 min one-way for a 5 GB WIM.
+
+    # --- C.1: stage Windows-side workdir + transfer credentials ---------------
+
+    - name: "kvm_iso_slipstream | create Windows-side workdirs"
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ slipstream_dism_workdir }}"
+        - "{{ slipstream_dism_updates_dir }}"
+        - "{{ slipstream_dism_mount_dir }}"
+        - "{{ slipstream_dism_scratch_dir }}"
+      delegate_to: "{{ slipstream_dism_host }}"
+
+    # --- C.2: stand up a temporary HTTP server on the Linux host --------------
+    #
+    # Bound to the libvirt corp-lab gateway (10.10.0.1) so ADDC01 can reach
+    # it over the virtio-net link. Single short-lived process; killed in the
+    # always: block at the end of the DISM phase.
+
+    - name: "kvm_iso_slipstream | start temporary HTTP server for WIM + MSU delivery"
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          pid_file=/tmp/slipstream-http.pid
+          if [ -f "$pid_file" ] && kill -0 "$(cat $pid_file)" 2>/dev/null; then
+            kill "$(cat $pid_file)" || true
+            sleep 1
+          fi
+          cd {{ slipstream_staging_dir | quote }}
+          # Logs to /tmp; serves the entire staging tree (sources/install.wim
+          # at /sources/install.wim, MSUs symlinked at root).
+          for msu_path in {{ slipstream_updates_dir | quote }}/*.msu; do
+            ln -sf "$msu_path" "{{ slipstream_staging_dir }}/$(basename $msu_path)"
+          done
+          nohup python3 -m http.server 8080 --bind {{ corp_subnet.gateway }} \
+            >/tmp/slipstream-http.log 2>&1 &
+          echo $! > "$pid_file"
+          # Give the server a moment to bind
+          sleep 1
+          if ! kill -0 "$(cat $pid_file)" 2>/dev/null; then
+            echo "ERROR: http.server failed to start; see /tmp/slipstream-http.log" >&2
+            cat /tmp/slipstream-http.log >&2
+            exit 1
+          fi
+        executable: /bin/bash
+      changed_when: true
+
+    - name: "kvm_iso_slipstream | wait for HTTP server to accept connections"
+      ansible.builtin.wait_for:
+        host: "{{ corp_subnet.gateway }}"
+        port: 8080
+        timeout: 15
+
+    # --- C.3: DISM servicing block with guaranteed teardown -------------------
+    #
+    # Two empirical findings drove the structure here (2026-05-27 first
+    # slipstream attempt against ADDC01 on Server 2025 24H2 RTM):
+    #
+    # 1. Defender's *exclusion-path* alone is insufficient. The exclusion only
+    #    prevents NEW scans; it does not release handles from scans already
+    #    in progress. Add-WindowsPackage failed with "needs to be remounted"
+    #    and Dismount-WindowsImage -Discard hit "directory could not be
+    #    completely unmounted" because MsMpEng held open file handles. The
+    #    fix that actually released the handles was
+    #    `Set-MpPreference -DisableRealtimeMonitoring $true`, applied BEFORE
+    #    the WIM was pushed to the host (so MsMpEng never started scanning
+    #    the WIM in the first place).
+    #
+    # 2. Cross-PSSession DISM state is unreliable. The mount registers in
+    #    `dism /get-mountedwiminfo` and a same-session Get-WindowsImage,
+    #    but a fresh PSSession opened by Ansible's next win_shell task can
+    #    fail to see the mount and report "needs to be remounted." Combining
+    #    Mount + Add-WindowsPackage + Cleanup-Image + Dismount-WindowsImage
+    #    into a SINGLE win_shell invocation eliminates the boundary problem
+    #    entirely. The single call needs a long WinRM read timeout (7200s
+    #    here) because the LCU apply alone is ~15-30 min on Server 2025.
+
+    - name: "kvm_iso_slipstream | DISM servicing (Windows-side)"
+      block:
+
+        # --- C.3.1: drop Defender out of the way BEFORE any file push --------
+        - name: "kvm_iso_slipstream | disable Defender real-time + add path exclusions (must precede WIM push)"
+          when: slipstream_defender_exclusion | bool
+          ansible.windows.win_shell: |
+            $ErrorActionPreference = 'Continue'
+            Add-MpPreference -ExclusionPath '{{ slipstream_dism_workdir }}' -ErrorAction SilentlyContinue
+            Add-MpPreference -ExclusionPath '{{ slipstream_dism_mount_dir }}' -ErrorAction SilentlyContinue
+            Add-MpPreference -ExclusionPath '{{ slipstream_dism_scratch_dir }}' -ErrorAction SilentlyContinue
+            Add-MpPreference -ExclusionPath '{{ slipstream_dism_updates_dir }}' -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+            # Give any in-flight scans a moment to drain before we start
+            # writing large files into the excluded paths.
+            Start-Sleep -Seconds 3
+            $status = Get-MpComputerStatus -ErrorAction SilentlyContinue
+            Write-Output ("realtime_disabled=" + ($status.RealTimeProtectionEnabled -eq $false))
+          delegate_to: "{{ slipstream_dism_host }}"
+          register: defender_off
+
+        - name: "kvm_iso_slipstream | report Defender state"
+          ansible.builtin.debug:
+            var: defender_off.stdout_lines
+
+        # --- C.3.2: file transport — Linux HTTP → DISM host ------------------
+
+        - name: "kvm_iso_slipstream | fetch install.wim from Linux HTTP → DISM host"
+          ansible.windows.win_shell: |
+            $ProgressPreference = 'SilentlyContinue'   # 10x faster than default
+            Invoke-WebRequest `
+              -Uri 'http://{{ corp_subnet.gateway }}:8080/sources/install.wim' `
+              -OutFile '{{ slipstream_dism_wim_path }}' `
+              -UseBasicParsing
+            $item = Get-Item '{{ slipstream_dism_wim_path }}'
+            Write-Output ("wim_bytes=" + $item.Length)
+          delegate_to: "{{ slipstream_dism_host }}"
+          register: wim_fetch
+
+        - name: "kvm_iso_slipstream | report WIM fetch result"
+          ansible.builtin.debug:
+            var: wim_fetch.stdout_lines
+
+        - name: "kvm_iso_slipstream | fetch each MSU from Linux HTTP → DISM host"
+          ansible.windows.win_shell: |
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest `
+              -Uri 'http://{{ corp_subnet.gateway }}:8080/{{ item.filename }}' `
+              -OutFile '{{ slipstream_dism_updates_dir }}\{{ item.filename }}' `
+              -UseBasicParsing
+          delegate_to: "{{ slipstream_dism_host }}"
+          loop: "{{ slipstream_msu_files }}"
+          loop_control:
+            label: "{{ item.kb }}"
+
+        # --- C.3.3: consolidated DISM pipeline (single PSSession) ------------
+        #
+        # Mount + Add-WindowsPackage + Cleanup-Image + Dismount-Save in ONE
+        # call. Total expected wall-clock: 45-75 min for the May 2026 LCU
+        # chain (KB5043080 + KB5087539 ~ 2.5 GB MSU input applied to a 5 GB
+        # WIM, then Cleanup-Image consolidating ~2 GB component-store delta).
+
+        - name: "kvm_iso_slipstream | Mount → Add-WindowsPackage → Cleanup-Image → Dismount-Save (45-75 min)"
+          ansible.windows.win_shell: |
+            $ErrorActionPreference = 'Stop'
+            Write-Output "[phase] Mount-WindowsImage"
+            Mount-WindowsImage -ImagePath '{{ slipstream_dism_wim_path }}' -Index {{ slipstream_wim_index }} -Path '{{ slipstream_dism_mount_dir }}' -ScratchDirectory '{{ slipstream_dism_scratch_dir }}' | Out-Null
+            $img = Get-WindowsImage -Mounted | Where-Object { $_.Path -eq '{{ slipstream_dism_mount_dir }}' }
+            if (-not $img) { throw "Mount registered but Get-WindowsImage -Mounted returned no match for {{ slipstream_dism_mount_dir }}" }
+            Write-Output ("[ok]    Mounted ImageIndex=" + $img.ImageIndex + " ImagePath=" + $img.ImagePath + " MountStatus=" + $img.MountStatus)
+
+            Write-Output "[phase] Add-WindowsPackage (auto-discovers checkpoint chain from -PackagePath folder)"
+            Add-WindowsPackage -Path '{{ slipstream_dism_mount_dir }}' -PackagePath '{{ slipstream_dism_updates_dir }}' -ScratchDirectory '{{ slipstream_dism_scratch_dir }}' -LogLevel WarningsInfo | Out-Null
+            Write-Output "[ok]    Add-WindowsPackage complete"
+
+            Write-Output "[phase] dism /Cleanup-Image /StartComponentCleanup (no /ResetBase — keep removability)"
+            $cleanup = & dism.exe /Image:'{{ slipstream_dism_mount_dir }}' /Cleanup-Image /StartComponentCleanup 2>&1
+            if ($LASTEXITCODE -ne 0) { throw ("Cleanup-Image failed (exit " + $LASTEXITCODE + "): " + ($cleanup | Out-String)) }
+            Write-Output "[ok]    Cleanup-Image complete"
+
+            Write-Output "[phase] Dismount-WindowsImage -Save"
+            Dismount-WindowsImage -Path '{{ slipstream_dism_mount_dir }}' -Save -ScratchDirectory '{{ slipstream_dism_scratch_dir }}' | Out-Null
+            Write-Output "[ok]    Dismount-Save complete"
+          delegate_to: "{{ slipstream_dism_host }}"
+          vars:
+            ansible_winrm_read_timeout_sec: 7200
+            ansible_winrm_operation_timeout_sec: 6900
+          register: dism_pipeline
+
+        - name: "kvm_iso_slipstream | report DISM pipeline result"
+          ansible.builtin.debug:
+            var: dism_pipeline.stdout_lines
+
+        # Marker fact so the always: discard task knows save completed
+        # successfully (uses dism_pipeline below instead of legacy wim_save).
+        - name: "kvm_iso_slipstream | mark DISM pipeline success for always: gating"
+          ansible.builtin.set_fact:
+            slipstream_dism_pipeline_ok: true
+
+        # --- C.4: hand patched WIM back to Linux via SMB share ----------------
+
+        - name: "kvm_iso_slipstream | publish temporary SMB share for return transfer"
+          ansible.windows.win_shell: |
+            $ErrorActionPreference = 'Stop'
+            $share = Get-SmbShare -Name 'SlipstreamOut' -ErrorAction SilentlyContinue
+            if ($share) { Remove-SmbShare -Name 'SlipstreamOut' -Force }
+            New-SmbShare -Name 'SlipstreamOut' `
+              -Path '{{ slipstream_dism_workdir }}' `
+              -ReadAccess 'Administrators' | Out-Null
+            Write-Output "share published"
+          delegate_to: "{{ slipstream_dism_host }}"
+
+        - name: "kvm_iso_slipstream | pull patched install.wim back via SMB"
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              smbclient '//{{ hostvars[slipstream_dism_host].ansible_host }}/SlipstreamOut' \
+                -U 'Administrator%{{ vault_dc_admin_password }}' \
+                -c 'get install.wim {{ slipstream_wim_local_path }}'
+              ls -la {{ slipstream_wim_local_path }}
+            executable: /bin/bash
+          no_log: true
+          changed_when: true
+
+        - name: "kvm_iso_slipstream | tear down SMB share"
+          ansible.windows.win_shell: |
+            Remove-SmbShare -Name 'SlipstreamOut' -Force -ErrorAction SilentlyContinue
+            Write-Output "share removed"
+          delegate_to: "{{ slipstream_dism_host }}"
+
+      # always: runs even if any task in the block fails. Critical for
+      # leaving the DISM host in a clean state (no mounted WIMs, no Defender
+      # exclusions lingering).
+      always:
+
+        - name: "kvm_iso_slipstream | stop HTTP server (always)"
+          ansible.builtin.shell:
+            cmd: |
+              pid_file=/tmp/slipstream-http.pid
+              if [ -f "$pid_file" ]; then
+                kill "$(cat $pid_file)" 2>/dev/null || true
+                rm -f "$pid_file"
+              fi
+              # Remove the MSU symlinks dropped into staging root
+              for sl in {{ slipstream_staging_dir | quote }}/*.msu; do
+                [ -L "$sl" ] && rm -f "$sl" || true
+              done
+            executable: /bin/bash
+          changed_when: false
+
+        - name: "kvm_iso_slipstream | ensure mounted WIM is dismounted-discard if pipeline did not finish"
+          ansible.windows.win_shell: |
+            $mounted = Get-WindowsImage -Mounted | Where-Object { $_.Path -eq '{{ slipstream_dism_mount_dir }}' }
+            if ($mounted) {
+              Write-Output "Discarding partial mount at $($mounted.Path)"
+              Dismount-WindowsImage -Path '{{ slipstream_dism_mount_dir }}' -Discard -ErrorAction SilentlyContinue
+              # Also run dism /cleanup-wim to clear any residual mount registration.
+              & dism /cleanup-wim 2>&1 | Out-Null
+            } else {
+              Write-Output "No partial mount to discard"
+            }
+          delegate_to: "{{ slipstream_dism_host }}"
+          when: slipstream_dism_pipeline_ok is not defined
+          ignore_errors: true
+
+        - name: "kvm_iso_slipstream | re-enable Defender real-time + remove path exclusions (always)"
+          when: slipstream_defender_exclusion | bool
+          ansible.windows.win_shell: |
+            $ErrorActionPreference = 'Continue'
+            Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
+            Remove-MpPreference -ExclusionPath '{{ slipstream_dism_workdir }}' -ErrorAction SilentlyContinue
+            Remove-MpPreference -ExclusionPath '{{ slipstream_dism_mount_dir }}' -ErrorAction SilentlyContinue
+            Remove-MpPreference -ExclusionPath '{{ slipstream_dism_scratch_dir }}' -ErrorAction SilentlyContinue
+            Remove-MpPreference -ExclusionPath '{{ slipstream_dism_updates_dir }}' -ErrorAction SilentlyContinue
+            $status = Get-MpComputerStatus -ErrorAction SilentlyContinue
+            Write-Output ("realtime_restored=" + ($status.RealTimeProtectionEnabled -eq $true))
+          delegate_to: "{{ slipstream_dism_host }}"
+          ignore_errors: true
+
+    # =========================================================================
+    # PHASE D — Linux repack
+    # =========================================================================
+
+    - name: "kvm_iso_slipstream | swap patched install.wim into staging dir"
+      # smbclient pulled it directly into the staging path; just verify size.
+      ansible.builtin.stat:
+        path: "{{ slipstream_wim_local_path }}"
+      register: patched_wim_stat
+
+    - name: "kvm_iso_slipstream | assert patched WIM exists and is non-trivial"
+      ansible.builtin.assert:
+        that:
+          - patched_wim_stat.stat.exists
+          - patched_wim_stat.stat.size > 1073741824   # > 1 GB sanity check
+        fail_msg: >-
+          Patched install.wim missing or suspiciously small at
+          {{ slipstream_wim_local_path }}.
+
+    - name: "kvm_iso_slipstream | swap BOOTX64.EFI for cdboot_noprompt.efi (consistency with kvm_windows_vm)"
+      ansible.builtin.copy:
+        src: "{{ slipstream_staging_dir }}/efi/microsoft/boot/cdboot_noprompt.efi"
+        dest: "{{ slipstream_staging_dir }}/efi/boot/bootx64.efi"
+        remote_src: true
+        mode: '0644'
+
+    - name: "kvm_iso_slipstream | rebuild patched ISO via xorriso"
+      ansible.builtin.command:
+        argv:
+          - xorriso
+          - -as
+          - mkisofs
+          - -o
+          - "{{ slipstream_output_iso }}"
+          - -iso-level
+          - "4"
+          - -joliet
+          - -joliet-long
+          - -rock
+          - -V
+          - "{{ slipstream_iso_volid }}"
+          - -no-emul-boot
+          - -e
+          - efi/microsoft/boot/efisys_noprompt.bin
+          - -graft-points
+          - "/={{ slipstream_staging_dir }}"
+      changed_when: true
+
+    - name: "kvm_iso_slipstream | compute SHA256 of patched ISO"
+      ansible.builtin.stat:
+        path: "{{ slipstream_output_iso }}"
+        checksum_algorithm: sha256
+      register: output_iso_stat
+
+    - name: "kvm_iso_slipstream | report patched ISO provenance"
+      ansible.builtin.debug:
+        msg:
+          - "Patched ISO:   {{ slipstream_output_iso }}"
+          - "Size (bytes):  {{ output_iso_stat.stat.size }}"
+          - "SHA256:        {{ output_iso_stat.stat.checksum }}"
+          - "Target build:  {{ slipstream_target_build }}"
+          - >-
+            Record this SHA256 in iso_checksums.windows_server_2025 (group_vars/all/main.yml)
+            and slipstream_output_iso_sha256 (role defaults or playbook vars) so future runs
+            short-circuit cleanly.
+
+    - name: "kvm_iso_slipstream | set fact for downstream consumers"
+      ansible.builtin.set_fact:
+        slipstream_result:
+          path: "{{ slipstream_output_iso }}"
+          sha256: "{{ output_iso_stat.stat.checksum }}"
+          size_bytes: "{{ output_iso_stat.stat.size }}"
+          target_build: "{{ slipstream_target_build }}"
+
+    # =========================================================================
+    # PHASE E — Optional cleanup
+    # =========================================================================
+
+    - name: "kvm_iso_slipstream | clean up DISM host workdir"
+      when: slipstream_cleanup_dism_host | bool
+      ansible.windows.win_file:
+        path: "{{ slipstream_dism_workdir }}"
+        state: absent
+      delegate_to: "{{ slipstream_dism_host }}"
+
+    - name: "kvm_iso_slipstream | clean up Linux staging dir"
+      when: slipstream_cleanup_linux_staging | bool
+      ansible.builtin.file:
+        path: "{{ slipstream_staging_dir }}"
+        state: absent

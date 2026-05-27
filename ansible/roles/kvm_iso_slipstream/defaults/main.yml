@@ -1,0 +1,55 @@
+---
+# Inputs (no defaults — playbook or caller must set):
+#   slipstream_pristine_iso          absolute path to pristine RTM ISO source
+#   slipstream_pristine_iso_sha256   expected SHA256 of pristine ISO (provenance gate)
+#   slipstream_target_build          OS build number after slipstream (e.g. "26100.32860")
+#   slipstream_msu_files             list of {kb, filename, sha256} in canonical order
+#                                    (foundational checkpoint first, target LCU last;
+#                                    DISM auto-orders internally, but this is the user-
+#                                    visible documentation of the chain)
+#   slipstream_wim_image_name        WIM image to service (e.g. "Windows Server 2025 SERVERSTANDARD")
+#   slipstream_wim_index             integer index of the image (2 for Server 2025 Standard DE)
+#   slipstream_output_iso            absolute path to write the patched ISO
+#   slipstream_output_iso_sha256     expected SHA256 of output (used for idempotency; on first
+#                                    run, this can be unset — role records the computed SHA in
+#                                    the play result. On subsequent runs, set this to short-
+#                                    circuit when the file exists with matching SHA)
+
+# === DISM servicing worker ===
+# Inventory hostname of a reachable Windows host (Server 2025 or newer) where DISM
+# Add-WindowsPackage will run. Tasks targeting this host are issued via delegate_to.
+# Connection credentials are pulled from this host's group_vars in the inventory.
+slipstream_dism_host: ADDC01-corp
+
+# === Linux-side paths (resolved on control node) ===
+slipstream_updates_dir: "{{ iso_dir }}/updates"
+slipstream_staging_dir: "{{ vm_lab_root }}/slipstream-stage"
+slipstream_iso_mount: "/mnt/iso-pristine-slipstream"
+slipstream_wim_local_path: "{{ slipstream_staging_dir }}/sources/install.wim"
+
+# === Windows-side paths (on slipstream_dism_host) ===
+slipstream_dism_workdir: 'C:\Slipstream'
+slipstream_dism_updates_dir: 'C:\Slipstream\updates'
+slipstream_dism_wim_path: 'C:\Slipstream\install.wim'
+slipstream_dism_mount_dir: 'C:\Slipstream\mount'
+slipstream_dism_scratch_dir: 'C:\Slipstream\scratch'
+
+# === Output ISO build options ===
+slipstream_iso_volid: "WINSRV2025_CORPLAB"
+
+# === Behavior toggles ===
+# Defender exclusion is added before mount and removed after dismount. Workaround for
+# the well-documented DISM Error 1812 ("request is not supported") caused by MsSense.exe
+# locking files inside the mounted image. Safe to leave on by default — the exclusion
+# scope is the mount dir only, and we restore the prior state on completion.
+slipstream_defender_exclusion: true
+
+# After successful slipstream, optionally remove the Windows-side workdir to free
+# disk on the DISM host. Set to false when iterating (faster re-runs because the
+# WIM is already pushed). Default true is the safer choice for fleet workflows.
+slipstream_cleanup_dism_host: true
+
+# After successful slipstream, optionally clear the Linux-side staging dir.
+# Default false because the next slipstream run can short-circuit the rsync-extract
+# step if the staging dir is still populated.
+slipstream_cleanup_linux_staging: false
