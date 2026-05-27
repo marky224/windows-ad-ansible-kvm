@@ -1,0 +1,61 @@
+---
+# Create the named domain admin account that becomes the steady-state Ansible
+# identity post-promotion. RID 500 (built-in Administrator) is hardened by
+# the ad_harden_builtin_admin role immediately after this — so this account
+# must exist and be verified working before that hardening runs.
+#
+# ADRs implemented: ADR-032 (named-admin tier).
+#
+# Connection assumption: this role is invoked from a play that connects as
+# the built-in domain Administrator (e.g. Administrator@corp.markandrewmarquez.com
+# with vault_dc_admin_password). It must run before ad_harden_builtin_admin
+# locks out that identity.
+
+- name: "Create OU=Admins under {{ forest.fqdn }} (if absent)"
+  microsoft.ad.ou:
+    name: Admins
+    path: "DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+    description: "Container for named domain admin accounts (ADR-032)"
+    state: present
+
+- name: "Create named domain admin '{{ named_admin.sam }}' in OU=Admins"
+  microsoft.ad.user:
+    name: "{{ named_admin.sam }}"
+    sam_account_name: "{{ named_admin.sam }}"
+    upn: "{{ named_admin.upn }}"  # module uses short 'upn', not 'user_principal_name'
+    password: "{{ vault_named_admin_password }}"
+    update_password: on_create        # don't fight manual rotations
+    password_never_expires: true      # service-style account; rotate manually via vault edit + on_create override
+    enabled: true
+    path: "{{ named_admin.ou_dn }}"
+    display_name: "{{ named_admin.display_name }}"
+    description: "{{ named_admin.description }}"
+    groups:
+      set:
+        - Domain Admins
+        - Enterprise Admins
+    state: present
+  register: r_named_admin
+
+- name: "Verify {{ named_admin.sam }} is in Domain Admins + Enterprise Admins"
+  ansible.windows.win_powershell:
+    script: |
+      $user = Get-ADUser -Identity '{{ named_admin.sam }}' -Properties MemberOf -ErrorAction Stop
+      $groups = @($user.MemberOf | ForEach-Object { (Get-ADGroup $_).Name })
+      $required = @('Domain Admins', 'Enterprise Admins')
+      $missing = @($required | Where-Object { $_ -notin $groups })
+      if ($missing.Count -gt 0) {
+          throw "Named admin missing required group memberships: $($missing -join ', ')"
+      }
+      $Ansible.Result = @{
+          DistinguishedName    = $user.DistinguishedName
+          UserPrincipalName    = $user.UserPrincipalName
+          Enabled              = $user.Enabled
+          Groups               = ($groups -join ', ')
+      }
+  register: r_named_admin_check
+  changed_when: false
+
+- name: "Show created named-admin identity"
+  ansible.builtin.debug:
+    var: r_named_admin_check.result

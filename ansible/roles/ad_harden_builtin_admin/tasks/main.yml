@@ -1,0 +1,66 @@
+---
+# Apply Microsoft Appendix D account-flag hardening to the built-in domain
+# Administrator (RID 500), demoting it to break-glass / disaster-recovery use.
+#
+# WARNING: After this role runs, password-based authentication as
+# CORP\Administrator is IMPOSSIBLE. The SmartcardLogonRequired flag has the
+# documented side effect of AD randomizing the password to a 120-byte
+# unknowable value. Only DSRM-mode console access (using vault_safe_mode_password)
+# can re-enable the account.
+#
+# This role assumes the calling play has already verified the named domain
+# admin (madmin-da) works — by virtue of connecting AS that user to run this
+# role. If the named admin couldn't authenticate, this play would never reach
+# this role.
+#
+# ADRs implemented: ADR-033 (Appendix D RID 500 hardening — account flags).
+# Deferred to ad_gpo role: Deny-logon GPO links per Appendix D.
+
+- name: "Apply Appendix D account flags to built-in domain Administrator"
+  ansible.windows.win_powershell:
+    script: |
+      # Read current state.
+      $user = Get-ADUser -Identity Administrator -Properties AccountNotDelegated,SmartcardLogonRequired -ErrorAction Stop
+
+      $changes = @()
+
+      # Flag 1: "Account is sensitive and cannot be delegated" (UAC bit 0x100000)
+      if (-not $user.AccountNotDelegated) {
+          Set-ADUser -Identity Administrator -AccountNotDelegated $true -ErrorAction Stop
+          $changes += 'AccountNotDelegated=true'
+      }
+
+      # Flag 2: "Smart card is required for interactive logon" (UAC bit 0x40000).
+      # Side effect: AD randomizes the password to a 120-byte random value.
+      # Apply LAST so we get the password-randomization side effect on the
+      # final pass, not on a partial-failure retry.
+      if (-not $user.SmartcardLogonRequired) {
+          Set-ADUser -Identity Administrator -SmartcardLogonRequired $true -ErrorAction Stop
+          $changes += 'SmartcardLogonRequired=true'
+      }
+
+      # Re-read for verification.
+      $after = Get-ADUser -Identity Administrator -Properties AccountNotDelegated,SmartcardLogonRequired,Enabled -ErrorAction Stop
+      if (-not $after.AccountNotDelegated) {
+          throw "AccountNotDelegated flag did not stick on built-in Administrator"
+      }
+      if (-not $after.SmartcardLogonRequired) {
+          throw "SmartcardLogonRequired flag did not stick on built-in Administrator"
+      }
+      if (-not $after.Enabled) {
+          throw "Built-in Administrator is unexpectedly Disabled — Appendix D wants it ENABLED but locked down, not disabled (forest recovery requires it enabled)."
+      }
+
+      $Ansible.Changed = ($changes.Count -gt 0)
+      $Ansible.Result = @{
+          ChangesApplied         = $changes
+          AccountNotDelegated    = $after.AccountNotDelegated
+          SmartcardLogonRequired = $after.SmartcardLogonRequired
+          Enabled                = $after.Enabled
+          Note                   = 'Password is now randomized by AD. Recover via DSRM only (vault_safe_mode_password).'
+      }
+  register: r_rid500_harden
+
+- name: "Show Appendix D hardening result"
+  ansible.builtin.debug:
+    var: r_rid500_harden.result
