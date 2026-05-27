@@ -32,7 +32,7 @@ vm_network: "{{ corp_subnet.libvirt_network_name }}"
 vm_netmask_prefix: 24
 
 # --- Identity / locale ---
-vm_local_admin_password: "{{ vault_local_admin_password }}"
+vm_local_admin_password: "{{ vault_dc_admin_password }}"  # renamed in ADR-031
 vm_timezone: "UTC"
 vm_locale: "en-US"
 vm_keyboard_layout: "0409:00000409"

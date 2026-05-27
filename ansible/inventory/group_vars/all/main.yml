@@ -6,6 +6,17 @@ forest:
   fqdn: corp.markandrewmarquez.com
   netbios: CORP
 
+# --- Named domain admin (ADR-032) ---
+# Single named *-da admin in OU=Admins, used as steady-state Ansible identity
+# after ad_admins role creates it. Convention: <principal>-da. Tiering suffix
+# extension (-da-t0 etc.) is the Phase 6+ pattern.
+named_admin:
+  sam: madmin-da
+  upn: "madmin-da@{{ forest.fqdn }}"
+  ou_dn: "OU=Admins,DC=corp,DC=markandrewmarquez,DC=com"
+  display_name: "madmin (Domain Admin)"
+  description: "Steady-state Ansible domain admin per ADR-032"
+
 # --- Network (matches _private/docs/NETWORK.md, ADR-005 + ADR-006) ---
 corp_subnet:
   cidr: 10.10.0.0/24

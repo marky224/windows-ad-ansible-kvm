@@ -1,8 +1,17 @@
 ---
-# DC-specific overrides. The Administrator credential post-promotion is the
-# domain Administrator (CORP\Administrator), not the local one.
-ansible_user: "CORP\\Administrator"
-ansible_password: "{{ vault_domain_admin_password }}"
+# DC-specific overrides.
+#
+# STEADY-STATE IDENTITY (post-promotion + post-named-admin-creation):
+# Connect as the named domain admin (madmin-da) per ADR-032, not as the
+# built-in domain Administrator (RID 500). RID 500 is hardened to break-glass
+# only by the ad_harden_builtin_admin role (ADR-033) — it cannot authenticate
+# via WinRM after that point.
+#
+# BOOTSTRAP IDENTITY (pre-promotion): plays in 02-configure-dc.yml that run
+# BEFORE the named admin exists override these at the play level
+# (ansible_user: Administrator + ansible_password: vault_dc_admin_password).
+ansible_user: "{{ named_admin.upn }}"
+ansible_password: "{{ vault_named_admin_password }}"
 
 # DC role markers — consumed by ad_* roles.
 dc_role:
@@ -14,5 +23,7 @@ dc_role:
   install_wsus: true
   is_pdc_time_source: true
 
-# DSRM (Directory Services Restore Mode) password — required by domain.
+# DSRM (Directory Services Restore Mode) password — required by microsoft.ad.domain.
+# Kept distinct from vault_dc_admin_password per ADR-031 (defense-in-depth: DSRM
+# is the only recovery path back to RID 500 after ADR-033's smartcard-required flag).
 safe_mode_password: "{{ vault_safe_mode_password }}"
