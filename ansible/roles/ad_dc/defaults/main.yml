@@ -10,9 +10,16 @@ ad_dc_ready_poll_minutes: 5        # how long to wait for Get-ADDomain to return
 ad_dc_ready_poll_interval: 10      # seconds between Get-ADDomain attempts
 
 # DNS SRV record registration validation (post-promotion).
-# See "Repl Perform Initial Synchronizations" pre-promotion fix below for why
-# we don't need aggressive self-heal here — the registry key handles it.
-ad_dc_dns_settle_minutes: 3        # total wait window for SRV records to appear
+# Netlogon's natural DNS-scavenger cycle is ~6 minutes (NlDnsScavengeWorker
+# in netlogon.log: "Set DNS scavenger to run in 6 minutes"). Empirically
+# verified 2026-05-27: a 3-min timeout consistently failed because Netlogon
+# emits NETLOGON 5782 ("No DNS servers configured") on early attempts but
+# successfully registers SRV/CNAME entries on the first scavenger fire at
+# ~6 min post-promotion. Setting to 10 min provides comfortable margin.
+# The earlier ADR-034 hypothesis ("Server 2025 RTM Netlogon regression
+# refuses to register") was misdiagnosed; what was observed was simply
+# this natural-cycle wait.
+ad_dc_dns_settle_minutes: 10       # total wait window for SRV records to appear
 ad_dc_dns_poll_interval: 10        # seconds between checks
 
 # Expected Windows hostname (set by Autounattend specialize pass — sanity-checked, not changed).
