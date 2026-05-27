@@ -54,20 +54,6 @@ Total wall-clock for a clean provision: **~60–75 minutes**, mostly unattended.
 
 ---
 
-## Why Milestone 2 was hard (a brief tour of the windlp jungle)
-
-Server 2025's "windlp" installer (the 24H2 redesigned setup pipeline) breaks several decade-old patterns that Packer/Vagrant/dockur templates rely on. Getting `kvm_windows_vm` to a deterministic green run required stacking five distinct fixes:
-
-1. **virtio-win #1100 workaround** — install CD must be on SATA bus, not virtio-scsi (else WinPE driver loading retriggers a known virtio-win bug → Autounattend never discovered).
-2. **Per-VM custom install ISO** — 24H2 windlp does not scan separate removable media for `Autounattend.xml`; it must be at the root of the install ISO itself. `xorriso` re-masters the install ISO per VM, also swapping `BOOTX64.EFI` for `cdboot_noprompt.efi` to bypass the "Press any key to boot from CD" prompt.
-3. **Pre-enrolled OVMF NVRAM BootOrder** — Ubuntu's OVMF won't auto-add removable-media boot entries on fresh NVRAM; without pre-enrollment via `virt-fw-vars --append-boot-filepath`, the VM drops to UEFI Interactive Shell.
-4. **Post-WinPE CD eject + forced cold restart** — Setup's queued reboot lands back on the CD by default (firmware priority + Autounattend's `WillWipeDisk=true` re-wipes the ESP each cycle → infinite WinPE loop). The role watches the SPICE screen for the install-progress UI → blank-screen transition (= WinPE committed `bcdboot`), then `virsh change-media --eject --live --config` + explicit `destroy` + `start` to force OVMF to re-enumerate devices and boot the disk's freshly-written Windows Boot Manager.
-5. **bootstrap.ps1 hardening** — Windows PowerShell 5.1 reads BOM-less scripts as CP1252, so a single em-dash from a markdown copy-paste silently breaks parsing → script never runs → no WinRM listener. The role lints the rendered `.ps1` for non-ASCII bytes at template time. Bootstrap also forces network profile to Private as line 1 (defense against the documented Server 2025 NLA-classifies-as-Public regression where Domain/Private-scoped firewall rules silently disable a few minutes after first logon).
-
-The handoff document in `_private/handoff/` captures the full saga.
-
----
-
 ## Hardware requirements
 
 - x86_64 with VT-x or AMD-V enabled in BIOS
