@@ -8,6 +8,32 @@ End-to-end automated build: from a bare Ubuntu 24.04 host, Ansible provisions a 
 
 ---
 
+## Status
+
+**Milestone 2 complete (2026-05-27)** — `kvm_windows_vm` role provisions a Windows Server 2025 24H2 VM from bare metal to a reachable WinRM HTTPS endpoint in ~12 minutes. Fully deterministic, no manual intervention.
+
+| Milestone | Status | What it produces |
+|---|---|---|
+| 1 — libvirt network | ✅ Done | `corp-lab` libvirt network, 10.10.0.0/24, no DHCP (DC owns it) |
+| 2 — Windows VM provisioner | ✅ Done | `kvm_windows_vm` role → Server 2025 VM, autologon, WinRM HTTPS:5986 reachable |
+| 3 — DC promotion + AD config | 🚧 Next | `ad_dc`, `ad_dns`, `ad_dhcp`, `ad_cs`, `ad_gpo`, `ad_ntp`, `ad_wsus` |
+| 4 — Client provisioning + domain join | ⏳ Planned | Win 11 + Ubuntu joined to `corp.markandrewmarquez.com` |
+| 5 — Smoke test + backups | ⏳ Planned | End-to-end verification + nightly state backup |
+
+### Milestone 2 visual progression
+
+| Stage | Screenshot |
+|---|---|
+| WinPE setup launching after CD-eject + cold-restart hand-off | ![Setup launching](docs/screenshots/milestone2-01-setup-launching.png) |
+| Install in progress (early phase) | ![Installing 24%](docs/screenshots/milestone2-02-installing-24pct.png) |
+| Install in progress (late phase) | ![Installing 83%](docs/screenshots/milestone2-03-installing-83pct.png) |
+| OOBE auto-skipped → autologon → desktop | ![Desktop](docs/screenshots/milestone2-04-desktop-after-autologon.png) |
+| Server Manager up, WinRM HTTPS:5986 reachable from host | ![Server Manager](docs/screenshots/milestone2-05-server-manager.png) |
+
+Validation: `ansible.windows.win_ping` → `pong` against `ADDC01-corp` at `10.10.0.10:5986`.
+
+---
+
 ## What you get
 
 | VM | OS | Role |
@@ -25,6 +51,20 @@ End-to-end automated build: from a bare Ubuntu 24.04 host, Ansible provisions a 
 - **Fire drill:** quarterly playbook restores the latest backup to a sandbox VM on an isolated network and runs the smoke test against it
 
 Total wall-clock for a clean provision: **~60–75 minutes**, mostly unattended.
+
+---
+
+## Why Milestone 2 was hard (a brief tour of the windlp jungle)
+
+Server 2025's "windlp" installer (the 24H2 redesigned setup pipeline) breaks several decade-old patterns that Packer/Vagrant/dockur templates rely on. Getting `kvm_windows_vm` to a deterministic green run required stacking five distinct fixes:
+
+1. **virtio-win #1100 workaround** — install CD must be on SATA bus, not virtio-scsi (else WinPE driver loading retriggers a known virtio-win bug → Autounattend never discovered).
+2. **Per-VM custom install ISO** — 24H2 windlp does not scan separate removable media for `Autounattend.xml`; it must be at the root of the install ISO itself. `xorriso` re-masters the install ISO per VM, also swapping `BOOTX64.EFI` for `cdboot_noprompt.efi` to bypass the "Press any key to boot from CD" prompt.
+3. **Pre-enrolled OVMF NVRAM BootOrder** — Ubuntu's OVMF won't auto-add removable-media boot entries on fresh NVRAM; without pre-enrollment via `virt-fw-vars --append-boot-filepath`, the VM drops to UEFI Interactive Shell.
+4. **Post-WinPE CD eject + forced cold restart** — Setup's queued reboot lands back on the CD by default (firmware priority + Autounattend's `WillWipeDisk=true` re-wipes the ESP each cycle → infinite WinPE loop). The role watches the SPICE screen for the install-progress UI → blank-screen transition (= WinPE committed `bcdboot`), then `virsh change-media --eject --live --config` + explicit `destroy` + `start` to force OVMF to re-enumerate devices and boot the disk's freshly-written Windows Boot Manager.
+5. **bootstrap.ps1 hardening** — Windows PowerShell 5.1 reads BOM-less scripts as CP1252, so a single em-dash from a markdown copy-paste silently breaks parsing → script never runs → no WinRM listener. The role lints the rendered `.ps1` for non-ASCII bytes at template time. Bootstrap also forces network profile to Private as line 1 (defense against the documented Server 2025 NLA-classifies-as-Public regression where Domain/Private-scoped firewall rules silently disable a few minutes after first logon).
+
+The handoff document in `_private/handoff/` captures the full saga.
 
 ---
 
@@ -50,7 +90,7 @@ sudo apt update && sudo apt install -y \
   python3-libvirt python3-lxml python3-winrm python3-pip \
   swtpm swtpm-tools ovmf \
   virt-manager virt-viewer \
-  samba samba-common-bin libnss-libvirt wimtools pipx
+  samba samba-common-bin libnss-libvirt wimtools pipx python3-virt-firmware
 
 sudo usermod -aG libvirt,kvm "$USER"
 sudo systemctl enable --now libvirtd
@@ -101,17 +141,17 @@ ansible-vault edit ansible/group_vars/all/vault.yml
 
 ```bash
 cd ansible
-ansible-playbook playbooks/00-libvirt-network.yml
-ansible-playbook playbooks/01-provision-dc.yml
-ansible-playbook playbooks/02-configure-dc.yml
-ansible-playbook playbooks/03-provision-clients.yml
-ansible-playbook playbooks/04-join-domain.yml
-ansible-playbook playbooks/05-provision-linux.yml
-ansible-playbook playbooks/06-join-linux.yml
-ansible-playbook playbooks/99-smoke-test.yml
+ansible-playbook playbooks/00-libvirt-network.yml         # ✅ Milestone 1
+ansible-playbook playbooks/01-provision-dc.yml            # ✅ Milestone 2
+ansible-playbook playbooks/02-configure-dc.yml            # 🚧 Milestone 3 (in progress)
+ansible-playbook playbooks/03-provision-clients.yml       # ⏳
+ansible-playbook playbooks/04-join-domain.yml             # ⏳
+ansible-playbook playbooks/05-provision-linux.yml         # ⏳
+ansible-playbook playbooks/06-join-linux.yml              # ⏳
+ansible-playbook playbooks/99-smoke-test.yml              # ⏳
 ```
 
-Or all in one:
+Or all in one (once Milestone 3+ ships):
 ```bash
 ansible-playbook playbooks/site.yml
 ```
@@ -121,40 +161,32 @@ ansible-playbook playbooks/site.yml
 ## Architecture
 
 - **Single mental model:** Ansible roles + playbooks. No standalone PowerShell scripts. Where Windows config has no native Ansible module (DNS server, DHCP, WSUS, GPO), the role uses inline `ansible.windows.win_powershell` blocks within YAML tasks.
-- **Hypervisor:** KVM/libvirt with `community.libvirt`. Each VM defined via libvirt XML rendered from Jinja2.
-- **Windows install:** thin `Autounattend.xml` (per-VM seed ISO via `xorriso`) gets the OS unattended + WinRM listening. All AD configuration owned by Ansible roles thereafter.
+- **Hypervisor:** KVM/libvirt with `community.libvirt`. Each VM defined via `virt-install` with q35 + OVMF UEFI + Secure Boot + swtpm TPM 2.0.
+- **Windows install:** per-VM custom install ISO (xorriso re-masters the Server 2025 ISO with `Autounattend.xml` at root and `cdboot_noprompt.efi` swapped in for the El Torito boot file). Bootstrap PowerShell runs from a separate seed ISO via Autounattend's `<FirstLogonCommands>`.
 - **Linux install:** cloud-init NoCloud datasource (also per-VM seed ISO).
 - **Authentication:** `ansible-vault` from day one — vault password file at `~/.ansible-vault-pass-corp-lab` (never committed).
 
 ## Roles
 
-| Role | Purpose |
-|---|---|
-| `kvm_network` | Define + start `corp-lab` libvirt network (10.10.0.0/24, NAT, no DHCP) |
-| `kvm_windows_vm` | Generic Windows VM provisioning (Autounattend seed, libvirt domain, boot, wait for WinRM) |
-| `kvm_linux_vm` | Generic Linux VM provisioning (cloud-init seed, boot, wait for SSH) |
-| `ad_dc` | Static IP, AD DS install, forest creation (`microsoft.ad.domain`) |
-| `ad_dns` | DNS forwarders, reverse zone |
-| `ad_dhcp` | DHCP scope + MAC-tied reservations for known clients |
-| `ad_cs` | Enterprise Root CA install + `cs_authority` + `cs_template` |
-| `ad_gpo` | Import MSFT SCT Server 2025 baseline + 12 lab-specific overrides |
-| `ad_ntp` | PDC NTP authority configuration |
-| `ad_wsus` | WSUS install + async sync trigger |
-| `domain_join_windows` | Win 11 client domain join (`microsoft.ad.membership`) |
-| `domain_join_linux` | Ubuntu domain join via `realmd` + `sssd` |
-| `ops_backup` | AD state backup orchestration (SMB to host + WinRM `fetch`) |
+| Role | Purpose | Status |
+|---|---|---|
+| `kvm_network` | Define + start `corp-lab` libvirt network (10.10.0.0/24, NAT, no DHCP) | ✅ |
+| `kvm_windows_vm` | Generic Windows VM provisioning (custom install ISO, libvirt domain, post-WinPE CD-eject + cold-restart, WinRM HTTPS bootstrap) | ✅ |
+| `kvm_linux_vm` | Generic Linux VM provisioning (cloud-init seed, boot, wait for SSH) | 🚧 |
+| `ad_dc` | Static IP, AD DS install, forest creation (`microsoft.ad.domain`) | 🚧 |
+| `ad_dns` | DNS forwarders, reverse zone | ⏳ |
+| `ad_dhcp` | DHCP scope + MAC-tied reservations for known clients | ⏳ |
+| `ad_cs` | Enterprise Root CA install + `cs_authority` + `cs_template` | ⏳ |
+| `ad_gpo` | Import MSFT SCT Server 2025 baseline + 12 lab-specific overrides | ⏳ |
+| `ad_ntp` | PDC NTP authority configuration | ⏳ |
+| `ad_wsus` | WSUS install + async sync trigger | ⏳ |
+| `domain_join_windows` | Win 11 client domain join (`microsoft.ad.membership`) | ⏳ |
+| `domain_join_linux` | Ubuntu domain join via `realmd` + `sssd` | ⏳ |
+| `ops_backup` | AD state backup orchestration (SMB to host + WinRM `fetch`) | ⏳ |
 
 ## Playbooks
 
 `00-libvirt-network.yml`, `01-provision-dc.yml`, `02-configure-dc.yml`, `03-provision-clients.yml`, `04-join-domain.yml`, `05-provision-linux.yml`, `06-join-linux.yml`, `99-smoke-test.yml`, plus operational utilities: `snapshot.yml`, `rollback.yml`, `list-snapshots.yml`, `backup-ad.yml`, `fire-drill.yml`, `teardown.yml`.
-
----
-
-## Project status
-
-🚧 **Under Construction**
-
-This README will be updated as implementation lands. For up-to-date design rationale and architectural decisions, see the `docs/` directory in this repository.
 
 ---
 
