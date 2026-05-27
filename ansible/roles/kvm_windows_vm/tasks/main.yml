@@ -288,20 +288,27 @@
         cmd: |
           set -u
           probe=/tmp/{{ vm_name }}-screen-probe.png
+          # Two-signal state machine. Run E (2026-05-27) showed that screen-size
+          # alone is too coarse — early OVMF/WBM transient screens can match both
+          # the install-progress (>10K) and blank (<5K) thresholds in 5 sec,
+          # causing eject during boot instead of after WinPE pass. Require disk
+          # growth past install.wim-extraction threshold to confirm WAIT_INSTALL
+          # is the REAL install-progress UI, not a transient boot screen.
           state=WAIT_INSTALL
           for i in $(seq 1 {{ vm_eject_wait_max_iters }}); do
             virsh -c qemu:///system screenshot {{ vm_name }} ${probe} >/dev/null 2>&1 || true
             size=$(stat -c %s ${probe} 2>/dev/null || echo 0)
+            disk_bytes=$(stat -c %s {{ vm_disk_path }} 2>/dev/null || echo 0)
             case ${state} in
               WAIT_INSTALL)
-                if [ "${size}" -gt 10000 ]; then
-                  echo "iter=${i} size=${size}B — install-progress UI detected"
+                if [ "${size}" -gt 10000 ] && [ "${disk_bytes}" -gt {{ vm_eject_winpe_disk_threshold_bytes }} ]; then
+                  echo "iter=${i} size=${size}B disk=${disk_bytes}B — confirmed WinPE writing install.wim"
                   state=WAIT_REBOOT
                 fi
                 ;;
               WAIT_REBOOT)
                 if [ "${size}" -lt 5000 ]; then
-                  echo "iter=${i} size=${size}B — WinPE → reboot transition detected"
+                  echo "iter=${i} size=${size}B disk=${disk_bytes}B — WinPE → reboot transition detected"
                   exit 0
                 fi
                 ;;
@@ -317,18 +324,42 @@
       ansible.builtin.debug:
         var: winpe_wait.stdout_lines
 
-    # NB: --live only (no --config). --config triggers a domain redefine which
-    # can SIGTERM QEMU if it lands during the guest's ACPI reboot sequence
-    # (observed Run D 2026-05-27). The eject only needs to affect the running
-    # VM — persistence is moot since post-install reboots boot the disk's
-    # Windows Boot Manager NVRAM entry, not the CD device, regardless.
-    - name: "kvm_windows_vm | eject install CD ({{ vm_install_cd_target_dev }}) - force boot from disk"
+    # Eject + cold-restart sequence. Live-eject alone (Run F 2026-05-27) leaves
+    # Windows holding stale CD device handles through the in-process ACPI
+    # reboot — bootmgfw then reads BCD that references the no-longer-present
+    # CD volume and dies with 0xc0000178 "A required device isn't connected".
+    # Forcing a full destroy + cold start makes OVMF re-enumerate devices
+    # fresh, sees the empty CD slot, falls through to the disk's Windows Boot
+    # Manager NVRAM entry, and bootmgfw resolves BCD against the new device
+    # topology cleanly. This deterministically reproduces the working pattern
+    # Run C accidentally hit via libvirt's --config-redefine SIGTERM race.
+    - name: "kvm_windows_vm | eject install CD ({{ vm_install_cd_target_dev }})"
       ansible.builtin.command:
         cmd: >-
           virsh -c qemu:///system change-media {{ vm_name }}
-          {{ vm_install_cd_target_dev }} --eject --live
+          {{ vm_install_cd_target_dev }} --eject --live --config
       register: eject_result
       changed_when: "'ejected' in eject_result.stdout"
+
+    - name: "kvm_windows_vm | force cold restart so OVMF re-enumerates without CD media"
+      ansible.builtin.shell:
+        cmd: |
+          set -u
+          # libvirt may have already SIGTERMed the VM via --config redefine race;
+          # only destroy if still running.
+          state=$(virsh -c qemu:///system domstate {{ vm_name }} 2>/dev/null || echo unknown)
+          if [ "${state}" = "running" ]; then
+            virsh -c qemu:///system destroy {{ vm_name }}
+          fi
+          # Wait briefly for state to settle before cold-starting.
+          for i in $(seq 1 10); do
+            state=$(virsh -c qemu:///system domstate {{ vm_name }} 2>/dev/null || echo unknown)
+            [ "${state}" = "shut off" ] && break
+            sleep 1
+          done
+          virsh -c qemu:///system start {{ vm_name }}
+        executable: /bin/bash
+      changed_when: true
 
 - name: "kvm_windows_vm | wait for WinRM on {{ vm_static_ip | default('the host') }}:{{ vm_winrm_port }}"
   ansible.builtin.wait_for:

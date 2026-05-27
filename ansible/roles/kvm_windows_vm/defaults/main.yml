@@ -68,6 +68,10 @@ vm_winrm_timeout: 1800                    # 30 minutes — Server 2025 unattende
 vm_eject_install_cd_after_winpe: true
 vm_install_cd_target_dev: sdb             # SATA port 1 — first CD after the virtio-scsi disk
 vm_eject_wait_max_iters: 120              # 120 × 5s = 10 min max wait for WinPE → reboot signal
+vm_eject_winpe_disk_threshold_bytes: 5368709120  # 5 GiB — install.wim is ~5 GB, hitting this
+                                                  # threshold confirms WinPE is actually extracting
+                                                  # to disk (defensive: screen-size alone matched
+                                                  # transient boot-manager screens in Run E)
 
 # --- Internal paths (rarely overridden) ---
 vm_disk_pool: "{{ libvirt_pools.disks }}"
