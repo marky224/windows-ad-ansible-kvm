@@ -5,7 +5,7 @@
 #
 # Prerequisites (one-time per LCU wave):
 #   1. Identify target LCU + checkpoint chain (see role README + ADR-035).
-#   2. Download .msu files to /home/madmin/vm-lab/iso/updates/.
+#   2. Download .msu files to ~/vm-lab/iso/updates/.
 #   3. Capture SHA256 of each MSU; record in slipstream_msu_files below.
 #   4. Ensure slipstream_dism_host is reachable in pre-promotion state
 #      (WORKGROUP / StandaloneServer; reachable as local Administrator).

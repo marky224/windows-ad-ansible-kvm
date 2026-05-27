@@ -78,7 +78,7 @@ permanently. Each LCU wave (~quarterly for this lab), refresh as follows:
 python3 _private/scripts/msu-catalog-fetch.py KB5043080 KB5087539
 
 # Save the file URLs from the output, then download:
-cd /home/madmin/vm-lab/iso/updates/
+cd ~/vm-lab/iso/updates/
 curl -L -o <filename>.msu '<URL>'
 
 # Verify and capture SHA256s for group_vars:
