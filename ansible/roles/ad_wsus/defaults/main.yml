@@ -1,0 +1,111 @@
+---
+# ad_wsus role defaults.
+#
+# Installs WSUS on ADDC01 with content on a dedicated D:\WSUS volume served by
+# a second virtual disk attached via libvirt (ADR-039). Uses UpdateServicesDsc
+# 1.3.0 for the runtime config (DSC Community, Dec 2025 release) per ADR-037,
+# with a thin inline-PS wrapper for the async first-sync trigger (DSC's
+# continuous-enforcement model is wrong for fire-and-forget semantics).
+#
+# WSUS is officially deprecated in Server 2025 (Sept 2024 announcement) but
+# still ships, still gets security patches (KB5070893 Oct 2025), and remains
+# the only on-prem update-distribution option without an Intune/Azure
+# subscription. The role + role README acknowledge this — see README.
+
+# --- Libvirt-side disk parameters (delegated to localhost) ---
+
+ad_wsus_libvirt_domain: "ADDC01-corp"
+ad_wsus_content_disk_size_gb: 60
+ad_wsus_content_disk_path: "{{ vm_lab_root }}/disks/{{ ad_wsus_libvirt_domain }}-wsus.qcow2"
+# Target dev letter for the WSUS content disk. Despite running on a separate
+# virtio-scsi controller, libvirt's `target dev` letter pool is shared across
+# ALL buses on the domain — so the SCSI sdb candidate collides with the SATA
+# CDROM at sdb. Existing taken letters: sda (SCSI OS), sdb/sdc/sdd (SATA CDROMs
+# for install + virtio-win + seed-ISO). Next free letter is sde.
+ad_wsus_content_disk_target: "sde"
+
+# Residual install media to detach before attaching the WSUS disk. Identified
+# by their libvirt source-file basenames. Cleanup is idempotent (skips if the
+# disk is no longer attached).
+ad_wsus_residual_cdrom_basenames:
+  - "{{ ad_wsus_libvirt_domain }}.iso"   # seed ISO (per-VM Autounattend)
+  - "virtio-win-0.1.271.iso"              # virtio-win driver ISO
+
+# --- Windows-side disk parameters ---
+
+ad_wsus_content_drive_letter: "D"
+ad_wsus_content_dir: "D:\\WSUS"
+ad_wsus_content_volume_label: "WSUS"
+
+# --- WSUS server config ---
+#
+# Per ADR-037 research, this canonical product/classification set covers:
+# Server 2025 + Win 11 Enterprise 24H2 + Microsoft 365 Apps. Classifications
+# omit "Service Packs" (relic) and "Drivers" (catalog bloat + driver chaos).
+
+ad_wsus_setup_credential_required: false   # Microsoft Update upstream needs no auth
+ad_wsus_upstream_server: ""                # empty = sync directly from Microsoft Update
+ad_wsus_use_ssl: false                     # MU sync uses HTTPS implicitly; this is the listener-side setting
+
+ad_wsus_languages:
+  - en
+
+# Product names — must match WSUS catalog EXACTLY. Names are fetched from
+# Microsoft Update during sync setup; mismatches silently no-op the
+# Set-WsusProduct call (per ADR-037 silent-no-op pattern).
+#
+# Verified against UpdateServicesDsc 1.3.0 + Server 2025 26100.6905 (Oct 2025
+# WSUS patch) catalog. The Win 11 product name CHANGED in late 2024 from
+# "Windows 11" to "Windows 11, version 24H2 and later" — pinning the old
+# name silently skips it on a v2602-era catalog.
+#
+# Title strings verified against the live MU catalog after the first
+# category sync on 2026-05-29:
+#   - "Windows 11"                              (covers all 24H2/25H2/26H1 client SKUs)
+#   - "Microsoft Server Operating System-24H2"  (Server 2025)
+#   - "Microsoft 365 Apps/Office 2019/Office LTSC"
+#   - "Microsoft Defender Antivirus"
+#
+# Titles I tried first that DON'T exist in the catalog (kept here as a
+# tripwire for future reference):
+#   - "Windows 11, version 24H2 and later" — doesn't exist; "Windows 11" is the parent
+#   - "Windows Defender" — doesn't exist; "Microsoft Defender Antivirus" is the modern name
+#   - "Windows Defender Antivirus" — doesn't exist; same as above
+#
+# Per ADR-037 silent-no-op defense: the role's products task does a post-
+# write read-back of GetUpdateCategories() and throws if any desired title
+# is missing — so a title typo fails loudly, not silently.
+ad_wsus_products:
+  - "Windows 11"
+  - "Microsoft Server Operating System-24H2"
+  - "Microsoft 365 Apps/Office 2019/Office LTSC"
+  - "Microsoft Defender Antivirus"
+
+ad_wsus_classifications:
+  - "Critical Updates"
+  - "Security Updates"
+  - "Definition Updates"
+  - "Update Rollups"
+
+# Sync timing — "fire and forget" for the lab. Production-MSP pattern is
+# Set-WsusSubscription -SynchronizeAutomatically + Auto Approval Rules.
+# The Default Automatic Approval Rule (built-in, ships disabled) is enabled
+# by the role for Critical + Security + All Computers. Custom approval rules
+# (ring-gated rollout, dev/stage/prod segmentation) are deferred to a future
+# ops_wsus_approve role.
+ad_wsus_synchronize_automatically: true
+ad_wsus_synchronize_time_of_day: "02:00:00"      # nightly at 2am
+ad_wsus_syncs_per_day: 1
+
+# Trigger an initial full sync at the end of the role (fire-and-forget).
+# Set false to skip and let the scheduled nightly sync pick up the catalog
+# at the configured time — useful for shorter-runtime CI/test paths.
+ad_wsus_trigger_full_sync: true
+
+# How long the Ansible side waits for the category-only sync to complete.
+# Research-stated typical is 5-15 min; empirically the lab hit 80 min for the
+# first category sync on residential bandwidth + a 9690-category MU catalog
+# (2026-05-29 run). Default bumped to 90 min as the realistic upper bound for
+# slower networks. Drop to 30 for fast/data-center connectivity.
+# Ansible until/retries pattern: retries=N + delay=60 = N min total.
+ad_wsus_category_sync_timeout_minutes: 90

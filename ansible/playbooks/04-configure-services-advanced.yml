@@ -32,4 +32,4 @@
   roles:
     - ad_cs
     - ad_gpo
-    # - ad_wsus
+    - ad_wsus

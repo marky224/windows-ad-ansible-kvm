@@ -1,0 +1,631 @@
+---
+# Install + configure WSUS on ADDC01 with content on a dedicated D:\WSUS
+# volume backed by a second virtual disk attached via libvirt.
+#
+# Design source: independent research 2026-05-29 against every Server 2025
+# WSUS install guide on the public web (computingforgeeks, hartiga.de,
+# RDR-IT, 4sysops, MS Learn, two community Ansible roles). Every source
+# converges on the same recipe: Install feature → ensure ContentDir exists
+# → wsusutil postinstall CONTENT_DIR=<dir> → service start → DSC config →
+# sync. No source documents an "Install-WindowsFeature auto-postinstall"
+# behavior on Server 2025; the symptom I hit on 2026-05-29 was a stale
+# Setup\PostInstall registry key from a previous attempt, NOT a 2025
+# behavior change.
+#
+# Per ADR-037: UpdateServicesDsc 1.3.0 (DSC Community, Dec 2025) handles
+# WSUS server config (sync source + products + classifications + schedule).
+# A thin inline-PS wrapper triggers the async first sync — DSC's continuous-
+# enforcement model would re-trigger sync on every run, which is wrong for
+# fire-and-forget semantics. NOTE: UpdateServicesDsc.UpdateServicesServer
+# does NOT install the Windows feature, only configures a postinstalled
+# WSUS; we install + postinstall explicitly before invoking DSC.
+#
+# Per ADR-039: 60 GB qcow2 disk attached as SCSI sde, formatted NTFS,
+# mounted at D:. Without this, a runaway WSUS sync writing to C:\WSUS could
+# fill the OS volume and take down DNS/DHCP/AD/AD CS in sequence.
+#
+# Flow:
+#   1. Libvirt-side: eject residual install CD media (virtio-win + seed-iso),
+#      create + attach the WSUS content disk.
+#   2. Windows-side: rescan storage, release CDROM letter mounts (free D:),
+#      initialize + format the new disk, assign drive letter.
+#   3. Stage UpdateServicesDsc module on the target (NuGet + PSGallery trust).
+#   4. Install UpdateServices feature + WID database feature.
+#   5. Ensure D:\WSUS exists, run wsusutil postinstall CONTENT_DIR=D:\WSUS
+#      gated by D:\WSUS\WSUSContent existence (created atomically on
+#      postinstall success — the gamethis/ansible_role_wsus_server pattern).
+#   6. Belt-and-suspenders registry assert (silent-no-op defense per ADR-037).
+#   7. Ensure WsusService is Automatic + Running.
+#   8. Configure WSUS via win_dsc UpdateServicesServer.
+#   9. Fire-and-forget first sync.
+#  10. Verify.
+
+# ============================================================
+# Phase 1: Libvirt-side cleanup + WSUS content disk (delegated to localhost)
+# ============================================================
+
+- name: "Eject residual install CD media from ADDC01 (libvirt-side; idempotent)"
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      basename="{{ item }}"
+      # virsh detach-disk does not support CDROM devices ("disk device type
+      # 'cdrom' cannot be detached"), so we eject the media instead. The
+      # CDROM device stays attached but with no source file; the next reboot
+      # could remove the device entirely via inactive-config edit, but for
+      # now eject is enough to ensure the residual install media isn't
+      # writable / consuming inode resources on the host.
+      target=$(virsh -c qemu:///system dumpxml {{ ad_wsus_libvirt_domain }} 2>/dev/null \
+          | xmllint --xpath "string(//disk[@device='cdrom'][source/@file[contains(., '$basename')]]/target/@dev)" - 2>/dev/null || true)
+      if [ -z "$target" ]; then
+          echo "skip: $basename not currently mounted"
+          exit 0
+      fi
+      virsh -c qemu:///system change-media {{ ad_wsus_libvirt_domain }} "$target" --eject --live --config
+      echo "ejected: $basename (target=$target)"
+  loop: "{{ ad_wsus_residual_cdrom_basenames }}"
+  register: r_cdrom_eject
+  changed_when: "'ejected:' in r_cdrom_eject.stdout"
+  delegate_to: localhost
+  become: false
+
+- name: "Ensure WSUS content qcow2 disk exists on host"
+  ansible.builtin.command:
+    cmd: "qemu-img create -f qcow2 {{ ad_wsus_content_disk_path }} {{ ad_wsus_content_disk_size_gb }}G"
+    creates: "{{ ad_wsus_content_disk_path }}"
+  register: r_qcow_create
+  delegate_to: localhost
+  become: false
+
+- name: "Attach WSUS content disk to ADDC01 (live, persistent)"
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      domain="{{ ad_wsus_libvirt_domain }}"
+      diskpath="{{ ad_wsus_content_disk_path }}"
+      target="{{ ad_wsus_content_disk_target }}"
+      # Idempotency: check the persistent config (not --live, since hot-plug
+      # state may have drifted). If the path is already in the domain XML,
+      # skip.
+      if virsh -c qemu:///system dumpxml --inactive "$domain" 2>/dev/null \
+          | xmllint --xpath "boolean(//disk/source[@file='$diskpath'])" - 2>/dev/null \
+          | grep -q true; then
+          echo "skip: $diskpath already attached"
+          exit 0
+      fi
+      virsh -c qemu:///system attach-disk "$domain" "$diskpath" "$target" \
+          --targetbus scsi --driver qemu --subdriver qcow2 --cache none --persistent
+      # --persistent attaches to both live + config. The --live counterpart
+      # would only stick until the next reboot.
+      echo "attached: $diskpath at $target"
+  register: r_disk_attach
+  changed_when: "'attached:' in r_disk_attach.stdout"
+  delegate_to: localhost
+  become: false
+
+# ============================================================
+# Phase 2: Windows-side disk init
+# ============================================================
+
+- name: "Rescan storage subsystem (pick up the newly attached disk)"
+  ansible.windows.win_powershell:
+    script: |
+      Update-HostStorageCache -ErrorAction Stop
+      $Ansible.Changed = $false
+      $Ansible.Result  = @{ Action = 'storage-cache-rescanned' }
+  changed_when: false
+
+- name: "Release CDROM drive letter mounts (free up D: for the WSUS volume)"
+  ansible.windows.win_powershell:
+    parameters:
+      DesiredLetter: "{{ ad_wsus_content_drive_letter }}"
+    script: |
+      param([string]$DesiredLetter)
+
+      # Empty + residual CDROMs hold drive letters that block the new WSUS
+      # volume from getting our preferred letter (typically D:). Strategy:
+      # find any CDROM volume whose drive letter is <= our DesiredLetter (so
+      # they currently occupy letters that should be available to disk
+      # volumes) and remove the mount via mountvol /D. The CDROM device stays
+      # present; just loses its letter. On the next reboot Windows may
+      # reassign letters, but for the steady-state lab a one-time release is
+      # enough.
+      #
+      # Get-CimInstance Win32_Volume DriveType=5 = CDROM (1=NoRoot 2=Removable
+      # 3=LocalDisk 4=NetworkDisk 5=CDROM 6=RAM).
+      $cdromVols = Get-CimInstance -ClassName Win32_Volume -Filter 'DriveType = 5'
+      $released = @()
+      foreach ($v in $cdromVols) {
+          if (-not $v.DriveLetter) { continue }
+          $letter = $v.DriveLetter.Substring(0, 1)
+          # Only release letters at or below D (would otherwise block disk
+          # volume assignment). Keep CDROMs at letters > D where they don't
+          # collide with the WSUS plan.
+          if ($letter -ge $DesiredLetter -and $letter -le 'F') {
+              & mountvol.exe "$($v.DriveLetter)\" /D 2>&1 | Out-Null
+              if ($LASTEXITCODE -ne 0) {
+                  throw "mountvol /D failed for $($v.DriveLetter), exit code $LASTEXITCODE"
+              }
+              $released += "$($v.DriveLetter) (was CDROM)"
+          }
+      }
+      $Ansible.Changed = ($released.Count -gt 0)
+      $Ansible.Result  = @{ Released = $released }
+  register: r_cdrom_unmount
+
+- name: "Initialize + partition + format the WSUS content disk (idempotent)"
+  ansible.windows.win_powershell:
+    parameters:
+      DriveLetter: "{{ ad_wsus_content_drive_letter }}"
+      VolumeLabel: "{{ ad_wsus_content_volume_label }}"
+      ExpectedSizeGB: "{{ ad_wsus_content_disk_size_gb | int }}"
+    script: |
+      param(
+          [string]$DriveLetter,
+          [string]$VolumeLabel,
+          [int]$ExpectedSizeGB
+      )
+
+      # Idempotency: if a volume already exists at $DriveLetter with the
+      # expected label, we're done.
+      $existing = Get-Volume -DriveLetter $DriveLetter -ErrorAction SilentlyContinue
+      if ($existing -and $existing.FileSystemLabel -eq $VolumeLabel -and $existing.FileSystem -eq 'NTFS') {
+          $Ansible.Changed = $false
+          $Ansible.Result  = @{
+              Action       = 'already-prepared'
+              DriveLetter  = $DriveLetter
+              Label        = $existing.FileSystemLabel
+              FileSystem   = $existing.FileSystem
+              SizeGB       = [math]::Round($existing.Size / 1GB, 1)
+          }
+          return
+      }
+
+      # Find the new uninitialized disk. Filter: PartitionStyle=RAW + size
+      # matches our expected size (with a ~5% tolerance because qcow2
+      # reports a slightly different physical size than the virtual size).
+      $tolerance = 0.05
+      $minSize = [int64]($ExpectedSizeGB * 1GB * (1 - $tolerance))
+      $maxSize = [int64]($ExpectedSizeGB * 1GB * (1 + $tolerance))
+      # RAW = uninitialized. OS disk is GPT, so this alone discriminates.
+      # PowerShell -and/-or precedence is left-to-right without explicit
+      # parens; combining unrelated -or clauses to this filter would
+      # short-circuit to "any Online disk matches" (caught on first run).
+      $candidates = Get-Disk | Where-Object {
+          $_.PartitionStyle -eq 'RAW' -and
+          $_.Size -ge $minSize -and
+          $_.Size -le $maxSize
+      }
+      if (-not $candidates -or $candidates.Count -eq 0) {
+          # Maybe the disk was already initialized but no volume exists.
+          # Fall back to "any disk that's not Disk 0 (OS disk) and has no
+          # partitions yet".
+          $candidates = Get-Disk | Where-Object {
+              $_.Number -ne 0 -and
+              ((Get-Partition -DiskNumber $_.Number -ErrorAction SilentlyContinue) -eq $null) -and
+              $_.Size -ge $minSize -and $_.Size -le $maxSize
+          }
+      }
+      if (-not $candidates -or $candidates.Count -eq 0) {
+          throw "No candidate disk found for WSUS content. Run 'Update-HostStorageCache' and re-check Get-Disk output."
+      }
+      if ($candidates.Count -gt 1) {
+          throw "Multiple candidate disks match WSUS criteria ($($candidates.Count)). Refusing to guess. Disks: $($candidates | ForEach-Object { $_.Number } | Out-String)"
+      }
+      $disk = $candidates[0]
+
+      # Bring online if needed.
+      if ($disk.OperationalStatus -eq 'Offline') {
+          Set-Disk -Number $disk.Number -IsOffline $false -ErrorAction Stop
+          Set-Disk -Number $disk.Number -IsReadOnly $false -ErrorAction Stop
+      }
+
+      # Initialize as GPT (modern; supports >2 TB and aligns with EFI guest).
+      if ($disk.PartitionStyle -eq 'RAW') {
+          Initialize-Disk -Number $disk.Number -PartitionStyle GPT -ErrorAction Stop | Out-Null
+      }
+
+      # Create partition + format. -UseMaximumSize fills the disk.
+      $partition = New-Partition -DiskNumber $disk.Number -DriveLetter $DriveLetter -UseMaximumSize -ErrorAction Stop
+      Format-Volume -DriveLetter $DriveLetter -FileSystem NTFS -NewFileSystemLabel $VolumeLabel -Confirm:$false -ErrorAction Stop | Out-Null
+
+      # Verify.
+      $after = Get-Volume -DriveLetter $DriveLetter -ErrorAction Stop
+      if ($after.FileSystem -ne 'NTFS') {
+          throw "Format-Volume reported success but $DriveLetter is not NTFS (got '$($after.FileSystem)')."
+      }
+      $Ansible.Changed = $true
+      $Ansible.Result  = @{
+          Action       = 'initialized'
+          DiskNumber   = $disk.Number
+          DriveLetter  = $DriveLetter
+          Label        = $after.FileSystemLabel
+          FileSystem   = $after.FileSystem
+          SizeGB       = [math]::Round($after.Size / 1GB, 1)
+      }
+  register: r_disk_init
+
+# ============================================================
+# Phase 3: WSUS feature install + postinstall
+# ============================================================
+#
+# DSC module staging (UpdateServicesDsc) was removed 2026-05-29 per the
+# ADR-037 amendment (DSC's UpdateServicesServer resource couples a 30-90 min
+# synchronous full sync into Set-TargetResource with no win_dsc async escape;
+# pivoted to inline PS following the 5tuk0v/ludus_wsus pattern). No DSC
+# module + no PSGallery prereqs needed anymore.
+
+- name: "Install UpdateServices Windows feature (+ management tools)"
+  ansible.windows.win_feature:
+    name:
+      - UpdateServices-Services
+      - UpdateServices-WidDB
+    include_management_tools: true
+    state: present
+  register: r_wsus_features
+
+- name: "Ensure WSUS content directory ({{ ad_wsus_content_dir }}) exists"
+  ansible.windows.win_file:
+    path: "{{ ad_wsus_content_dir }}"
+    state: directory
+  register: r_content_dir
+
+- name: "Run wsusutil postinstall (creates WSUSContent subdir atomically on success)"
+  # Idempotency gate: WSUSContent subfolder is created by wsusutil postinstall
+  # only when the full postinstall succeeds. If we re-run after success, the
+  # `creates:` predicate skips the task. This is the gamethis/ansible_role_wsus_server
+  # pattern, the most reliable idempotency check across community Ansible roles.
+  ansible.windows.win_command:
+    cmd: 'wsusutil.exe postinstall CONTENT_DIR={{ ad_wsus_content_dir }}'
+    chdir: 'C:\Program Files\Update Services\Tools'
+    creates: '{{ ad_wsus_content_dir }}\WSUSContent'
+  register: r_wsus_postinstall
+
+- name: "Belt-and-suspenders: assert WSUS ContentDir registry matches intent"
+  # win_command above gates on filesystem state; this task verifies the
+  # registry value matches. If the postinstall succeeded earlier with a
+  # different ContentDir (e.g., a stale state), we want to fail loudly here
+  # rather than silently configure the wrong WSUS. ADR-037 silent-no-op
+  # defense: registry is the canonical source.
+  ansible.windows.win_powershell:
+    parameters:
+      ContentDir: "{{ ad_wsus_content_dir }}"
+    script: |
+      param([string]$ContentDir)
+      $regKey = 'HKLM:\SOFTWARE\Microsoft\Update Services\Server\Setup'
+      $current = (Get-ItemProperty -Path $regKey -Name ContentDir -ErrorAction SilentlyContinue).ContentDir
+      if (-not $current) {
+          throw "WSUS ContentDir registry value is unset after postinstall. Setup may have errored silently."
+      }
+      if ($current -ne $ContentDir) {
+          throw "WSUS ContentDir registry mismatch. Got '$current', expected '$ContentDir'. " +
+                "If this is a re-postinstall after relocation, run wsusutil reset to clear stale Setup keys first."
+      }
+      $Ansible.Changed = $false
+      $Ansible.Result  = @{ ContentDir = $current }
+  changed_when: false
+
+- name: "Ensure WsusService is Automatic + Running"
+  ansible.windows.win_service:
+    name: WsusService
+    start_mode: auto
+    state: started
+  register: r_wsus_service
+
+# ============================================================
+# Phase 5: WSUS configure — inline PS following 5tuk0v/ludus_wsus pattern
+# (per ADR-037 amendment 2026-05-29; DSC's synchronous coupling of a full
+# sync into Set-TargetResource is incompatible with Ansible's lack of an
+# async/poll knob in win_dsc.)
+#
+# Ordering (critical — chicken-and-egg with empty catalog):
+#   5a. Set sync source = Microsoft Update + sync schedule
+#   5b. Trigger StartSynchronizationForCategoryOnly() if never-synced;
+#       wait via Ansible-side until/retries/delay (timeout-bounded ~30 min)
+#   5c. Configure classifications declaratively (Compare-Object diff on .Id)
+#   5d. Configure products declaratively (Compare-Object diff on .Id)
+#   5e. Enable Default Automatic Approval Rule (Critical + Security + All Computers,
+#       ships disabled out-of-box)
+#   5f. Fire-and-forget StartSynchronization() for the first full metadata sync
+# ============================================================
+
+- name: "Set WSUS sync source to Microsoft Update + nightly schedule"
+  ansible.windows.win_powershell:
+    parameters:
+      SyncTimeOfDay: "{{ ad_wsus_synchronize_time_of_day }}"
+      SyncsPerDay: "{{ ad_wsus_syncs_per_day | int }}"
+    script: |
+      param(
+          [string]$SyncTimeOfDay,
+          [int]$SyncsPerDay
+      )
+      $changed = @()
+      $wsus = Get-WsusServer -ErrorAction Stop
+      $cfg  = $wsus.GetConfiguration()
+      $sub  = $wsus.GetSubscription()
+
+      # Sync source.
+      if (-not $cfg.SyncFromMicrosoftUpdate) {
+          Set-WsusServerSynchronization -SyncFromMU -ErrorAction Stop
+          $changed += 'sync-source=MU'
+      }
+
+      # Schedule.
+      $desiredTimeOfDay = [TimeSpan]::Parse($SyncTimeOfDay)
+      $dirty = $false
+      if (-not $sub.SynchronizeAutomatically) {
+          $sub.SynchronizeAutomatically = $true
+          $changed += 'SynchronizeAutomatically=true'
+          $dirty = $true
+      }
+      if ($sub.SynchronizeAutomaticallyTimeOfDay -ne $desiredTimeOfDay) {
+          $sub.SynchronizeAutomaticallyTimeOfDay = $desiredTimeOfDay
+          $changed += "TimeOfDay=$SyncTimeOfDay"
+          $dirty = $true
+      }
+      if ($sub.NumberOfSynchronizationsPerDay -ne $SyncsPerDay) {
+          $sub.NumberOfSynchronizationsPerDay = $SyncsPerDay
+          $changed += "SyncsPerDay=$SyncsPerDay"
+          $dirty = $true
+      }
+      if ($dirty) {
+          $sub.Save()
+      }
+
+      # Opt out of CEIP / Update Improvement Program (ADR-039 stance).
+      if ($cfg.MURollupOptin) {
+          $cfg.MURollupOptin = $false
+          $cfg.Save()
+          $changed += 'MURollupOptin=false'
+      }
+
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result  = @{
+          Updated         = $changed
+          SyncFromMU      = (Get-WsusServer).GetConfiguration().SyncFromMicrosoftUpdate
+          SyncAutomatically = (Get-WsusServer).GetSubscription().SynchronizeAutomatically
+          TimeOfDay       = "$($sub.SynchronizeAutomaticallyTimeOfDay)"
+      }
+  register: r_wsus_sync_source
+
+# Idempotency-gated category bootstrap. On a never-synced WSUS the products
+# catalog is empty — StartSynchronizationForCategoryOnly() populates it in
+# ~5-15 min without doing the full multi-hour metadata sync. We gate on
+# LastSynchronizationTime.Year == 1 (MinValue = 0001-01-01); after first
+# successful sync of any kind this becomes a real year and we skip.
+
+- name: "Trigger category-only metadata sync (only if WSUS has never synced)"
+  ansible.windows.win_powershell:
+    script: |
+      $sub = (Get-WsusServer).GetSubscription()
+      if ($sub.LastSynchronizationTime.Year -gt 1) {
+          $Ansible.Changed = $false
+          $Ansible.Result  = @{ Action = 'already-synced-before'; LastSync = "$($sub.LastSynchronizationTime.ToString('o'))" }
+          return
+      }
+      if ($sub.GetSynchronizationStatus() -ne 'NotProcessing') {
+          $Ansible.Changed = $false
+          $Ansible.Result  = @{ Action = 'sync-already-in-progress'; Status = "$($sub.GetSynchronizationStatus())" }
+          return
+      }
+      $sub.StartSynchronizationForCategoryOnly()
+      $Ansible.Changed = $true
+      $Ansible.Result  = @{ Action = 'category-sync-started' }
+  register: r_wsus_cat_sync
+
+- name: "Wait for category sync to complete (up to {{ ad_wsus_category_sync_timeout_minutes }} min)"
+  # Ansible-side retry loop polls GetSynchronizationStatus() == 'NotProcessing'.
+  # This is the timeout-bounded async pattern from ludus_wsus — avoids the
+  # DSC-style blocking while-loop inside a single win_dsc call.
+  ansible.windows.win_powershell:
+    script: |
+      $sub = (Get-WsusServer).GetSubscription()
+      $status = $sub.GetSynchronizationStatus()
+      $Ansible.Result = @{ Status = "$status"; LastSync = "$($sub.LastSynchronizationTime.ToString('o'))" }
+      if ($status -ne 'NotProcessing') {
+          # Throw forces the outer until-retries to keep polling.
+          throw "Sync still $status"
+      }
+      $Ansible.Changed = $false
+  register: r_wsus_cat_wait
+  until: r_wsus_cat_wait is succeeded
+  retries: "{{ ad_wsus_category_sync_timeout_minutes | int }}"
+  delay: 60
+  changed_when: false
+  when: r_wsus_cat_sync.result.Action == 'category-sync-started'
+
+- name: "Configure WSUS classifications (declarative diff via Compare-Object)"
+  # Per ADR-037 silent-no-op defense:
+  # - Filter on .Classification.Title (wrapper) for Where-Object, .Id for Compare-Object.
+  # - Set-WsusClassification is pipeline-only — calling with named params silently no-ops.
+  # - JSON-encoded parameter (DesiredJson) sidesteps the win-powershell-args-dash-truncation
+  #   bug for product titles containing dashes (per feedback memory).
+  # - Post-write read-back asserts the live state matches intent.
+  ansible.windows.win_powershell:
+    parameters:
+      DesiredJson: "{{ ad_wsus_classifications | to_json }}"
+    script: |
+      param([string]$DesiredJson)
+      $desired = $DesiredJson | ConvertFrom-Json
+      [array]$all     = Get-WsusClassification -ErrorAction Stop
+      [array]$current = (Get-WsusServer).GetSubscription().GetUpdateClassifications()
+      [array]$should  = ($all | Where-Object { $_.Classification.Title -in $desired }).Classification
+      if ($null -eq $should -or $should.Count -eq 0) {
+          throw "No classifications matched desired list ($($desired -join ', ')). Either the category-only sync did not populate the catalog or the titles are wrong. Available classifications: $($all.Classification.Title -join ', ')"
+      }
+      $diffs = Compare-Object $current $should -Property Id
+      $changed = @()
+      foreach ($d in $diffs) {
+          $wrapper = $all | Where-Object { $_.Classification.Id -eq $d.Id }
+          if ($d.SideIndicator -eq '<=') {
+              # Currently enabled but not desired → disable.
+              $wrapper | Set-WsusClassification -Disable -ErrorAction Stop
+              $changed += "disable: $($wrapper.Classification.Title)"
+          } elseif ($d.SideIndicator -eq '=>') {
+              # Desired but not enabled → enable.
+              $wrapper | Set-WsusClassification -ErrorAction Stop
+              $changed += "enable: $($wrapper.Classification.Title)"
+          }
+      }
+      # Post-write verify (silent-no-op gate).
+      [array]$verify = (Get-WsusServer).GetSubscription().GetUpdateClassifications().Title | Sort-Object
+      $missing = $desired | Where-Object { $_ -notin $verify }
+      if ($missing) {
+          throw "Post-write classification verification failed. Desired but not enabled: $($missing -join ', '). Live state: $($verify -join ', ')"
+      }
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result  = @{ Updated = $changed; Enabled = $verify }
+  register: r_wsus_classifications
+
+- name: "Configure WSUS products (declarative diff via Compare-Object)"
+  ansible.windows.win_powershell:
+    parameters:
+      DesiredJson: "{{ ad_wsus_products | to_json }}"
+    script: |
+      param([string]$DesiredJson)
+      $desired = $DesiredJson | ConvertFrom-Json
+      [array]$all     = Get-WsusProduct -ErrorAction Stop
+      [array]$current = (Get-WsusServer).GetSubscription().GetUpdateCategories()
+      [array]$should  = ($all | Where-Object { $_.Product.Title -in $desired }).Product
+      if ($null -eq $should -or $should.Count -eq 0) {
+          throw "No products matched desired list ($($desired -join ', ')). Title strings may have shifted in the MU catalog; check `Get-WsusProduct | Select -Expand Product | Select Title` for current names."
+      }
+      $diffs = Compare-Object $current $should -Property Id
+      $changed = @()
+      foreach ($d in $diffs) {
+          $wrapper = $all | Where-Object { $_.Product.Id -eq $d.Id }
+          if ($d.SideIndicator -eq '<=') {
+              $wrapper | Set-WsusProduct -Disable -ErrorAction Stop
+              $changed += "disable: $($wrapper.Product.Title)"
+          } elseif ($d.SideIndicator -eq '=>') {
+              $wrapper | Set-WsusProduct -ErrorAction Stop
+              $changed += "enable: $($wrapper.Product.Title)"
+          }
+      }
+      [array]$verify = (Get-WsusServer).GetSubscription().GetUpdateCategories().Title | Sort-Object
+      $missing = $desired | Where-Object { $_ -notin $verify }
+      if ($missing) {
+          throw "Post-write product verification failed. Desired but not enabled: $($missing -join ', '). Live state: $($verify -join ', ')"
+      }
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result  = @{ Updated = $changed; Enabled = $verify }
+  register: r_wsus_products
+
+- name: "Enable Default Automatic Approval Rule (Critical + Security + All Computers)"
+  # Every fresh WSUS ships with this rule disabled. Enabling it lets clients
+  # actually receive approved updates without per-update operator approval.
+  # Custom approval rules (e.g. ring-gated rollout) are deferred to a future
+  # ops_wsus_approve role.
+  ansible.windows.win_powershell:
+    script: |
+      $rules = (Get-WsusServer).GetInstallApprovalRules()
+      $rule = $rules | Where-Object { $_.Name -eq 'Default Automatic Approval Rule' }
+      if (-not $rule) {
+          throw "Default Automatic Approval Rule not found. Available: $(($rules | ForEach-Object Name) -join ', ')"
+      }
+      if ($rule.Enabled) {
+          $Ansible.Changed = $false
+          $Ansible.Result  = @{ Action = 'already-enabled'; RuleName = $rule.Name }
+          return
+      }
+      $rule.Enabled = $true
+      $rule.Save()
+      $Ansible.Changed = $true
+      $Ansible.Result  = @{ Action = 'enabled'; RuleName = $rule.Name }
+  register: r_wsus_approval_rule
+
+# ============================================================
+# Phase 6: Fire-and-forget full sync (does not block the play)
+# ============================================================
+
+- name: "Trigger full WSUS metadata sync (fire-and-forget; first full sync 30-90 min)"
+  ansible.windows.win_powershell:
+    script: |
+      $sub = (Get-WsusServer).GetSubscription()
+      $status = $sub.GetSynchronizationStatus()
+      if ($status -ne 'NotProcessing') {
+          $Ansible.Changed = $false
+          $Ansible.Result  = @{ Action = 'sync-in-progress'; Status = "$status" }
+          return
+      }
+      # If a category-only sync was the only prior sync, LastSync is set but
+      # the catalog hasn't pulled full metadata yet. Kick off a full sync so
+      # the catalog populates. After this initial run, the scheduled sync
+      # (Phase 5 set the schedule) handles steady-state.
+      $sub.StartSynchronization()
+      $Ansible.Changed = $true
+      $Ansible.Result  = @{
+          Action = 'full-sync-started'
+          Note   = 'Full metadata sync runs async — typically 30-90 min on Server 2025. Content downloads happen after updates are approved (Default Approval Rule covers Critical + Security).'
+      }
+  register: r_wsus_full_sync
+  when: ad_wsus_trigger_full_sync | default(true) | bool
+
+# ============================================================
+# Phase 7: End-to-end verification
+# ============================================================
+
+- name: "Verify WSUS end-to-end (server reachable + products + classifications)"
+  ansible.windows.win_powershell:
+    parameters:
+      ExpectedProducts: "{{ ad_wsus_products }}"
+      ExpectedClassifications: "{{ ad_wsus_classifications }}"
+    script: |
+      param(
+          [string[]]$ExpectedProducts,
+          [string[]]$ExpectedClassifications
+      )
+
+      $svc = Get-WsusServer -ErrorAction Stop
+      $sub = $svc.GetSubscription()
+
+      # Configured products / classifications come from the subscription's
+      # GetUpdateCategories / GetUpdateClassifications methods. On a fresh
+      # postinstall before MU metadata sync completes, the catalog is empty
+      # → we can only verify config intent, not actual MU-resolved entries.
+      $configuredProducts        = @($sub.GetUpdateCategories() | ForEach-Object { $_.Title })
+      $configuredClassifications = @($sub.GetUpdateClassifications() | ForEach-Object { $_.Title })
+
+      $missingProducts = @()
+      foreach ($p in $ExpectedProducts) {
+          if ($p -notin $configuredProducts) { $missingProducts += $p }
+      }
+      $missingClassifications = @()
+      foreach ($c in $ExpectedClassifications) {
+          if ($c -notin $configuredClassifications) { $missingClassifications += $c }
+      }
+
+      # On a brand-new install BEFORE the first metadata sync completes, the
+      # subscription's GetUpdateCategories / GetUpdateClassifications return
+      # nothing — MU hasn't been queried yet. That's expected; the missing
+      # entries will populate after sync completes. Treat as warning, not
+      # failure, unless sync has already finished.
+      $lastInfo = $sub.GetLastSynchronizationInfo()
+      $syncCompleted = ($lastInfo.Result -eq 'Succeeded')
+
+      if ($syncCompleted -and $missingProducts.Count -gt 0) {
+          throw "Configured products missing from WSUS subscription after sync: $($missingProducts -join ', ')"
+      }
+      if ($syncCompleted -and $missingClassifications.Count -gt 0) {
+          throw "Configured classifications missing: $($missingClassifications -join ', ')"
+      }
+
+      $Ansible.Changed = $false
+      $Ansible.Result  = @{
+          ServerReachable        = $true
+          ContentDir             = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Update Services\Server\Setup' -Name ContentDir).ContentDir
+          SyncStatus             = "$($sub.GetSynchronizationStatus())"
+          LastSyncResult         = "$($lastInfo.Result)"
+          LastSyncStart          = "$($lastInfo.StartTime)"
+          ConfiguredProducts     = $configuredProducts
+          ConfiguredClassifications = $configuredClassifications
+          MissingProducts        = $missingProducts
+          MissingClassifications = $missingClassifications
+          PreSyncNote            = if ($syncCompleted) { $null } else { 'Pre-sync: configured products/classifications resolve to live catalog entries only after the first MU metadata sync completes (typically 30-90 min).' }
+      }
+  register: r_wsus_verify
+  changed_when: false
+
+- name: "Show WSUS verification summary"
+  ansible.builtin.debug:
+    var: r_wsus_verify.result
