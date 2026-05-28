@@ -12,6 +12,10 @@ ansible.log
 ansible/files/rendered/
 ansible/files/*-seed.iso
 
+# Microsoft-distributed binary blobs (operator fetches once via _private/scripts/sct-fetch.sh).
+# Version + SHA256 are pinned in ansible/files/sct/.version, which IS committed.
+ansible/files/sct/*.zip
+
 # Python
 __pycache__/
 *.pyc

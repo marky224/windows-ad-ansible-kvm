@@ -1,0 +1,101 @@
+---
+# ad_gpo role defaults.
+#
+# Imports the Microsoft Security Compliance Toolkit (SCT) Server 2025 baseline
+# v2602 (Feb 2026) and applies a small lab-specific delta on top. Pruned from
+# the original 12-override list to 2 deliberate deltas per the ADR-019
+# amendment 2026-05-29 (SCT v2602 already covers 10 of the 12). See ADR-019
+# + ADR-037 for the design rationale.
+
+# --- SCT package version + integrity ---
+#
+# The pinned filename + SHA256 must match ansible/files/sct/.version.
+# The role asserts the local file matches this hash before any state-changing
+# task runs. If the operator hasn't run _private/scripts/sct-fetch.sh yet,
+# the role fails fast with a clear error.
+
+ad_gpo_sct_zip_filename: "WindowsServer2025-SecurityBaseline-2602.zip"
+ad_gpo_sct_zip_sha256: "a66dffbe2622c3c4dd70e44a7f2080f362fb2d6f9208c50678671cbb046a286f"
+ad_gpo_sct_zip_top_dir: "Windows Server 2025 Security Baseline - 2602"
+ad_gpo_sct_version_tag: "SCT-WS2025-v2602"
+
+# --- Staging path on ADDC01 ---
+#
+# Outside any auto-mounted user profile so it survives reboots + isn't tied
+# to a specific admin's session.
+ad_gpo_staging_dir: 'C:\SCT-Staging'
+
+# --- SCT GPOs to import + their linking targets ---
+#
+# Each item: display_name (final GPO name in AD), backup_id (GUID inside the
+# ZIP's GPOs/ tree — read from the manifest), link_to (DN of OU or domain
+# root that the GPO links to, or null to skip linking).
+#
+# Linking pattern per MS SCT v2506/v2602 release notes + Ravenswood best practices:
+#   - DC + DC VBS                          → OU=Domain Controllers (canonical)
+#   - Domain Security                      → domain root (account/lockout/Kerberos)
+#   - Member Server + MS Cred Guard + AV   → OU=Member Servers (created if absent)
+#   - IE11 baselines                       → not linked (IE11 is end-of-life; import-only for completeness)
+
+ad_gpo_baseline_imports:
+  - display_name: "MSFT Windows Server 2025 v2602 - Domain Controller"
+    backup_id: "{88603F56-DC8F-4132-8A8C-8FE5EB0B4B1A}"
+    link_to: "OU=Domain Controllers,DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+  - display_name: "MSFT Windows Server 2025 v2602 - Domain Controller Virtualization Based Security"
+    backup_id: "{B637F7F1-09CA-46B8-AC6C-E47E7F2F0F41}"
+    link_to: "OU=Domain Controllers,DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+  - display_name: "MSFT Windows Server 2025 v2602 - Domain Security"
+    backup_id: "{40CF40AD-F1B2-433F-A5C9-032DB7424608}"
+    link_to: "DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+  - display_name: "MSFT Windows Server 2025 v2602 - Member Server"
+    backup_id: "{066B7FF5-BF2B-4B1B-8A92-2A83B8619444}"
+    link_to: "OU=Member Servers,DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+  - display_name: "MSFT Windows Server 2025 v2602 - Member Server Credential Guard"
+    backup_id: "{5DCDD718-EB35-4D88-9E9A-2B936D7B8A4B}"
+    link_to: "OU=Member Servers,DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+  - display_name: "MSFT Windows Server 2025 v2602 - Defender Antivirus"
+    backup_id: "{B0CBE378-B19F-440E-A939-80B79E48C4EF}"
+    link_to: "OU=Member Servers,DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+
+# IE11 baselines: import the GPOs (so a future MSP customer with legacy app
+# requirements can link them quickly) but don't link by default.
+ad_gpo_ie11_imports:
+  - display_name: "MSFT Internet Explorer 11 - Computer"
+    backup_id: "{2E1948EE-56EE-45A1-9473-D5A4C2153E5F}"
+  - display_name: "MSFT Internet Explorer 11 - User"
+    backup_id: "{F74D904A-2A4B-4865-8877-3E71FEFF91FF}"
+
+# Whether to import IE11 baselines. End-of-life product; import-only by default
+# (no link). Set false to skip entirely.
+ad_gpo_import_ie11: true
+
+# --- Member Servers OU ---
+#
+# Created at domain root if absent. SCT Member Server GPOs link here. OU is
+# initially empty in the lab (the only "member server" candidate would be a
+# future second DC promoted into a member, or a file/print server VM).
+
+ad_gpo_member_servers_ou: "OU=Member Servers,DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+ad_gpo_member_servers_ou_name: "Member Servers"
+
+# --- Lab Delta GPO (post-prune per ADR-019 amendment 2026-05-29) ---
+#
+# Single delta GPO linked at domain root, containing the firewall logging
+# tuneup that the SCT baseline does NOT cover (baseline enforces firewall
+# ON with default-block but doesn't tune log path/size/dropped-packet logging).
+
+ad_gpo_lab_delta_name: "Lab Delta - Firewall Logging"
+
+# Registry-backed firewall logging values, per profile (Domain / Private / Public).
+# Path layout matches the Advanced Audit Policy + Windows Defender Firewall
+# nodes that GPOEditor writes to. Values are documented at
+# https://learn.microsoft.com/en-us/windows/win32/wfas-policy-administration.
+ad_gpo_firewall_log_path: '%systemroot%\system32\logfiles\firewall\pfirewall.log'
+ad_gpo_firewall_log_size_kb: 16384   # MS recommends 4096 minimum; 16 MB gives reasonable retention
+ad_gpo_firewall_log_dropped: true    # capture dropped packets — invaluable for diagnosing block rules
+ad_gpo_firewall_log_success: false   # successful connections fill the log fast; disable by default
+
+# GPO comment marker used as the idempotency check. If the GPO description on
+# AD starts with this prefix + version tag, the role skips re-importing the GPO.
+# Re-imports only happen when the version tag changes (SCT upgrade).
+ad_gpo_description_marker: "Imported by ad_gpo role from {{ ad_gpo_sct_version_tag }}"

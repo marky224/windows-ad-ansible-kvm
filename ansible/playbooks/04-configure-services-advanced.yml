@@ -31,5 +31,5 @@
   gather_facts: false
   roles:
     - ad_cs
-    # - ad_gpo
+    - ad_gpo
     # - ad_wsus

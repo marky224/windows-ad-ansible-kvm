@@ -1,0 +1,8 @@
+# Pinned versions for Microsoft Security Compliance Toolkit blobs.
+# Not gitignored — this file IS committed so anyone cloning the repo knows
+# which version + hash to fetch via _private/scripts/sct-fetch.sh.
+#
+# Format: <filename>\t<sha256>\t<size_bytes>\t<source_url>\t<verified_date>
+
+WindowsServer2025-SecurityBaseline-2602.zip	a66dffbe2622c3c4dd70e44a7f2080f362fb2d6f9208c50678671cbb046a286f	1443330	https://download.microsoft.com/download/e99be2d2-e077-4986-a06b-6078051999dd/Windows%20Server%202025%20Security%20Baseline%20-%202602.zip	2026-05-29
+LGPO.zip	cb7159d134a0a1e7b1ed2ada9a3ce8ce8f4de391d14403d55438af824247cc55	532019	https://download.microsoft.com/download/8/5/c/85c25433-a1b0-4ffa-9429-7e023e7da8d8/LGPO.zip	2026-05-29

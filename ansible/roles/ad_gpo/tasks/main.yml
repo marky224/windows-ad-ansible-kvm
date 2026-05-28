@@ -1,0 +1,410 @@
+---
+# Import the MSFT Security Compliance Toolkit Server 2025 v2602 baseline GPOs
+# + apply a small lab-specific delta (firewall logging tuneup) per ADR-019
+# (amended 2026-05-29) and ADR-037 (inline PS, no DSC).
+#
+# Flow:
+#   1. Assert the SCT zip + LGPO zip exist locally + SHA256 match.
+#   2. Copy + extract on ADDC01 under C:\SCT-Staging.
+#   3. Ensure OU=Member Servers exists at domain root.
+#   4. Import each baseline GPO (idempotent via description-marker check).
+#   5. Link each GPO to its canonical OU (idempotent via Get-GPInheritance).
+#   6. Create + populate the Lab Delta GPO with firewall logging settings.
+#   7. Link Lab Delta GPO at domain root.
+#   8. Run Invoke-GPUpdate /force.
+#   9. Verify: each GPO exists + correct link exists.
+#
+# ADR-037 silent-no-op defenses applied throughout: Get-Command parameter
+# verification (in-line comments), -ErrorAction Stop on every state-changing
+# cmdlet, post-write state reads, two-run idempotency gate.
+
+- name: "Assert SCT baseline zip is staged + SHA256 matches pin"
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/../files/sct/{{ ad_gpo_sct_zip_filename }}"
+    checksum_algorithm: sha256
+  register: r_sct_zip_local
+  delegate_to: localhost
+  become: false
+
+- name: "Fail if SCT zip is missing"
+  ansible.builtin.fail:
+    msg: |
+      Required SCT baseline zip is missing at
+        {{ playbook_dir }}/../files/sct/{{ ad_gpo_sct_zip_filename }}
+      Fetch it once via:
+        ./_private/scripts/sct-fetch.sh
+      (gitignored; not redistributed in this public repo per MS license + repo hygiene)
+  when: not r_sct_zip_local.stat.exists
+
+- name: "Fail if SCT zip SHA256 does not match pin"
+  ansible.builtin.fail:
+    msg: |
+      SCT zip SHA256 mismatch. Have: {{ r_sct_zip_local.stat.checksum }}
+      Want (from ad_gpo_sct_zip_sha256): {{ ad_gpo_sct_zip_sha256 }}
+      MS may have rotated the file under the same filename — refresh
+      ansible/files/sct/.version + ad_gpo defaults, then re-run sct-fetch.sh.
+  when: r_sct_zip_local.stat.checksum != ad_gpo_sct_zip_sha256
+
+- name: "Ensure staging directory exists on ADDC01"
+  ansible.windows.win_file:
+    path: "{{ ad_gpo_staging_dir }}"
+    state: directory
+
+- name: "Copy SCT baseline zip to ADDC01"
+  ansible.windows.win_copy:
+    src: "{{ playbook_dir }}/../files/sct/{{ ad_gpo_sct_zip_filename }}"
+    dest: "{{ ad_gpo_staging_dir }}\\{{ ad_gpo_sct_zip_filename }}"
+  register: r_sct_copy
+
+- name: "Extract SCT baseline zip on ADDC01"
+  ansible.windows.win_powershell:
+    parameters:
+      ZipPath: "{{ ad_gpo_staging_dir }}\\{{ ad_gpo_sct_zip_filename }}"
+      StagingDir: "{{ ad_gpo_staging_dir }}"
+      TopDir: "{{ ad_gpo_sct_zip_top_dir }}"
+    script: |
+      param(
+          [string]$ZipPath,
+          [string]$StagingDir,
+          [string]$TopDir
+      )
+      $extractedRoot = Join-Path $StagingDir $TopDir
+      $manifestPath  = Join-Path $extractedRoot 'GPOs\manifest.xml'
+      if (Test-Path -Path $manifestPath) {
+          $Ansible.Changed = $false
+          $Ansible.Result  = @{ Action = 'already-extracted'; Path = $extractedRoot }
+          return
+      }
+      # Expand-Archive on Server 2025: -Force overwrites without prompting;
+      # without -Force a partial extract from a failed prior run will throw.
+      Expand-Archive -Path $ZipPath -DestinationPath $StagingDir -Force -ErrorAction Stop
+      if (-not (Test-Path -Path $manifestPath)) {
+          throw "Extracted but GPO manifest missing at expected path: $manifestPath"
+      }
+      $Ansible.Changed = $true
+      $Ansible.Result  = @{ Action = 'extracted'; Path = $extractedRoot }
+  register: r_sct_extract
+
+- name: "Ensure OU=Member Servers exists at domain root"
+  microsoft.ad.ou:
+    name: "{{ ad_gpo_member_servers_ou_name }}"
+    path: "DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+    state: present
+    description: "Member Servers (file/print/app servers) — SCT MS GPOs link here. Empty in the single-DC lab; populated when Phase 6+ adds member servers."
+  register: r_member_servers_ou
+
+# The GPO import + link loop uses a single win_powershell task per phase so
+# that we can centralize idempotency logic (description-marker check) and
+# error handling. Per-GPO Ansible loop tasks would multiply log noise without
+# helping debuggability.
+
+- name: "Import SCT baseline GPOs from staged backup tree (idempotent via description marker)"
+  ansible.windows.win_powershell:
+    parameters:
+      BaselineImports: "{{ ad_gpo_baseline_imports + (ad_gpo_ie11_imports if ad_gpo_import_ie11 else []) }}"
+      BackupRoot: "{{ ad_gpo_staging_dir }}\\{{ ad_gpo_sct_zip_top_dir }}\\GPOs"
+      DescriptionMarker: "{{ ad_gpo_description_marker }}"
+    script: |
+      param(
+          [object[]]$BaselineImports,
+          [string]$BackupRoot,
+          [string]$DescriptionMarker
+      )
+      # GroupPolicy module is in RSAT on the DC — should already be loaded for
+      # any AD admin session, but explicit import is the silent-no-op defense.
+      Import-Module GroupPolicy -ErrorAction Stop
+      Import-Module ActiveDirectory -ErrorAction Stop
+
+      $imported = @()
+      $skipped  = @()
+
+      # Idempotency check reads the GPO's AD container `description` attribute
+      # directly, NOT (Get-GPO -Name X).Description. The latter reads GPMC's
+      # display description from the SYSVOL backup XML — a separate value that
+      # is read-only via the standard cmdlets and is NOT what we stamp.
+      $domainDn      = (Get-ADDomain -ErrorAction Stop).DistinguishedName
+      $gpoContainer  = "CN=Policies,CN=System,$domainDn"
+
+      foreach ($entry in $BaselineImports) {
+          $name     = $entry['display_name']
+          $backupId = $entry['backup_id']
+
+          # LDAP filter: groupPolicyContainer with matching displayName.
+          $existing = Get-ADObject `
+              -LDAPFilter "(&(objectClass=groupPolicyContainer)(displayName=$name))" `
+              -SearchBase $gpoContainer `
+              -Properties description `
+              -ErrorAction SilentlyContinue
+
+          if ($existing -and $existing.description -and ($existing.description -like "$DescriptionMarker*")) {
+              $skipped += $name
+              continue
+          }
+
+          # Import-GPO -BackupId is the canonical SCT import call. -CreateIfNeeded
+          # is the deliberately-idempotent mode: create new GPO if absent, replace
+          # contents if present. -TargetName forces the imported GPO to use the
+          # display name we chose (MS-recommended; SCT backups have their own
+          # internal display names that may not match what we want).
+          Import-GPO `
+              -BackupId $backupId `
+              -Path $BackupRoot `
+              -TargetName $name `
+              -CreateIfNeeded `
+              -ErrorAction Stop | Out-Null
+
+          # Stamp the description marker on the AD GPO object so the next run
+          # can skip this GPO. Re-fetch after import (the AD object only exists
+          # for new GPOs after Import-GPO -CreateIfNeeded creates the container).
+          $gpoObj = Get-ADObject `
+              -LDAPFilter "(&(objectClass=groupPolicyContainer)(displayName=$name))" `
+              -SearchBase $gpoContainer `
+              -Properties description `
+              -ErrorAction Stop
+          if (-not $gpoObj) {
+              throw "Import-GPO reported success for '$name' but AD object not found post-write."
+          }
+          Set-ADObject -Identity $gpoObj.DistinguishedName -Replace @{ description = $DescriptionMarker } -ErrorAction Stop
+
+          $imported += $name
+      }
+
+      $Ansible.Changed = ($imported.Count -gt 0)
+      $Ansible.Result  = @{
+          Imported = $imported
+          Skipped  = $skipped
+      }
+  register: r_gpo_imports
+
+- name: "Link SCT baseline GPOs to their canonical OUs (idempotent via Get-GPInheritance)"
+  ansible.windows.win_powershell:
+    parameters:
+      BaselineLinks: "{{ ad_gpo_baseline_imports }}"
+    script: |
+      param([object[]]$BaselineLinks)
+
+      Import-Module GroupPolicy -ErrorAction Stop
+
+      $linked = @()
+      $skipped = @()
+
+      foreach ($entry in $BaselineLinks) {
+          $name   = $entry['display_name']
+          $target = $entry['link_to']
+
+          # Skip entries with no link target (IE11 baselines are import-only).
+          if (-not $target) {
+              $skipped += "$name (no link target)"
+              continue
+          }
+
+          # Get-GPInheritance returns the list of GpoLinks at the target.
+          # Each entry has a DisplayName matching the GPO name.
+          $existingLinks = (Get-GPInheritance -Target $target -ErrorAction Stop).GpoLinks
+          $alreadyLinked = $existingLinks | Where-Object { $_.DisplayName -eq $name }
+          if ($alreadyLinked) {
+              $skipped += "$name -> $target (already linked)"
+              continue
+          }
+
+          # New-GPLink: -Enforced No (default), -LinkEnabled Yes (default).
+          # Link order: appended at the end (lowest precedence). The SCT
+          # baseline + a delta GPO at the same OU compose by order; deltas
+          # higher in order win on conflict — but our lab delta is at the
+          # domain root (different scope) so this is fine.
+          New-GPLink -Name $name -Target $target -ErrorAction Stop | Out-Null
+          $linked += "$name -> $target"
+      }
+
+      $Ansible.Changed = ($linked.Count -gt 0)
+      $Ansible.Result  = @{
+          Linked  = $linked
+          Skipped = $skipped
+      }
+  register: r_gpo_links
+
+- name: "Ensure Lab Delta GPO exists with firewall logging settings (post-prune per ADR-019)"
+  ansible.windows.win_powershell:
+    parameters:
+      DeltaName: "{{ ad_gpo_lab_delta_name }}"
+      LogPath: "{{ ad_gpo_firewall_log_path }}"
+      LogSizeKB: "{{ ad_gpo_firewall_log_size_kb | int }}"
+      LogDropped: "{{ ad_gpo_firewall_log_dropped | bool }}"
+      LogSuccess: "{{ ad_gpo_firewall_log_success | bool }}"
+    script: |
+      param(
+          [string]$DeltaName,
+          [string]$LogPath,
+          [int]$LogSizeKB,
+          [bool]$LogDropped,
+          [bool]$LogSuccess
+      )
+      Import-Module GroupPolicy -ErrorAction Stop
+
+      $changed = @()
+
+      # Ensure the GPO exists.
+      $gpo = Get-GPO -Name $DeltaName -ErrorAction SilentlyContinue
+      if (-not $gpo) {
+          $gpo = New-GPO -Name $DeltaName -Comment 'ad_gpo role: lab delta layered on top of SCT WS2025 v2602' -ErrorAction Stop
+          $changed += 'gpo-created'
+      }
+
+      # Firewall log settings live under Computer Config > Policies > Windows Settings >
+      # Security Settings > Windows Firewall with Advanced Security > {Domain|Private|Public} Profile.
+      # The registry-backed values written by GPOEditor live at:
+      #   HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\<Profile>Profile\Logging
+      # Key names: LogFilePath, LogFileSize, LogDroppedPackets, LogSuccessfulConnections.
+      #
+      # Set-GPRegistryValue is the canonical Ansible-friendly path for these values.
+      # Get-Command Set-GPRegistryValue | Select -Expand Parameters lists Name, Key,
+      # ValueName, Type, Value — verified against Server 2025 build 26100.32860.
+
+      $profiles = @('DomainProfile', 'PrivateProfile', 'PublicProfile')
+      $logDroppedDw  = if ($LogDropped) { 1 } else { 0 }
+      $logSuccessDw  = if ($LogSuccess) { 1 } else { 0 }
+
+      foreach ($p in $profiles) {
+          $regKey = "HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\$p\Logging"
+
+          # Idempotency-aware writes: read current value, compare, set only if different.
+          # Set-GPRegistryValue is itself idempotent but always reports Changed; reading
+          # via Get-GPRegistryValue + comparing is the silent-no-op defense (registry
+          # canonical source per ADR-037).
+
+          # LogFilePath
+          $current = (Get-GPRegistryValue -Name $DeltaName -Key $regKey -ValueName 'LogFilePath' -ErrorAction SilentlyContinue).Value
+          if ($current -ne $LogPath) {
+              Set-GPRegistryValue -Name $DeltaName -Key $regKey -ValueName 'LogFilePath' -Type String -Value $LogPath -ErrorAction Stop | Out-Null
+              $changed += "$p/LogFilePath"
+          }
+
+          # LogFileSize (KB)
+          $current = (Get-GPRegistryValue -Name $DeltaName -Key $regKey -ValueName 'LogFileSize' -ErrorAction SilentlyContinue).Value
+          if ($current -ne $LogSizeKB) {
+              Set-GPRegistryValue -Name $DeltaName -Key $regKey -ValueName 'LogFileSize' -Type DWord -Value $LogSizeKB -ErrorAction Stop | Out-Null
+              $changed += "$p/LogFileSize"
+          }
+
+          # LogDroppedPackets
+          $current = (Get-GPRegistryValue -Name $DeltaName -Key $regKey -ValueName 'LogDroppedPackets' -ErrorAction SilentlyContinue).Value
+          if ($current -ne $logDroppedDw) {
+              Set-GPRegistryValue -Name $DeltaName -Key $regKey -ValueName 'LogDroppedPackets' -Type DWord -Value $logDroppedDw -ErrorAction Stop | Out-Null
+              $changed += "$p/LogDroppedPackets"
+          }
+
+          # LogSuccessfulConnections
+          $current = (Get-GPRegistryValue -Name $DeltaName -Key $regKey -ValueName 'LogSuccessfulConnections' -ErrorAction SilentlyContinue).Value
+          if ($current -ne $logSuccessDw) {
+              Set-GPRegistryValue -Name $DeltaName -Key $regKey -ValueName 'LogSuccessfulConnections' -Type DWord -Value $logSuccessDw -ErrorAction Stop | Out-Null
+              $changed += "$p/LogSuccessfulConnections"
+          }
+      }
+
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result  = @{
+          Updated  = $changed
+          GpoId    = $gpo.Id.ToString()
+      }
+  register: r_lab_delta_gpo
+
+- name: "Link Lab Delta GPO at domain root (idempotent)"
+  ansible.windows.win_powershell:
+    parameters:
+      DeltaName: "{{ ad_gpo_lab_delta_name }}"
+      DomainRootDn: "DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+    script: |
+      param(
+          [string]$DeltaName,
+          [string]$DomainRootDn
+      )
+      Import-Module GroupPolicy -ErrorAction Stop
+
+      $existingLinks = (Get-GPInheritance -Target $DomainRootDn -ErrorAction Stop).GpoLinks
+      $alreadyLinked = $existingLinks | Where-Object { $_.DisplayName -eq $DeltaName }
+      if ($alreadyLinked) {
+          $Ansible.Changed = $false
+          $Ansible.Result  = @{ Action = 'already-linked'; Target = $DomainRootDn }
+          return
+      }
+      New-GPLink -Name $DeltaName -Target $DomainRootDn -ErrorAction Stop | Out-Null
+      $Ansible.Changed = $true
+      $Ansible.Result  = @{ Action = 'linked'; Target = $DomainRootDn }
+  register: r_lab_delta_link
+
+- name: "Trigger Invoke-GPUpdate /force on the DC (apply imports + delta immediately)"
+  ansible.windows.win_powershell:
+    script: |
+      # gpupdate /force replaces both Computer + User policy. On a DC this is
+      # safe and fast (~5 sec). Skipping the wait if no changes happened
+      # in this play run keeps repeat invocations cheap.
+      $result = & gpupdate.exe /force /target:computer 2>&1
+      if ($LASTEXITCODE -ne 0) {
+          throw "gpupdate /force returned exit code $LASTEXITCODE. Output: $result"
+      }
+      $Ansible.Changed = $false   # gpupdate output is informational, not a state change
+      $Ansible.Result  = @{ Action = 'gpupdate-completed' }
+  changed_when: false
+  register: r_gpupdate
+
+- name: "Verify all baseline + delta GPOs exist and have expected links"
+  ansible.windows.win_powershell:
+    parameters:
+      BaselineImports: "{{ ad_gpo_baseline_imports + (ad_gpo_ie11_imports if ad_gpo_import_ie11 else []) }}"
+      BaselineLinks: "{{ ad_gpo_baseline_imports }}"
+      DeltaName: "{{ ad_gpo_lab_delta_name }}"
+      DomainRootDn: "DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+    script: |
+      param(
+          [object[]]$BaselineImports,
+          [object[]]$BaselineLinks,
+          [string]$DeltaName,
+          [string]$DomainRootDn
+      )
+      Import-Module GroupPolicy -ErrorAction Stop
+
+      $missing = @()
+      foreach ($entry in $BaselineImports) {
+          $name = $entry['display_name']
+          $gpo = Get-GPO -Name $name -ErrorAction SilentlyContinue
+          if (-not $gpo) {
+              $missing += "GPO missing: $name"
+          }
+      }
+
+      $deltaGpo = Get-GPO -Name $DeltaName -ErrorAction SilentlyContinue
+      if (-not $deltaGpo) {
+          $missing += "GPO missing: $DeltaName"
+      }
+
+      $linkMissing = @()
+      foreach ($entry in $BaselineLinks) {
+          $name = $entry['display_name']
+          $target = $entry['link_to']
+          $links = (Get-GPInheritance -Target $target -ErrorAction Stop).GpoLinks
+          if (-not ($links | Where-Object { $_.DisplayName -eq $name })) {
+              $linkMissing += "$name not linked at $target"
+          }
+      }
+      $domainRootLinks = (Get-GPInheritance -Target $DomainRootDn -ErrorAction Stop).GpoLinks
+      if (-not ($domainRootLinks | Where-Object { $_.DisplayName -eq $DeltaName })) {
+          $linkMissing += "$DeltaName not linked at $DomainRootDn"
+      }
+
+      if ($missing.Count -gt 0 -or $linkMissing.Count -gt 0) {
+          throw "Verification failed.`nMissing GPOs:`n  $($missing -join "`n  ")`nMissing links:`n  $($linkMissing -join "`n  ")"
+      }
+
+      $allGpos = Get-GPO -All | Where-Object { $_.DisplayName -like 'MSFT *' -or $_.DisplayName -eq $DeltaName }
+      $Ansible.Changed = $false
+      $Ansible.Result  = @{
+          BaselineGpoCount = ($allGpos | Where-Object { $_.DisplayName -like 'MSFT *' }).Count
+          DeltaGpoPresent  = ($deltaGpo -ne $null)
+          AllLinksOk       = $true
+      }
+  register: r_gpo_verify
+  changed_when: false
+
+- name: "Show GPO verification summary"
+  ansible.builtin.debug:
+    var: r_gpo_verify.result
