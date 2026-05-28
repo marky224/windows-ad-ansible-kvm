@@ -1,0 +1,35 @@
+---
+# Configure the "advanced" DC-resident services on the already-promoted DC.
+#
+# Assumes 02-configure-dc.yml + 03-configure-services.yml have already run:
+# forest exists, named admin owns the steady-state identity, DNS/DHCP/NTP
+# are converged. Connects as madmin-da@corp.markandrewmarquez.com
+# (group_vars/dc.yml).
+#
+# Roles applied in order:
+#   1. ad_cs   — Enterprise Root CA + Web Enrollment + CDP/AIA + 5 templates
+#   2. ad_gpo  — SCT Server 2025 baseline import + lab-specific delta
+#   3. ad_wsus — WSUS install (DSC) + fire-and-forget initial sync
+#
+# Ordering rationale:
+#   - ad_cs first: standalone, no GPO dependency, gives CA + Web Enrollment
+#     foundation that future GPO autoenrollment policies will reference.
+#   - ad_gpo second: SCT baseline may tighten settings (LDAP signing, NTLM)
+#     that could affect CA operation if applied before — running it after
+#     ad_cs converges keeps the dependency arrow pointing forward.
+#   - ad_wsus last: lowest coupling, longest async operation (initial sync
+#     runs in background). Failure here doesn't block AD CS or GPO.
+#
+# Idempotent: re-running this playbook is a no-op once each role has
+# converged. Each task reads current state before writing per ADR-037.
+#
+# Run:
+#   ansible-playbook -i inventory/lab.yml playbooks/04-configure-services-advanced.yml
+
+- name: "Configure advanced DC-resident services (CS, GPO, WSUS) on {{ groups['dc'][0] }}"
+  hosts: dc
+  gather_facts: false
+  roles:
+    - ad_cs
+    # - ad_gpo
+    # - ad_wsus

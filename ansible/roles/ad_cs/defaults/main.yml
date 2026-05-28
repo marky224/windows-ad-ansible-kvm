@@ -1,0 +1,86 @@
+---
+# ad_cs role defaults.
+#
+# Deploys a single-tier Enterprise Root CA on the promoted DC. This is a
+# deliberate lab compression of the production-canonical two-tier offline-Root +
+# online-Enterprise-Issuing pattern (see ADR-038). For a real 50-200 seat
+# MSP client, the production answer is an offline standalone Root that boots
+# twice a year to re-sign the issuing CA's CRL, and a separate online
+# Enterprise Issuing CA. Documented as a deliberate compression in the role
+# README so the portfolio story stays honest.
+
+# --- CA identity + crypto (ADR-038) ---
+
+# CA common name. Convention: <netbios>-<dc-shortname>-CA.
+# Picked at install time, embedded in every issued cert's Issuer DN, cannot
+# be changed without rebuilding the CA. Choose carefully.
+ad_cs_ca_common_name: "{{ forest.netbios }}-ADDC01-CA"
+
+# 4096-bit RSA + SHA-256 is still production-canonical in mid-2026. ECDSA P-384
+# is technically defensible per MS guidance but creates real-world interop
+# friction (older NDES/SCEP clients, legacy app servers, some Linux verifiers).
+# See ADR-038 for the research backing this.
+ad_cs_key_length: 4096
+ad_cs_hash_algorithm: "SHA256"
+
+# Key storage provider. KSP (vs the legacy CSP) is the 2025 hardening baseline.
+# Microsoft Software KSP is the right pick when no HSM/TPM is in play — the
+# next step up would be the Microsoft Platform Crypto Provider (TPM-backed).
+ad_cs_crypto_provider: "RSA#Microsoft Software Key Storage Provider"
+
+# CA validity period (years). 10 years is the MSFT-documented default for
+# Enterprise Root in single-tier deployments and matches production-MSP norms.
+ad_cs_validity_years: 10
+
+# --- CRL + delta CRL timing (ADR-038, certutil -setreg) ---
+#
+# 1 week base CRL + 1 day delta CRL is the production-canonical balance: tight
+# enough that revocation propagates within a day, loose enough that the CA
+# doesn't churn signing operations. Overlap defaults to 10% of CRL lifetime
+# or 12h max; explicit 12h is the canonical setting.
+
+ad_cs_crl_period: "Weeks"
+ad_cs_crl_period_units: 1
+ad_cs_crl_delta_period: "Days"
+ad_cs_crl_delta_period_units: 1
+ad_cs_crl_overlap_period: "Hours"
+ad_cs_crl_overlap_units: 12
+
+# --- Web Enrollment / HTTP CDP+AIA (ADR-038) ---
+#
+# The Web Enrollment role installs IIS + the /CertEnroll virtual directory
+# pointing at C:\Windows\System32\CertSrv\CertEnroll\. The CA already writes
+# its CRL and AIA cert into that directory; Web Enrollment makes them
+# HTTP-reachable so non-domain-joined endpoints (Linux/macOS, external apps,
+# domain-joined hosts before Kerberos is up) can validate certs.
+#
+# Set to false to skip the Web Enrollment install — leaves the CA with
+# default LDAP-only CDP/AIA, which is fine for domain-joined Windows clients
+# but breaks cert validation from Linux endpoints + non-domain devices.
+ad_cs_install_web_enrollment: true
+
+# FQDN used in HTTP CDP/AIA URLs. The DNS name must resolve to the CA host
+# from anywhere a cert is validated (so use the real published FQDN, not the
+# DC's NetBIOS name with a synthetic suffix).
+ad_cs_http_pki_host: "addc01.{{ forest.fqdn }}"
+
+# --- Certificate templates to publish at CA install (ADR-038) ---
+#
+# Production-canonical day-1 set for a 50-200 seat MSP build:
+#   - Machine                    (CN of V1 "Computer" template) — generic computer auth
+#   - WebServer                  (V1) — LDAPS, WinRM HTTPS, IIS-served sites
+#   - User                       (V1) — generic user auth
+#   - Workstation                (CN of V2 "Workstation Authentication") — 802.1X / NPS client
+#   - KerberosAuthentication     (V2) — modern DC cert, supersedes V1 DomainController
+#                                       and V2 DomainControllerAuthentication; includes
+#                                       the KDC Authentication EKU OID per RFC 4556
+#
+# Each entry is the template CN (what Add-CATemplate -Name takes), which
+# differs from the display name for several built-ins (Computer → Machine,
+# Workstation Authentication → Workstation).
+ad_cs_templates_to_publish:
+  - Machine
+  - WebServer
+  - User
+  - Workstation
+  - KerberosAuthentication

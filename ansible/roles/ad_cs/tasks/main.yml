@@ -1,0 +1,341 @@
+---
+# Configure Active Directory Certificate Services on the promoted DC.
+#
+# Single-tier Enterprise Root CA pattern (ADR-038): a deliberate lab
+# compression of the production-canonical two-tier (offline Root + online
+# Issuing). See ADR-038 for the production-vs-lab framing.
+#
+# This role:
+#   1. Installs AD-Certificate-Services + management tools.
+#   2. Creates the Enterprise Root CA via Install-AdcsCertificationAuthority
+#      (inline PS — no native Ansible module for the CA install itself).
+#   3. Installs Web Enrollment role (AD-Certificate-Services-Web-Enrollment +
+#      Web-Server) so HTTP CDP/AIA URLs are reachable.
+#   4. Sets CRL + delta CRL + overlap periods via certutil -setreg
+#      (registry is the canonical source; CLI annotates output).
+#   5. Issues the first CRL (otherwise newly-issued certs reference a CRL
+#      that does not yet exist on disk → IIS 404).
+#   6. Configures CDP/AIA URLs via microsoft.ad.cs_authority (native, v1.11.0+).
+#      Includes default local file + LDAP entries plus added HTTP entries.
+#   7. Publishes the production-canonical 5-template baseline via
+#      microsoft.ad.cs_template (native, v1.11.0+).
+#   8. Verifies CA via certutil -CAInfo + certutil -ping + Get-CATemplate.
+#
+# ADR-037 (DSC vs inline PS): inline PS + native modules. ActiveDirectoryCSDsc
+# stable release is from 2020 with no Server 2025 24H2 validation.
+# CertificateDsc is healthy but only solves what cs_template already covers.
+# Stay native; apply silent-no-op defenses (Get-Command verification,
+# -ErrorAction Stop, post-write reads, two-run idempotency gate) to every
+# inline PS task.
+
+- name: "Install AD-Certificate-Services Windows features (with management tools)"
+  ansible.windows.win_feature:
+    name:
+      - AD-Certificate
+      - ADCS-Cert-Authority
+    include_management_tools: true
+    state: present
+  register: r_cs_features
+
+# The CertSvc service is created by the feature install but disabled/stopped
+# until Install-AdcsCertificationAuthority runs. We can't use win_service to
+# check whether the CA is "installed" — instead we look for the CA registry
+# key, which only gets populated by the post-install cmdlet.
+
+- name: "Install Enterprise Root CA (Install-AdcsCertificationAuthority)"
+  ansible.windows.win_powershell:
+    parameters:
+      CaCommonName: "{{ ad_cs_ca_common_name }}"
+      KeyLength: "{{ ad_cs_key_length }}"
+      HashAlgorithm: "{{ ad_cs_hash_algorithm }}"
+      CryptoProvider: "{{ ad_cs_crypto_provider }}"
+      ValidityYears: "{{ ad_cs_validity_years }}"
+    script: |
+      param(
+          [string]$CaCommonName,
+          [int]$KeyLength,
+          [string]$HashAlgorithm,
+          [string]$CryptoProvider,
+          [int]$ValidityYears
+      )
+      Import-Module ADCSDeployment -ErrorAction Stop
+
+      # The "Active" value under CertSvc\Configuration is the canonical "CA is
+      # installed and configured" marker — populated by Install-AdcsCertificationAuthority
+      # with the CA common name, missing entirely on a feature-only install.
+      $configRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration'
+      $active = (Get-ItemProperty -Path $configRoot -Name Active -ErrorAction SilentlyContinue).Active
+      if ($active -eq $CaCommonName) {
+          $Ansible.Changed = $false
+          $Ansible.Result = @{
+              CaCommonName = $active
+              Action       = 'already-installed'
+          }
+          return
+      }
+      if ($active -and $active -ne $CaCommonName) {
+          throw "A CA is already installed under a different name ('$active'). " +
+                "Refusing to overwrite. Uninstall via Uninstall-AdcsCertificationAuthority first."
+      }
+
+      # Install. Enterprise Root with KSP-backed key — no shared-key password
+      # needed (KSP protects the key); we do NOT pass -AllowAdministratorInteraction
+      # because that would prompt for a password at every CertSvc restart.
+      Install-AdcsCertificationAuthority `
+          -CAType EnterpriseRootCA `
+          -CACommonName $CaCommonName `
+          -KeyLength $KeyLength `
+          -HashAlgorithmName $HashAlgorithm `
+          -CryptoProviderName $CryptoProvider `
+          -ValidityPeriod Years `
+          -ValidityPeriodUnits $ValidityYears `
+          -Force `
+          -ErrorAction Stop | Out-Null
+
+      # Post-write state read (silent-no-op defense per ADR-037).
+      $activeAfter = (Get-ItemProperty -Path $configRoot -Name Active -ErrorAction Stop).Active
+      if ($activeAfter -ne $CaCommonName) {
+          throw "CA install reported success but CertSvc 'Active' value is '$activeAfter', expected '$CaCommonName'."
+      }
+      $Ansible.Changed = $true
+      $Ansible.Result = @{
+          CaCommonName = $activeAfter
+          Action       = 'installed'
+      }
+  register: r_ca_install
+
+- name: "Install Web Enrollment role features (AD-Certificate-Services-Web-Enrollment + Web-Server)"
+  when: ad_cs_install_web_enrollment | bool
+  ansible.windows.win_feature:
+    name:
+      - ADCS-Web-Enrollment
+      - Web-Server
+    include_management_tools: true
+    state: present
+  register: r_we_features
+
+- name: "Install Web Enrollment service binding (Install-AdcsWebEnrollment)"
+  when: ad_cs_install_web_enrollment | bool
+  ansible.windows.win_powershell:
+    script: |
+      Import-Module ADCSDeployment -ErrorAction Stop
+
+      # The Web Enrollment install creates the /CertSrv and /CertEnroll virtual
+      # directories under IIS Default Web Site. The IIS WebAdministration module
+      # is the canonical place to check whether the install has run already.
+      Import-Module WebAdministration -ErrorAction Stop
+      $existing = Get-WebApplication -Site 'Default Web Site' -Name 'CertSrv' -ErrorAction SilentlyContinue
+      if ($existing) {
+          $Ansible.Changed = $false
+          $Ansible.Result = @{ Action = 'already-installed'; ApplicationPath = $existing.Path }
+          return
+      }
+      Install-AdcsWebEnrollment -Force -ErrorAction Stop | Out-Null
+      $after = Get-WebApplication -Site 'Default Web Site' -Name 'CertSrv' -ErrorAction Stop
+      $Ansible.Changed = $true
+      $Ansible.Result = @{ Action = 'installed'; ApplicationPath = $after.Path }
+  register: r_we_install
+
+- name: "Set CRL + delta CRL + overlap periods via certutil -setreg"
+  ansible.windows.win_powershell:
+    parameters:
+      CrlPeriod: "{{ ad_cs_crl_period }}"
+      CrlPeriodUnits: "{{ ad_cs_crl_period_units }}"
+      CrlDeltaPeriod: "{{ ad_cs_crl_delta_period }}"
+      CrlDeltaPeriodUnits: "{{ ad_cs_crl_delta_period_units }}"
+      CrlOverlapPeriod: "{{ ad_cs_crl_overlap_period }}"
+      CrlOverlapUnits: "{{ ad_cs_crl_overlap_units }}"
+      CaCommonName: "{{ ad_cs_ca_common_name }}"
+    script: |
+      param(
+          [string]$CrlPeriod,
+          [int]$CrlPeriodUnits,
+          [string]$CrlDeltaPeriod,
+          [int]$CrlDeltaPeriodUnits,
+          [string]$CrlOverlapPeriod,
+          [int]$CrlOverlapUnits,
+          [string]$CaCommonName
+      )
+
+      # Per-CA config lives under
+      #   HKLM\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\<CAName>\...
+      # Reading the registry is the canonical idempotency check — certutil's
+      # text output annotates values ("(default)", trailing whitespace) and
+      # breaks string equality. ADR-037 defense.
+      $caKey = "HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$CaCommonName"
+      $desired = @{
+          'CRLPeriod'             = $CrlPeriod
+          'CRLPeriodUnits'        = $CrlPeriodUnits
+          'CRLDeltaPeriod'        = $CrlDeltaPeriod
+          'CRLDeltaPeriodUnits'   = $CrlDeltaPeriodUnits
+          'CRLOverlapPeriod'      = $CrlOverlapPeriod
+          'CRLOverlapUnits'       = $CrlOverlapUnits
+      }
+      $changed = @()
+      foreach ($name in $desired.Keys) {
+          $expected = $desired[$name]
+          $current = (Get-ItemProperty -Path $caKey -Name $name -ErrorAction SilentlyContinue).$name
+          if ($current -ne $expected) {
+              if ($expected -is [int]) {
+                  & certutil.exe -setreg "CA\$name" $expected | Out-Null
+              } else {
+                  & certutil.exe -setreg "CA\$name" $expected | Out-Null
+              }
+              if ($LASTEXITCODE -ne 0) {
+                  throw "certutil -setreg CA\$name $expected failed with exit code $LASTEXITCODE"
+              }
+              $changed += $name
+          }
+      }
+
+      if ($changed.Count -gt 0) {
+          # CertSvc restart is required for registry CRL period changes to land
+          # — the service caches the values at startup.
+          Restart-Service -Name CertSvc -Force -ErrorAction Stop
+      }
+
+      # Post-write state read.
+      $after = @{}
+      foreach ($name in $desired.Keys) {
+          $after[$name] = (Get-ItemProperty -Path $caKey -Name $name -ErrorAction Stop).$name
+      }
+      $mismatch = @($desired.Keys | Where-Object { $after[$_] -ne $desired[$_] })
+      if ($mismatch.Count -gt 0) {
+          throw "CRL period registry mismatch after certutil -setreg: $($mismatch -join ', ')"
+      }
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result = @{
+          Updated  = $changed
+          Current  = $after
+      }
+  register: r_crl_period
+
+- name: "Configure CDP + AIA (LDAP + local file + HTTP) via microsoft.ad.cs_authority"
+  microsoft.ad.cs_authority:
+    cdp:
+      # 1. Local file publish target. CA writes CRL + delta CRL to disk here;
+      #    IIS Default Web Site /CertEnroll serves the same directory.
+      - uri: 'C:\Windows\System32\CertSrv\CertEnroll\<CaName><CRLNameSuffix><DeltaCRLAllowed>.crl'
+        publish_to_server: true
+        publish_delta_to_server: true
+      # 2. LDAP CDP. Default for Enterprise CA; fast for domain-joined clients.
+      - uri: 'ldap:///CN=<CATruncatedName><CRLNameSuffix>,CN=<ServerShortName>,CN=CDP,CN=Public Key Services,CN=Services,<ConfigurationContainer>?certificateRevocationList?base?objectClass=cRLDistributionPoint'
+        add_to_certificate_cdp: true
+        add_to_crl_cdp: true
+      # 3. HTTP CDP via Web Enrollment /CertEnroll vdir. Works for non-domain
+      #    endpoints (Linux via SSSD, external apps); also the path that
+      #    most modern Windows builds prefer over LDAP for CRL retrieval.
+      - uri: 'http://{{ ad_cs_http_pki_host }}/CertEnroll/<CaName><CRLNameSuffix><DeltaCRLAllowed>.crl'
+        add_to_certificate_cdp: true
+        add_to_freshest_crl: true
+    aia:
+      # 1. Local file publish target for the CA cert itself.
+      - uri: 'C:\Windows\System32\CertSrv\CertEnroll\<ServerDNSName>_<CaName><CertificateName>.crt'
+      # 2. LDAP AIA. Default for Enterprise CA.
+      - uri: 'ldap:///CN=<CATruncatedName>,CN=AIA,CN=Public Key Services,CN=Services,<ConfigurationContainer>?cACertificate?base?objectClass=certificationAuthority'
+        add_to_certificate_aia: true
+      # 3. HTTP AIA via Web Enrollment.
+      - uri: 'http://{{ ad_cs_http_pki_host }}/CertEnroll/<ServerDNSName>_<CaName><CertificateName>.crt'
+        add_to_certificate_aia: true
+    restart_service: true
+  register: r_cdp_aia
+
+- name: "Issue initial CRL (certutil -CRL)"
+  ansible.windows.win_powershell:
+    parameters:
+      CaCommonName: "{{ ad_cs_ca_common_name }}"
+    script: |
+      param([string]$CaCommonName)
+
+      # CRL filename produced by the CA install includes a sanitized version
+      # of the CA common name (commas → spaces, then concatenated). Easier
+      # to just check whether ANY .crl exists in the CertEnroll directory.
+      $crlDir = 'C:\Windows\System32\CertSrv\CertEnroll'
+      $existing = Get-ChildItem -Path $crlDir -Filter '*.crl' -ErrorAction SilentlyContinue
+      if ($existing -and $existing.Count -gt 0) {
+          $Ansible.Changed = $false
+          $Ansible.Result = @{
+              Action  = 'already-issued'
+              CrlFiles = @($existing | ForEach-Object { $_.Name })
+          }
+          return
+      }
+      $out = & certutil.exe -CRL 2>&1
+      if ($LASTEXITCODE -ne 0) {
+          throw "certutil -CRL failed with exit code $LASTEXITCODE. Output: $out"
+      }
+      $after = Get-ChildItem -Path $crlDir -Filter '*.crl' -ErrorAction Stop
+      $Ansible.Changed = $true
+      $Ansible.Result = @{
+          Action   = 'issued'
+          CrlFiles = @($after | ForEach-Object { $_.Name })
+      }
+  register: r_crl_issue
+
+- name: "Publish production-canonical certificate templates to the CA"
+  microsoft.ad.cs_template:
+    name: "{{ item }}"
+    publish_to_ca:
+      - "{{ ad_cs_ca_common_name }}"
+    state: present
+  loop: "{{ ad_cs_templates_to_publish }}"
+  register: r_templates
+
+- name: "Verify CA end-to-end (certutil -ping + -CAInfo + Get-CATemplate)"
+  ansible.windows.win_powershell:
+    parameters:
+      CaCommonName: "{{ ad_cs_ca_common_name }}"
+      ExpectedTemplates: "{{ ad_cs_templates_to_publish }}"
+    script: |
+      param(
+          [string]$CaCommonName,
+          [string[]]$ExpectedTemplates
+      )
+
+      # certutil -ping uses the local CA's ICertAdmin2 RPC interface — works
+      # over RPC/COM, returns "Server could not be reached" on any local-CA
+      # service-startup failure. Cheap liveness check.
+      $pingOut = & certutil.exe -ping 2>&1
+      if ($LASTEXITCODE -ne 0) {
+          throw "certutil -ping failed (CA unreachable). Exit $LASTEXITCODE. Output: $pingOut"
+      }
+
+      # certutil -CAInfo dumps CA metadata. We assert on CA name + type only
+      # (full structure is verbose and not all fields are stable across patches).
+      $caInfoOut = & certutil.exe -CAInfo 2>&1 | Out-String
+      if ($caInfoOut -notmatch [regex]::Escape($CaCommonName)) {
+          throw "certutil -CAInfo output does not reference expected CA '$CaCommonName'. Got:`n$caInfoOut"
+      }
+      if ($caInfoOut -notmatch 'Enterprise Root') {
+          throw "certutil -CAInfo output does not indicate Enterprise Root CA type. Got:`n$caInfoOut"
+      }
+
+      # Published-templates check. certutil -CATemplates lists one row per
+      # template currently published to the local CA. Names are the CN
+      # (not display name).
+      $publishedRaw = & certutil.exe -CATemplates 2>&1 | Out-String
+      $missing = @()
+      foreach ($t in $ExpectedTemplates) {
+          # certutil -CATemplates output format: "<CN>: <display name>" per line
+          # for each published template. Use boundary-anchored regex.
+          if ($publishedRaw -notmatch "(?im)^\s*$([regex]::Escape($t))\s*:") {
+              $missing += $t
+          }
+      }
+      if ($missing.Count -gt 0) {
+          throw "Expected templates not published to CA: $($missing -join ', '). " +
+                "certutil -CATemplates output:`n$publishedRaw"
+      }
+
+      $Ansible.Changed = $false
+      $Ansible.Result = @{
+          CaCommonName    = $CaCommonName
+          PingOk          = $true
+          PublishedCount  = $ExpectedTemplates.Count
+      }
+  register: r_ca_verify
+  changed_when: false
+
+- name: "Show CA verification summary"
+  ansible.builtin.debug:
+    var: r_ca_verify.result
