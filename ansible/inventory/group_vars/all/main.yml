@@ -18,13 +18,20 @@ named_admin:
   description: "Steady-state Ansible domain admin per ADR-032"
 
 # --- Network (matches _private/docs/NETWORK.md, ADR-005 + ADR-006) ---
+# DHCP layout (production-MSP pattern, M4 design call 2026-05-28):
+# One scope spans .50-.199; an exclusion .50-.99 keeps the reservation block
+# off dynamic allocation; per-MAC reservations punch through the exclusion.
+# Effective dynamic pool is the unexcluded remainder, .100-.199.
+# Reservations themselves live in clients.yml + linux_clients.yml group_vars.
 corp_subnet:
   cidr: 10.10.0.0/24
   netmask: 255.255.255.0
   gateway: 10.10.0.1
   dc_ip: 10.10.0.10
-  dhcp_scope_start: 10.10.0.100
+  dhcp_scope_start: 10.10.0.50
   dhcp_scope_end: 10.10.0.199
+  dhcp_reservation_range_start: 10.10.0.50
+  dhcp_reservation_range_end: 10.10.0.99
   libvirt_network_name: corp-lab
   libvirt_bridge: virbr-corp
   mac_oui: "52:54:00"  # libvirt-allocated range
