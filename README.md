@@ -10,7 +10,7 @@ End-to-end automated build: from a bare Ubuntu 24.04 host, Ansible provisions a 
 
 ## Status
 
-**Milestone 4 complete (2026-05-28)** — DC is up, joined, hardened, and now serving DNS (Quad9 forwarders, AD-integrated reverse zone, aging/scavenging), DHCP (single-scope `/24` with reservation carve-out, 3 MAC-tied client reservations, server authorized in AD), and NTP (4× `pool.ntp.org`, PDC announces as reliable source). All three roles fully idempotent — `ok=20, changed=0` on consecutive re-runs.
+**Milestone 5 complete (2026-05-29)** — DC now also runs an Enterprise Root CA (5 templates published, HTTP CDP/AIA via Web Enrollment, CRL on the standard 1-week/1-day-delta/12-hour-overlap cadence), the Microsoft SCT Server 2025 v2602 GPO baseline (6 Server 2025 + 2 IE11 GPOs imported, linked to their canonical OUs, plus a Lab Delta GPO for firewall logging), and WSUS on a dedicated `D:\WSUS` volume (4 products + 4 classifications, Default Automatic Approval Rule enabled, fire-and-forget sync). All three M5 roles fully idempotent — `ok=10, changed=0` (ad_cs), `ok=22, changed=0` (ad_gpo), `ok=40, changed=0` (ad_wsus) on consecutive re-runs.
 
 | Milestone | Status | What it produces |
 |---|---|---|
@@ -19,8 +19,8 @@ End-to-end automated build: from a bare Ubuntu 24.04 host, Ansible provisions a 
 | 3 — DC promotion + named admin + RID 500 hardening | ✅ Done | `ad_dc` + `ad_admins` + `ad_harden_builtin_admin` → forest `corp.markandrewmarquez.com`, FSMO holder, `madmin-da` steady-state admin |
 | 3.5 — DISM-slipstream Server 2025 install ISO | ✅ Done | `kvm_iso_slipstream` role → patched install media at build 26100.32860 |
 | 4 — DC-resident services (DNS / DHCP / NTP) | ✅ Done | `ad_dns` + `ad_dhcp` + `ad_ntp` → forwarders, reverse zone, scope with reservations, authoritative time |
-| 5 — Cert services + GPO baseline + WSUS | 🚧 Next | `ad_cs`, `ad_gpo`, `ad_wsus` |
-| 6 — Client provisioning + domain join | ⏳ Planned | Win 11 + Ubuntu joined to `corp.markandrewmarquez.com` |
+| 5 — Cert services + GPO baseline + WSUS | ✅ Done | `ad_cs` (Enterprise Root CA + Web Enrollment + 5 templates), `ad_gpo` (SCT v2602 baseline + Lab Delta), `ad_wsus` (D:\WSUS + 4 products + Default Approval Rule) |
+| 6 — Client provisioning + domain join | 🚧 Next | Win 11 + Ubuntu joined to `corp.markandrewmarquez.com` |
 | 7 — Smoke test + backups | ⏳ Planned | End-to-end verification + nightly state backup |
 
 ### From install ISO to live forest
@@ -138,8 +138,8 @@ ansible-playbook playbooks/slipstream-iso.yml             # ✅ Milestone 3.5 (o
 ansible-playbook playbooks/01-provision-dc.yml            # ✅ Milestone 2
 ansible-playbook playbooks/02-configure-dc.yml            # ✅ Milestone 3
 ansible-playbook playbooks/03-configure-services.yml      # ✅ Milestone 4 (DNS/DHCP/NTP)
-ansible-playbook playbooks/04-configure-services-advanced.yml  # 🚧 Milestone 5 (CS/GPO/WSUS, planned)
-ansible-playbook playbooks/05-provision-clients.yml       # ⏳
+ansible-playbook playbooks/04-configure-services-advanced.yml  # ✅ Milestone 5 (CS/GPO/WSUS)
+ansible-playbook playbooks/05-provision-clients.yml       # 🚧 Milestone 6
 ansible-playbook playbooks/06-join-domain.yml             # ⏳
 ansible-playbook playbooks/07-provision-linux.yml         # ⏳
 ansible-playbook playbooks/08-join-linux.yml              # ⏳
@@ -175,9 +175,9 @@ ansible-playbook playbooks/site.yml
 | `ad_dns` | Quad9 forwarders, AD-integrated reverse zone, server scavenging + per-zone aging | ✅ |
 | `ad_dhcp` | DHCP install, AD-authorize, single-scope `/24` with reservation carve-out + options 003/006/015/042 | ✅ |
 | `ad_ntp` | PDC NTP authority pointing at `pool.ntp.org`, AnnounceFlags=5 | ✅ |
-| `ad_cs` | Enterprise Root CA install + `cs_authority` + `cs_template` | 🚧 |
-| `ad_gpo` | Import MSFT SCT Server 2025 baseline + 12 lab-specific overrides | 🚧 |
-| `ad_wsus` | WSUS install + async sync trigger | 🚧 |
+| `ad_cs` | Single-tier Enterprise Root CA + Web Enrollment + `cs_authority` (CDP/AIA) + `cs_template` (5 templates: Machine, WebServer, User, Workstation, KerberosAuthentication) | ✅ |
+| `ad_gpo` | Import MSFT SCT Server 2025 v2602 baseline (6 GPOs linked to canonical OUs + 2 IE11 import-only) + Lab Delta GPO (firewall logging) | ✅ |
+| `ad_wsus` | WSUS install on dedicated `D:\WSUS` (60 GB qcow2) + 4 products + 4 classifications + Default Automatic Approval Rule + fire-and-forget sync | ✅ |
 | `domain_join_windows` | Win 11 client domain join (`microsoft.ad.membership`) | ⏳ |
 | `domain_join_linux` | Ubuntu domain join via `realmd` + `sssd` | ⏳ |
 | `ops_backup` | AD state backup orchestration (SMB to host + WinRM `fetch`) | ⏳ |
