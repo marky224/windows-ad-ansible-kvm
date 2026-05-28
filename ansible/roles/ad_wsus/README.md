@@ -28,7 +28,7 @@ The role + this README acknowledge the deprecation explicitly. See ADR-037 + ADR
 
 ### Phase 1: Libvirt-side disk prep (delegated to localhost)
 1. Eject residual install CD media from ADDC01 (`virtio-win-0.1.271.iso` + per-VM seed ISO) — idempotent (`virsh change-media --eject`; `detach-disk` does not support CDROM devices).
-2. Create 60 GB qcow2 at `vm-lab/disks/ADDC01-corp-wsus.qcow2` if absent.
+2. Create 200 GB qcow2 at `vm-lab/disks/ADDC01-corp-wsus.qcow2` if absent. (Sized for day-one full sync + Default Approval Rule auto-approval — research-stated 40-80 GB steady-state was insufficient on first sync; see ADR-039 amendment.)
 3. Live-attach the qcow2 as SCSI `sde` (libvirt's `target dev` letter pool is shared across buses; the SATA CDROMs already occupy sdb/sdc/sdd).
 
 ### Phase 2: Windows-side disk init
@@ -69,7 +69,7 @@ See `defaults/main.yml`. Key knobs:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `ad_wsus_content_disk_size_gb` | `60` | qcow2 sparse; grows on demand. |
+| `ad_wsus_content_disk_size_gb` | `200` | qcow2 sparse; grows on demand. Empirically sized — first sync + auto-approval lands at ~170 GB; 200 GB gives ~30 GB headroom before cleanup is required. See ADR-039 amendment for the sizing journey. To resize later: shutdown VM, `qemu-img resize <path> <new>G`, start VM, `Resize-Partition -DriveLetter D -Size (Get-PartitionSupportedSize -DriveLetter D).SizeMax`. |
 | `ad_wsus_content_disk_path` | `{{ vm_lab_root }}/disks/ADDC01-corp-wsus.qcow2` | Outside the repo per the vm-lab convention. |
 | `ad_wsus_content_drive_letter` | `D` | Phase 2 step 5 frees D: by releasing CDROM letter mounts. |
 | `ad_wsus_products` | 5 entries | Server 2025 + Win 11 24H2 + M365 Apps + Defender. **Win 11 product name was renamed late 2024** to `"Windows 11, version 24H2 and later"`. If the role's product/classification configure task throws "No products matched", the title strings have shifted; check `Get-WsusProduct \| Select -Expand Product \| Select Title` for current names. |
