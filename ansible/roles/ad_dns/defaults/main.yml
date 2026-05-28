@@ -1,0 +1,32 @@
+---
+# ad_dns role defaults.
+#
+# Forwarders default to Quad9 (9.9.9.9 + 149.112.112.112). Quad9 is a
+# threat-blocking recursive resolver operated by a Swiss non-profit; it
+# refuses to resolve known-malicious domains using threat-intel feeds.
+# Cost: free. Override at playbook level for environments that require a
+# specific upstream.
+ad_dns_forwarders:
+  - 9.9.9.9
+  - 149.112.112.112
+
+# Per-forwarder query timeout (seconds). MSFT default is 3; matched here.
+ad_dns_forwarder_timeout: 3
+
+# Whether the DNS server falls back to root hints when forwarders don't
+# answer. Default true matches MSFT default and keeps lab-internal lookups
+# resilient when Quad9 is unreachable.
+ad_dns_use_root_hints: true
+
+# Reverse-lookup zone for the corp subnet. Derived from corp_subnet.cidr
+# (10.10.0.0/24 → 0.10.10.in-addr.arpa). AD-integrated so it replicates
+# with the forest (single-DC today, future-proof for multi-DC).
+ad_dns_reverse_zone: "0.10.10.in-addr.arpa"
+
+# Aging/scavenging defaults. Both intervals = 7 days is the MSFT-recommended
+# starting point for AD-integrated zones (MS Learn "Set aging and scavenging
+# properties for a zone"). Enables stale record cleanup as clients churn.
+ad_dns_enable_scavenging: true
+ad_dns_no_refresh_interval_days: 7
+ad_dns_refresh_interval_days: 7
+ad_dns_scavenging_interval_hours: 168   # weekly; matches refresh interval

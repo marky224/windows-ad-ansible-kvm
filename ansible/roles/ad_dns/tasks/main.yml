@@ -1,0 +1,198 @@
+---
+# Configure the DNS Server role on the freshly-promoted DC.
+#
+# Assumes ad_dc has already:
+#   - Installed the DNS Server feature (install_dns: true on microsoft.ad.domain).
+#   - Created the AD-integrated forward zone for corp.markandrewmarquez.com.
+#   - Created the AD-integrated _msdcs.corp.markandrewmarquez.com zone.
+#
+# This role adds:
+#   - Upstream forwarders (Quad9 by default; see defaults/main.yml).
+#   - AD-integrated reverse-lookup zone for the corp subnet.
+#   - Aging + scavenging on the forward zone so stale dynamic records
+#     get cleaned up as the lab churns.
+#
+# No native Ansible modules cover these reliably on Server 2025 (the
+# community.windows DNS modules predate the AD-integrated reverse-zone
+# story), so this role uses inline win_powershell against the DnsServer
+# PS module per ADR-016.
+
+- name: "Sanity-check: DNS Server service is running"
+  ansible.windows.win_powershell:
+    script: |
+      $svc = Get-Service -Name DNS -ErrorAction SilentlyContinue
+      if (-not $svc -or $svc.Status -ne 'Running') {
+          throw "DNS service is not Running (status=$($svc.Status)). ad_dc should have installed + started it."
+      }
+      $Ansible.Changed = $false
+      $Ansible.Result = @{ Status = "$($svc.Status)" }
+  register: r_dns_service
+  changed_when: false
+
+- name: "Configure upstream DNS forwarders ({{ ad_dns_forwarders | join(', ') }})"
+  ansible.windows.win_powershell:
+    parameters:
+      Forwarders: "{{ ad_dns_forwarders }}"
+      Timeout: "{{ ad_dns_forwarder_timeout }}"
+      UseRootHints: "{{ ad_dns_use_root_hints }}"
+    script: |
+      param(
+          [string[]]$Forwarders,
+          [int]$Timeout,
+          [bool]$UseRootHints
+      )
+      $current = (Get-DnsServerForwarder).IPAddress | ForEach-Object { $_.IPAddressToString }
+      $desired = @($Forwarders)
+      $changed = $false
+      $needsReplace = $false
+      if ($current -eq $null) { $needsReplace = $true }
+      elseif (@($current).Count -ne $desired.Count) { $needsReplace = $true }
+      else {
+          for ($i = 0; $i -lt $desired.Count; $i++) {
+              if (@($current)[$i] -ne $desired[$i]) { $needsReplace = $true; break }
+          }
+      }
+      if ($needsReplace) {
+          # Set-DnsServerForwarder replaces the entire list (idempotent rewrite).
+          Set-DnsServerForwarder -IPAddress $Forwarders -Timeout $Timeout -UseRootHint:$UseRootHints
+          $changed = $true
+      } else {
+          # Order-correct but settings may differ. Re-apply timeout/UseRootHint via cmdlet.
+          $cfg = Get-DnsServerForwarder
+          if ($cfg.Timeout -ne $Timeout -or $cfg.UseRootHint -ne $UseRootHints) {
+              Set-DnsServerForwarder -IPAddress $Forwarders -Timeout $Timeout -UseRootHint:$UseRootHints
+              $changed = $true
+          }
+      }
+      $Ansible.Changed = $changed
+      $after = Get-DnsServerForwarder
+      $Ansible.Result = @{
+          Forwarders   = @($after.IPAddress | ForEach-Object { $_.IPAddressToString })
+          Timeout      = $after.Timeout
+          UseRootHint  = $after.UseRootHint
+      }
+  register: r_forwarders
+
+- name: "Ensure AD-integrated reverse-lookup zone {{ ad_dns_reverse_zone }} exists"
+  ansible.windows.win_powershell:
+    parameters:
+      ZoneName: "{{ ad_dns_reverse_zone }}"
+    script: |
+      param([string]$ZoneName)
+      $existing = Get-DnsServerZone -Name $ZoneName -ErrorAction SilentlyContinue
+      if ($existing) {
+          $Ansible.Changed = $false
+          $Ansible.Result = @{
+              ZoneName        = $existing.ZoneName
+              ZoneType        = "$($existing.ZoneType)"
+              IsDsIntegrated  = $existing.IsDsIntegrated
+              Action          = 'already-exists'
+          }
+          return
+      }
+      # AD-integrated, forest-wide replication, secure dynamic updates only.
+      Add-DnsServerPrimaryZone `
+          -NetworkID '10.10.0.0/24' `
+          -ReplicationScope Forest `
+          -DynamicUpdate Secure
+      $created = Get-DnsServerZone -Name $ZoneName -ErrorAction Stop
+      $Ansible.Changed = $true
+      $Ansible.Result = @{
+          ZoneName        = $created.ZoneName
+          ZoneType        = "$($created.ZoneType)"
+          IsDsIntegrated  = $created.IsDsIntegrated
+          Action          = 'created'
+      }
+  register: r_reverse_zone
+
+- name: "Enable aging/scavenging on AD-integrated zones"
+  when: ad_dns_enable_scavenging | bool
+  ansible.windows.win_powershell:
+    parameters:
+      ForwardZone: "{{ forest.fqdn }}"
+      ReverseZone: "{{ ad_dns_reverse_zone }}"
+      NoRefresh: "{{ ad_dns_no_refresh_interval_days }}"
+      Refresh: "{{ ad_dns_refresh_interval_days }}"
+      ScavInterval: "{{ ad_dns_scavenging_interval_hours }}"
+    script: |
+      param(
+          [string]$ForwardZone,
+          [string]$ReverseZone,
+          [int]$NoRefresh,
+          [int]$Refresh,
+          [int]$ScavInterval
+      )
+      $changed = @()
+      # Server-level scavenging (must be enabled for per-zone aging to actually run).
+      # NOTE: Set-DnsServerScavenging on Server 2025 chokes when passed
+      # -ApplyOnAllZones $false alongside -Force — PS binds $false positionally
+      # to -RefreshInterval and errors "Cannot convert 'False' to System.TimeSpan."
+      # Calling with only the params we actually need works cleanly.
+      $srv = Get-DnsServerScavenging
+      $desiredInterval = New-TimeSpan -Hours $ScavInterval
+      if (-not $srv.ScavengingState -or $srv.ScavengingInterval -ne $desiredInterval) {
+          Set-DnsServerScavenging -ScavengingState $true -ScavengingInterval $desiredInterval -ErrorAction Stop | Out-Null
+          $changed += 'server-scavenging'
+      }
+      # Per-zone aging.
+      # NOTE: Set-DnsServerZoneAging has NO -Force parameter (verified against
+      # the DnsServer module on Server 2025 build 26100.32860; param list
+      # includes Aging/Name/NoRefreshInterval/RefreshInterval/ScavengeServers
+      # plus standard CmdletBinding, but no -Force). Including it makes PS
+      # interpret it as a positional, silently no-opping the call.
+      foreach ($zone in @($ForwardZone, $ReverseZone)) {
+          $z = Get-DnsServerZone -Name $zone -ErrorAction SilentlyContinue
+          if (-not $z) { continue }
+          $aging = Get-DnsServerZoneAging -Name $zone
+          $noRefreshTs = New-TimeSpan -Days $NoRefresh
+          $refreshTs   = New-TimeSpan -Days $Refresh
+          if (-not $aging.AgingEnabled -or
+              $aging.NoRefreshInterval -ne $noRefreshTs -or
+              $aging.RefreshInterval -ne $refreshTs) {
+              Set-DnsServerZoneAging -Name $zone -Aging $true -NoRefreshInterval $noRefreshTs -RefreshInterval $refreshTs -ErrorAction Stop | Out-Null
+              $changed += "aging-on-$zone"
+          }
+      }
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result = @{ Updated = $changed }
+  register: r_scavenging
+
+- name: "Verify configuration end-to-end"
+  ansible.windows.win_powershell:
+    parameters:
+      ForwardZone: "{{ forest.fqdn }}"
+      ReverseZone: "{{ ad_dns_reverse_zone }}"
+      ExpectedForwarders: "{{ ad_dns_forwarders }}"
+    script: |
+      param(
+          [string]$ForwardZone,
+          [string]$ReverseZone,
+          [string[]]$ExpectedForwarders
+      )
+      $forwarders = @((Get-DnsServerForwarder).IPAddress | ForEach-Object { $_.IPAddressToString })
+      $missing = @($ExpectedForwarders | Where-Object { $_ -notin $forwarders })
+      if ($missing.Count -gt 0) {
+          throw "Expected forwarders missing: $($missing -join ', '). Actual: $($forwarders -join ', ')"
+      }
+      $fz = Get-DnsServerZone -Name $ForwardZone -ErrorAction Stop
+      $rz = Get-DnsServerZone -Name $ReverseZone -ErrorAction Stop
+      if (-not $fz.IsDsIntegrated) {
+          throw "Forward zone $ForwardZone is not AD-integrated"
+      }
+      if (-not $rz.IsDsIntegrated) {
+          throw "Reverse zone $ReverseZone is not AD-integrated"
+      }
+      $Ansible.Changed = $false
+      $Ansible.Result = @{
+          Forwarders            = $forwarders
+          ForwardZoneType       = "$($fz.ZoneType)"
+          ForwardZoneDsScope    = "$($fz.ReplicationScope)"
+          ReverseZoneType       = "$($rz.ZoneType)"
+          ReverseZoneDsScope    = "$($rz.ReplicationScope)"
+      }
+  register: r_dns_verify
+  changed_when: false
+
+- name: "Show resolved DNS configuration"
+  ansible.builtin.debug:
+    var: r_dns_verify.result
