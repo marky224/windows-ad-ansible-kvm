@@ -1,0 +1,44 @@
+---
+# ad_ntp role defaults.
+#
+# Configure the PDC emulator as the authoritative NTP server for the forest.
+# Domain-joined clients (member servers + workstations) will sync from the
+# PDC via NT5DS (domain hierarchy) automatically; the PDC itself must sync
+# from external stratum-2 peers.
+
+# Upstream peer list. pool.ntp.org rotates the underlying servers DNS-side
+# so we get diverse stratum-2 sources without naming specific operators.
+# 4 entries gives w32time enough redundancy + outlier rejection material.
+# Cost: free (volunteer-operated). For production with strict SLA needs,
+# pair with a paid stratum-1 (NIST, Meinberg appliance) or a vendor NTP.
+ad_ntp_peers:
+  - 0.pool.ntp.org
+  - 1.pool.ntp.org
+  - 2.pool.ntp.org
+  - 3.pool.ntp.org
+
+# w32time peer flag (per-peer hex suffix appended as ",0xN" in the manual
+# peer list).
+#   0x1 = SpecialInterval (use SpecialPollInterval from registry, not the
+#         default ramped polling)
+#   0x8 = Client (client-mode association — what we want for upstream NTP)
+# 0x9 = 0x1 | 0x8 — common w32time recipe for "use the configured poll
+# interval and treat the peer as upstream client-mode."
+ad_ntp_peer_flag: "0x9"
+
+# AnnounceFlags for the local time service (registry value at
+# HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Config).
+#   0x1 = Always announce time service
+#   0x4 = Announce as reliable time source
+# 5 = 0x1 | 0x4 — what a PDC emulator (authoritative for the domain) needs.
+ad_ntp_announce_flags: 5
+
+# Special poll interval (seconds) — only used when SpecialInterval flag (0x1)
+# is set per peer. 1024 = 17m4s, the w32time default for SpecialPollInterval.
+ad_ntp_special_poll_interval: 1024
+
+# Firewall: open UDP 123 inbound for clients to sync from this server.
+# Server 2025 may have an inactive built-in rule (Windows Time, UDP-In);
+# the role enables that rule if present and creates an explicit fallback
+# rule if not.
+ad_ntp_firewall_rule_name: "NTP-Server-UDP-123-In"

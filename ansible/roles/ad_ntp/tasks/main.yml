@@ -1,0 +1,182 @@
+---
+# Configure the PDC emulator as the authoritative NTP source for the forest.
+#
+# Hierarchy after this role:
+#
+#   pool.ntp.org (stratum 2)
+#         |
+#         v
+#   ADDC01 (PDC emulator, NTP type=NTP, AnnounceFlags=5)
+#         |
+#         v
+#   Domain-joined clients (NT5DS, sync from PDC automatically)
+#
+# No native Ansible module exists for w32time; this is all inline PS
+# wrapping w32tm.exe + registry edits (ADR-016).
+
+- name: "Verify W32Time service is installed + Running"
+  ansible.windows.win_powershell:
+    script: |
+      $svc = Get-Service -Name W32Time -ErrorAction SilentlyContinue
+      if (-not $svc) {
+          throw "W32Time service is not present"
+      }
+      if ($svc.Status -ne 'Running') {
+          Start-Service W32Time
+          $Ansible.Changed = $true
+      } else {
+          $Ansible.Changed = $false
+      }
+      $Ansible.Result = @{ Status = "$((Get-Service W32Time).Status)" }
+  register: r_w32time_svc
+
+- name: "Configure w32time peers + announce as reliable PDC source"
+  ansible.windows.win_powershell:
+    parameters:
+      Peers: "{{ ad_ntp_peers }}"
+      PeerFlag: "{{ ad_ntp_peer_flag }}"
+      AnnounceFlags: "{{ ad_ntp_announce_flags }}"
+      PollInterval: "{{ ad_ntp_special_poll_interval }}"
+    script: |
+      param(
+          [string[]]$Peers,
+          [string]$PeerFlag,
+          [int]$AnnounceFlags,
+          [int]$PollInterval
+      )
+      $changed = @()
+
+      # Build the manualpeerlist string, e.g.
+      #   "0.pool.ntp.org,0x9 1.pool.ntp.org,0x9 ..."
+      $manualPeerList = ($Peers | ForEach-Object { "$_,$PeerFlag" }) -join ' '
+
+      # Read current state from the registry (canonical config source).
+      # NOT from `w32tm /query /configuration` — that appends " (Local)" to
+      # values read from local-server policy and breaks string equality.
+      # NOT comparing against `w32tm /query /source` — the source rotates
+      # through whichever configured peer the service is currently locked
+      # to, so it might be "2.pool.ntp.org,0x9" right now and
+      # "0.pool.ntp.org,0x9" 30 minutes later. Checking against $Peers[0]
+      # specifically tripped a false-positive every time the local clock
+      # had rolled to a non-first peer. Drift in /source isn't config drift.
+      $currentList = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' -Name NtpServer -ErrorAction SilentlyContinue).NtpServer
+      if (-not $currentList) { $currentList = '' }
+      $announce    = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Config' -Name AnnounceFlags -ErrorAction SilentlyContinue).AnnounceFlags
+      $specPoll    = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient' -Name SpecialPollInterval -ErrorAction SilentlyContinue).SpecialPollInterval
+
+      $needsConfig = $false
+      if ($currentList -ne $manualPeerList) { $needsConfig = $true }
+      if ($announce -ne $AnnounceFlags) { $needsConfig = $true }
+      if ($specPoll -ne $PollInterval) { $needsConfig = $true }
+
+      if ($needsConfig) {
+          # Apply config via w32tm. /reliable:yes flips AnnounceFlags to 5
+          # automatically; we also write it explicitly below as a safety net
+          # in case w32tm version varies.
+          $cmd = "w32tm /config /manualpeerlist:`"$manualPeerList`" /syncfromflags:manual /reliable:yes /update"
+          $out = & cmd /c $cmd 2>&1
+          if ($LASTEXITCODE -ne 0) {
+              throw "w32tm /config failed (rc=$LASTEXITCODE): $($out -join "`n")"
+          }
+          $changed += 'w32tm-config'
+
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Config' `
+              -Name AnnounceFlags -Value $AnnounceFlags -Type DWord
+          $changed += 'announce-flags'
+
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient' `
+              -Name SpecialPollInterval -Value $PollInterval -Type DWord
+          $changed += 'special-poll-interval'
+
+          # Restart service so all settings take effect cleanly.
+          Restart-Service W32Time -Force
+          Start-Sleep -Seconds 3
+          $changed += 'service-restart'
+
+          # Nudge an immediate resync; on a freshly-configured DC the first
+          # sync may report "no time data" until the peers respond. Don't
+          # fail the role on that — verification task below polls.
+          w32tm /resync /nowait 2>&1 | Out-Null
+      }
+
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result = @{
+          ManualPeerList   = $manualPeerList
+          AnnounceFlags    = $AnnounceFlags
+          SpecialPollSecs  = $PollInterval
+          Changed          = $changed
+      }
+  register: r_ntp_config
+
+- name: "Ensure UDP 123 is open inbound (NTP server)"
+  ansible.windows.win_powershell:
+    parameters:
+      RuleName: "{{ ad_ntp_firewall_rule_name }}"
+    script: |
+      param([string]$RuleName)
+      $changed = @()
+
+      # 1) Built-in "Windows Time" rule — enable if present + disabled.
+      $builtin = Get-NetFirewallRule -DisplayGroup 'Windows Time' -ErrorAction SilentlyContinue
+      foreach ($r in $builtin) {
+          if ($r.Enabled -ne 'True') {
+              Enable-NetFirewallRule -Name $r.Name
+              $changed += "enable-builtin:$($r.Name)"
+          }
+      }
+
+      # 2) Explicit fallback rule (idempotent — only created if absent).
+      $existing = Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue
+      if (-not $existing) {
+          New-NetFirewallRule `
+              -Name $RuleName `
+              -DisplayName 'NTP Server (UDP 123 In)' `
+              -Direction Inbound `
+              -Protocol UDP `
+              -LocalPort 123 `
+              -Action Allow `
+              -Profile Any `
+              -Description 'Allow inbound NTP queries from domain-joined clients' | Out-Null
+          $changed += "create:$RuleName"
+      }
+
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result = @{ Changed = $changed }
+  register: r_ntp_fw
+
+- name: "Verify NTP source resolves to a configured peer (may take ~30s after restart)"
+  ansible.windows.win_powershell:
+    parameters:
+      Peers: "{{ ad_ntp_peers }}"
+    script: |
+      param([string[]]$Peers)
+      $deadline = (Get-Date).AddSeconds(60)
+      $source = ''
+      while ((Get-Date) -lt $deadline) {
+          $source = (w32tm /query /source 2>$null | Out-String).Trim()
+          if ($source -and $source -notmatch 'Local CMOS') {
+              break
+          }
+          Start-Sleep -Seconds 5
+      }
+      $match = $Peers | Where-Object { $source -match [regex]::Escape($_) }
+      if (-not $match) {
+          # Don't fail — first sync from pool peers can lag. Surface for visibility.
+          $Ansible.Result = @{
+              Source            = $source
+              MatchedExpected   = $false
+              Note              = 'First w32tm sync may not have completed; not failing.'
+          }
+      } else {
+          $Ansible.Result = @{
+              Source            = $source
+              MatchedExpected   = $true
+          }
+      }
+      $Ansible.Changed = $false
+  register: r_ntp_source
+  changed_when: false
+
+- name: "Show NTP source"
+  ansible.builtin.debug:
+    var: r_ntp_source.result
