@@ -15,7 +15,18 @@
 # --- Libvirt-side disk parameters (delegated to localhost) ---
 
 ad_wsus_libvirt_domain: "ADDC01-corp"
-ad_wsus_content_disk_size_gb: 60
+# 200 GB virtual (qcow2 sparse). Sized for a Server 2025 + Win 11 + Office
+# + Defender Antivirus product set with day-one Default Approval Rule
+# enabled — empirically the first full sync + auto-approved content downloads
+# blew through 60 GB (2026-05-29 first attempt) and were still climbing past
+# 95 GB when paused for resize (~30% through Updates phase). 200 GB targets:
+# ~100-150 GB initial-sync footprint + ~50-100 GB headroom for 6-12 months
+# of monthly Defender definitions + cumulative updates before
+# Invoke-WsusServerCleanup is needed.
+#
+# Resizing in-place later: shutdown VM, qemu-img resize <path> <new-virt-GB>G,
+# start VM, Ansible: Resize-Partition -DriveLetter D -Size (Get-PartitionSupportedSize ...).SizeMax.
+ad_wsus_content_disk_size_gb: 200
 ad_wsus_content_disk_path: "{{ vm_lab_root }}/disks/{{ ad_wsus_libvirt_domain }}-wsus.qcow2"
 # Target dev letter for the WSUS content disk. Despite running on a separate
 # virtio-scsi controller, libvirt's `target dev` letter pool is shared across
