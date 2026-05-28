@@ -1,0 +1,34 @@
+---
+# Configure DC-resident services on the already-promoted DC.
+#
+# Assumes 02-configure-dc.yml has already run: forest exists, madmin-da
+# named admin is created, RID 500 is hardened. Connects as the steady-state
+# named admin identity (group_vars/dc.yml — madmin-da@corp.markandrewmarquez.com).
+#
+# Roles applied in order:
+#   1. ad_dns   — forwarders + reverse zone + aging/scavenging
+#   2. ad_dhcp  — feature install + AD authorize + scope + exclusions +
+#                 options + MAC-tied reservations
+#   3. ad_ntp   — PDC as authoritative NTP source (pool.ntp.org upstream)
+#
+# Ordering rationale:
+#   - DNS first because DHCP option 006 hands out the DC IP as DNS server,
+#     and we want DNS healthy before clients can lease addresses.
+#   - DHCP second because clients (built in 03-provision-clients.yml, next
+#     milestone) need to be able to lease IPs to reach WinRM.
+#   - NTP last because it's lowest-coupling — nothing else depends on time
+#     being authoritative for the role bring-up itself; domain-joined
+#     clients will sync from PDC via NT5DS once they're built.
+#
+# Idempotent: re-running this playbook is a no-op once each role has
+# converged. Each task reads current state before writing.
+#
+# Run: ansible-playbook -i inventory/lab.yml playbooks/03-configure-services.yml
+
+- name: "Configure DC-resident services (DNS, DHCP, NTP) on {{ groups['dc'][0] }}"
+  hosts: dc
+  gather_facts: false
+  roles:
+    - ad_dns
+    - ad_dhcp
+    - ad_ntp
