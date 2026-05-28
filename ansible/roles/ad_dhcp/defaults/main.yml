@@ -1,0 +1,69 @@
+---
+# ad_dhcp role defaults.
+#
+# Production-MSP DHCP layout for the corp lab subnet (10.10.0.0/24):
+#
+#   .1               Gateway (static, on virbr-corp host)
+#   .10              ADDC01 / DC (static, set at OS install)
+#   .50 .. .99       Reservation block (DHCP scope + EXCLUSION; reservations
+#                     punch through to pin known MACs to known IPs)
+#   .100 .. .199     Dynamic pool (free leases)
+#   .200 .. .254     Reserved (not in scope)
+#
+# This matches what a real MSP /24 looks like: ONE scope per subnet, exclusions
+# to carve out a reservation range, reservations override the exclusion. The
+# scope MUST span the reservation range — Windows DHCP rejects reservations
+# whose IPs sit outside any defined scope (ERROR_DHCP_SUBNET_NOT_PRESENT).
+
+ad_dhcp_scope_id: "10.10.0.0"
+ad_dhcp_scope_name: "Corp Lab Scope"
+ad_dhcp_scope_description: "Single scope for corp.markandrewmarquez.com lab (.50-.199, reservations carved out via exclusion)"
+ad_dhcp_scope_start: "{{ corp_subnet.dhcp_scope_start }}"
+ad_dhcp_scope_end: "{{ corp_subnet.dhcp_scope_end }}"
+ad_dhcp_subnet_mask: "{{ corp_subnet.netmask }}"
+
+# Lease duration. 8 days is the Windows default; appropriate for a settled
+# lab where most hosts are reservations + a handful of dynamic test VMs.
+ad_dhcp_lease_duration: "8.00:00:00"
+
+# Exclusion ranges within the scope. Reservations sit inside this range and
+# override the exclusion on a per-MAC basis.
+ad_dhcp_exclusions:
+  - start: "{{ corp_subnet.dhcp_reservation_range_start }}"
+    end: "{{ corp_subnet.dhcp_reservation_range_end }}"
+
+# Scope options handed out via DHCP.
+#   003 (Router):          gateway
+#   006 (DNS Servers):     DC (Server 2025 holds DNS + AD-integrated zones)
+#   015 (DNS Domain Name): forest FQDN — sets the connection-specific DNS suffix
+#   042 (NTP Servers):     DC (PDC is the authoritative NTP source per ad_ntp)
+ad_dhcp_scope_options:
+  router: "{{ corp_subnet.gateway }}"
+  dns_servers:
+    - "{{ corp_subnet.dc_ip }}"
+  dns_domain_name: "{{ forest.fqdn }}"
+  ntp_servers:
+    - "{{ corp_subnet.dc_ip }}"
+
+# Reservation source. Defaults compose the two existing group_vars dicts
+# (client_dhcp_reservations from clients.yml, linux_client_dhcp_reservations
+# from linux_clients.yml) into one dict keyed by hostname. The role looks
+# this up via hostvars[first-host-in-group] because group_vars are loaded
+# per-host, not at the group level itself.
+#
+# Each entry: { mac: "52:54:00:xx:xx:xx", ip: "10.10.0.NN" }
+# MAC may use ":" or "-" separators; the role normalizes to "-" for the
+# DhcpServer cmdlets (which want dash-separated ClientId).
+ad_dhcp_reservations: >-
+  {{
+    (
+      (hostvars[(groups.clients | default([''])) | first]
+       | default({})).client_dhcp_reservations
+      | default({})
+    )
+    | combine(
+        (hostvars[(groups.linux_clients | default([''])) | first]
+         | default({})).linux_client_dhcp_reservations
+        | default({})
+      )
+  }}

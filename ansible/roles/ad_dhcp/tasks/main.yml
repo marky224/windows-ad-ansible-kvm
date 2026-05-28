@@ -1,0 +1,356 @@
+---
+# Install DHCP on the DC, authorize it in AD, create the lab scope with
+# options + exclusions + MAC-tied reservations.
+#
+# Production-MSP pattern (see defaults/main.yml): one scope per subnet,
+# exclusions carve out reservation territory, reservations override
+# exclusions. No native Ansible module covers DHCP server config on
+# Server 2025; all inline PS against the DhcpServer module (ADR-016).
+
+- name: "Install DHCP Server feature (with management tools)"
+  ansible.windows.win_feature:
+    name: DHCP
+    include_management_tools: true
+    state: present
+  register: r_dhcp_feature
+
+# Post-install MSFT recipe — without these the Server Manager dashboard
+# keeps nagging "Complete DHCP configuration" and the security groups
+# the cmdlets reference don't exist.
+- name: "Post-install: create DHCP security groups + mark configuration complete"
+  ansible.windows.win_powershell:
+    script: |
+      $changed = @()
+      # Idempotent — Add-DhcpServerSecurityGroup creates DhcpAdministrators +
+      # DhcpUsers local groups if absent and is silent if present.
+      Add-DhcpServerSecurityGroup -ErrorAction Stop
+      # ServerManager "ConfigurationState=2" silences the post-install warning.
+      $key = 'HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12'
+      $current = (Get-ItemProperty -Path $key -Name ConfigurationState -ErrorAction SilentlyContinue).ConfigurationState
+      if ($current -ne 2) {
+          if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+          Set-ItemProperty -Path $key -Name ConfigurationState -Value 2 -Type DWord
+          $changed += 'configuration-state'
+      }
+      # Restart the service so the security groups take effect cleanly.
+      if ((Get-Service -Name DHCPServer -ErrorAction SilentlyContinue).Status -ne 'Running') {
+          Start-Service DHCPServer
+          $changed += 'service-start'
+      } elseif ($changed.Count -gt 0) {
+          Restart-Service DHCPServer
+          $changed += 'service-restart'
+          Start-Sleep -Seconds 3
+      }
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result = @{ Changed = $changed }
+  register: r_dhcp_postinstall
+
+- name: "Authorize DHCP server in Active Directory"
+  ansible.windows.win_powershell:
+    parameters:
+      DnsName: "{{ forest.fqdn }}"
+      IPAddress: "{{ corp_subnet.dc_ip }}"
+    script: |
+      param([string]$DnsName, [string]$IPAddress)
+      # Use computer FQDN, not forest FQDN, for the DhcpServer identity.
+      $hostFqdn = "$($env:COMPUTERNAME).$DnsName"
+      $authorized = @(Get-DhcpServerInDC -ErrorAction SilentlyContinue)
+      $already = $authorized | Where-Object {
+          $_.DnsName -ieq $hostFqdn -or $_.IPAddress -eq $IPAddress
+      }
+      if ($already) {
+          $Ansible.Changed = $false
+          $Ansible.Result = @{
+              Action  = 'already-authorized'
+              DnsName = $already.DnsName
+              IPAddress = "$($already.IPAddress)"
+          }
+          return
+      }
+      Add-DhcpServerInDC -DnsName $hostFqdn -IPAddress $IPAddress -ErrorAction Stop
+      $Ansible.Changed = $true
+      $Ansible.Result = @{
+          Action  = 'authorized'
+          DnsName = $hostFqdn
+          IPAddress = $IPAddress
+      }
+  register: r_dhcp_authorize
+
+- name: "Create / update IPv4 scope {{ ad_dhcp_scope_id }}"
+  ansible.windows.win_powershell:
+    parameters:
+      ScopeId: "{{ ad_dhcp_scope_id }}"
+      Name: "{{ ad_dhcp_scope_name }}"
+      Description: "{{ ad_dhcp_scope_description }}"
+      StartRange: "{{ ad_dhcp_scope_start }}"
+      EndRange: "{{ ad_dhcp_scope_end }}"
+      SubnetMask: "{{ ad_dhcp_subnet_mask }}"
+      LeaseDuration: "{{ ad_dhcp_lease_duration }}"
+    script: |
+      param(
+          [string]$ScopeId,
+          [string]$Name,
+          [string]$Description,
+          [string]$StartRange,
+          [string]$EndRange,
+          [string]$SubnetMask,
+          [string]$LeaseDuration
+      )
+      $existing = Get-DhcpServerv4Scope -ScopeId $ScopeId -ErrorAction SilentlyContinue
+      $lease = [TimeSpan]::Parse($LeaseDuration)
+      $changed = @()
+      if (-not $existing) {
+          Add-DhcpServerv4Scope `
+              -Name $Name `
+              -Description $Description `
+              -StartRange $StartRange `
+              -EndRange $EndRange `
+              -SubnetMask $SubnetMask `
+              -LeaseDuration $lease `
+              -State Active `
+              -ErrorAction Stop
+          $changed += 'created'
+      } else {
+          if ($existing.Name -ne $Name -or
+              $existing.Description -ne $Description -or
+              $existing.StartRange.IPAddressToString -ne $StartRange -or
+              $existing.EndRange.IPAddressToString -ne $EndRange -or
+              $existing.SubnetMask.IPAddressToString -ne $SubnetMask -or
+              $existing.LeaseDuration -ne $lease -or
+              $existing.State -ne 'Active') {
+              Set-DhcpServerv4Scope `
+                  -ScopeId $ScopeId `
+                  -Name $Name `
+                  -Description $Description `
+                  -StartRange $StartRange `
+                  -EndRange $EndRange `
+                  -LeaseDuration $lease `
+                  -State Active `
+                  -ErrorAction Stop
+              $changed += 'updated'
+          }
+      }
+      $after = Get-DhcpServerv4Scope -ScopeId $ScopeId
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result = @{
+          Action     = ($changed -join ',') | ForEach-Object { if ($_) { $_ } else { 'no-change' } }
+          ScopeId    = "$($after.ScopeId)"
+          Name       = $after.Name
+          Start      = "$($after.StartRange)"
+          End        = "$($after.EndRange)"
+          Lease      = "$($after.LeaseDuration)"
+          State      = "$($after.State)"
+      }
+  register: r_dhcp_scope
+
+- name: "Apply exclusion ranges within scope"
+  ansible.windows.win_powershell:
+    parameters:
+      ScopeId: "{{ ad_dhcp_scope_id }}"
+      Desired: "{{ ad_dhcp_exclusions }}"
+    script: |
+      param(
+          [string]$ScopeId,
+          [hashtable[]]$Desired
+      )
+      $current = @(Get-DhcpServerv4ExclusionRange -ScopeId $ScopeId -ErrorAction SilentlyContinue)
+      $changed = @()
+
+      # Build a lookup of "start|end" for both sets for comparison.
+      $currentKeys = @{}
+      foreach ($e in $current) {
+          $key = "$($e.StartRange.IPAddressToString)|$($e.EndRange.IPAddressToString)"
+          $currentKeys[$key] = $e
+      }
+      $desiredKeys = @{}
+      foreach ($d in $Desired) {
+          $key = "$($d.start)|$($d.end)"
+          $desiredKeys[$key] = $d
+      }
+
+      # Add missing exclusions.
+      foreach ($key in $desiredKeys.Keys) {
+          if (-not $currentKeys.ContainsKey($key)) {
+              $d = $desiredKeys[$key]
+              Add-DhcpServerv4ExclusionRange -ScopeId $ScopeId -StartRange $d.start -EndRange $d.end -ErrorAction Stop
+              $changed += "add:$key"
+          }
+      }
+      # Remove exclusions that aren't desired.
+      foreach ($key in $currentKeys.Keys) {
+          if (-not $desiredKeys.ContainsKey($key)) {
+              $e = $currentKeys[$key]
+              Remove-DhcpServerv4ExclusionRange `
+                  -ScopeId $ScopeId `
+                  -StartRange $e.StartRange.IPAddressToString `
+                  -EndRange $e.EndRange.IPAddressToString `
+                  -ErrorAction Stop
+              $changed += "remove:$key"
+          }
+      }
+
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result = @{ Changed = $changed; Desired = $Desired }
+  register: r_dhcp_exclusions
+
+- name: "Set scope DHCP options (003/006/015/042)"
+  ansible.windows.win_powershell:
+    parameters:
+      ScopeId: "{{ ad_dhcp_scope_id }}"
+      Router: "{{ ad_dhcp_scope_options.router }}"
+      DnsServers: "{{ ad_dhcp_scope_options.dns_servers }}"
+      DnsDomain: "{{ ad_dhcp_scope_options.dns_domain_name }}"
+      NtpServers: "{{ ad_dhcp_scope_options.ntp_servers }}"
+    script: |
+      param(
+          [string]$ScopeId,
+          [string]$Router,
+          [string[]]$DnsServers,
+          [string]$DnsDomain,
+          [string[]]$NtpServers
+      )
+      function Get-OptionValue {
+          param([string]$ScopeId, [int]$OptionId)
+          $v = Get-DhcpServerv4OptionValue -ScopeId $ScopeId -OptionId $OptionId -ErrorAction SilentlyContinue
+          if (-not $v) { return @() }
+          return @($v.Value)
+      }
+      function Compare-Array {
+          param($A, $B)
+          if (@($A).Count -ne @($B).Count) { return $false }
+          for ($i = 0; $i -lt @($A).Count; $i++) {
+              if (@($A)[$i] -ne @($B)[$i]) { return $false }
+          }
+          return $true
+      }
+
+      $changed = @()
+
+      # Option 003 — Router (single value).
+      $cur = Get-OptionValue -ScopeId $ScopeId -OptionId 3
+      if (-not (Compare-Array $cur @($Router))) {
+          Set-DhcpServerv4OptionValue -ScopeId $ScopeId -Router $Router -Force -ErrorAction Stop
+          $changed += 'option-003-router'
+      }
+      # Option 006 — DNS Servers.
+      $cur = Get-OptionValue -ScopeId $ScopeId -OptionId 6
+      if (-not (Compare-Array $cur $DnsServers)) {
+          Set-DhcpServerv4OptionValue -ScopeId $ScopeId -DnsServer $DnsServers -Force -ErrorAction Stop
+          $changed += 'option-006-dns-servers'
+      }
+      # Option 015 — DNS Domain Name.
+      $cur = Get-OptionValue -ScopeId $ScopeId -OptionId 15
+      if (-not (Compare-Array $cur @($DnsDomain))) {
+          Set-DhcpServerv4OptionValue -ScopeId $ScopeId -DnsDomain $DnsDomain -Force -ErrorAction Stop
+          $changed += 'option-015-dns-domain'
+      }
+      # Option 042 — NTP Servers. No -Ntp shorthand; use -OptionId 42 + -Value.
+      $cur = Get-OptionValue -ScopeId $ScopeId -OptionId 42
+      if (-not (Compare-Array $cur $NtpServers)) {
+          Set-DhcpServerv4OptionValue -ScopeId $ScopeId -OptionId 42 -Value $NtpServers -Force -ErrorAction Stop
+          $changed += 'option-042-ntp-servers'
+      }
+
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result = @{ Changed = $changed }
+  register: r_dhcp_options
+
+- name: "Apply MAC-tied reservations ({{ ad_dhcp_reservations | length }} entries)"
+  ansible.windows.win_powershell:
+    parameters:
+      ScopeId: "{{ ad_dhcp_scope_id }}"
+      Reservations: "{{ ad_dhcp_reservations }}"
+    script: |
+      param(
+          [string]$ScopeId,
+          [hashtable]$Reservations
+      )
+      # Normalize MAC to dash-separated lowercase (what DhcpServerv4Reservation
+      # expects in -ClientId). Accept ":" or "-" separators on input.
+      function Normalize-Mac { param([string]$Mac) ($Mac -replace '[:\-]', '').ToLower() -replace '(.{2})', '$1-' -replace '-$', '' }
+
+      $current = @(Get-DhcpServerv4Reservation -ScopeId $ScopeId -ErrorAction SilentlyContinue)
+      $desiredByIp = @{}
+      foreach ($name in $Reservations.Keys) {
+          $r = $Reservations[$name]
+          $desiredByIp[$r.ip] = @{ Name = $name; Mac = (Normalize-Mac $r.mac); Ip = $r.ip }
+      }
+
+      $changed = @()
+
+      # Add or update.
+      foreach ($ip in $desiredByIp.Keys) {
+          $d = $desiredByIp[$ip]
+          $existing = $current | Where-Object { $_.IPAddress.IPAddressToString -eq $ip }
+          $existingMac = if ($existing) { (Normalize-Mac $existing.ClientId) } else { '' }
+          $existingName = if ($existing) { $existing.Name } else { '' }
+          if (-not $existing) {
+              Add-DhcpServerv4Reservation `
+                  -ScopeId $ScopeId `
+                  -IPAddress $d.Ip `
+                  -ClientId $d.Mac `
+                  -Name $d.Name `
+                  -Description "Lab reservation for $($d.Name)" `
+                  -ErrorAction Stop
+              $changed += "add:$($d.Name)=$ip/$($d.Mac)"
+          } elseif ($existingMac -ne $d.Mac -or $existingName -ne $d.Name) {
+              Set-DhcpServerv4Reservation `
+                  -ScopeId $ScopeId `
+                  -IPAddress $d.Ip `
+                  -ClientId $d.Mac `
+                  -Name $d.Name `
+                  -ErrorAction Stop
+              $changed += "update:$($d.Name)=$ip/$($d.Mac)"
+          }
+      }
+      # Remove reservations not in the desired set.
+      foreach ($e in $current) {
+          $eip = $e.IPAddress.IPAddressToString
+          if (-not $desiredByIp.ContainsKey($eip)) {
+              Remove-DhcpServerv4Reservation -ScopeId $ScopeId -IPAddress $eip -ErrorAction Stop
+              $changed += "remove:$eip"
+          }
+      }
+
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result = @{
+          Changed = $changed
+          DesiredCount = $desiredByIp.Count
+      }
+  register: r_dhcp_reservations
+
+- name: "Verify DHCP end state"
+  ansible.windows.win_powershell:
+    parameters:
+      ScopeId: "{{ ad_dhcp_scope_id }}"
+      ExpectedReservations: "{{ ad_dhcp_reservations | length }}"
+    script: |
+      param([string]$ScopeId, [int]$ExpectedReservations)
+      $scope = Get-DhcpServerv4Scope -ScopeId $ScopeId -ErrorAction Stop
+      $excl  = @(Get-DhcpServerv4ExclusionRange -ScopeId $ScopeId)
+      $opts  = @(Get-DhcpServerv4OptionValue -ScopeId $ScopeId)
+      $res   = @(Get-DhcpServerv4Reservation -ScopeId $ScopeId)
+      $auth  = @(Get-DhcpServerInDC)
+      if ($res.Count -ne $ExpectedReservations) {
+          throw "Reservation count mismatch (expected $ExpectedReservations, got $($res.Count))"
+      }
+      if ($scope.State -ne 'Active') {
+          throw "Scope $ScopeId state is $($scope.State), expected Active"
+      }
+      if ($auth.Count -lt 1) {
+          throw "DHCP server is not authorized in AD"
+      }
+      $Ansible.Changed = $false
+      $Ansible.Result = @{
+          Scope = "$($scope.StartRange) - $($scope.EndRange) ($($scope.State))"
+          Exclusions = @($excl | ForEach-Object { "$($_.StartRange) - $($_.EndRange)" })
+          OptionCount = $opts.Count
+          ReservationCount = $res.Count
+          AuthorizedAs = @($auth | ForEach-Object { "$($_.DnsName) ($($_.IPAddress))" })
+      }
+  register: r_dhcp_verify
+  changed_when: false
+
+- name: "Show DHCP end state"
+  ansible.builtin.debug:
+    var: r_dhcp_verify.result
