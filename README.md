@@ -10,15 +10,18 @@ End-to-end automated build: from a bare Ubuntu 24.04 host, Ansible provisions a 
 
 ## Status
 
-**Milestone 2 complete (2026-05-27)** — `kvm_windows_vm` role provisions a Windows Server 2025 24H2 VM from bare metal to a reachable WinRM HTTPS endpoint in ~12 minutes. Fully deterministic, no manual intervention.
+**Milestone 4 complete (2026-05-28)** — DC is up, joined, hardened, and now serving DNS (Quad9 forwarders, AD-integrated reverse zone, aging/scavenging), DHCP (single-scope `/24` with reservation carve-out, 3 MAC-tied client reservations, server authorized in AD), and NTP (4× `pool.ntp.org`, PDC announces as reliable source). All three roles fully idempotent — `ok=20, changed=0` on consecutive re-runs.
 
 | Milestone | Status | What it produces |
 |---|---|---|
 | 1 — libvirt network | ✅ Done | `corp-lab` libvirt network, 10.10.0.0/24, no DHCP (DC owns it) |
 | 2 — Windows VM provisioner | ✅ Done | `kvm_windows_vm` role → Server 2025 VM, autologon, WinRM HTTPS:5986 reachable |
-| 3 — DC promotion + AD config | 🚧 Next | `ad_dc`, `ad_dns`, `ad_dhcp`, `ad_cs`, `ad_gpo`, `ad_ntp`, `ad_wsus` |
-| 4 — Client provisioning + domain join | ⏳ Planned | Win 11 + Ubuntu joined to `corp.markandrewmarquez.com` |
-| 5 — Smoke test + backups | ⏳ Planned | End-to-end verification + nightly state backup |
+| 3 — DC promotion + named admin + RID 500 hardening | ✅ Done | `ad_dc` + `ad_admins` + `ad_harden_builtin_admin` → forest `corp.markandrewmarquez.com`, FSMO holder, `madmin-da` steady-state admin |
+| 3.5 — DISM-slipstream Server 2025 install ISO | ✅ Done | `kvm_iso_slipstream` role → patched install media at build 26100.32860 |
+| 4 — DC-resident services (DNS / DHCP / NTP) | ✅ Done | `ad_dns` + `ad_dhcp` + `ad_ntp` → forwarders, reverse zone, scope with reservations, authoritative time |
+| 5 — Cert services + GPO baseline + WSUS | 🚧 Next | `ad_cs`, `ad_gpo`, `ad_wsus` |
+| 6 — Client provisioning + domain join | ⏳ Planned | Win 11 + Ubuntu joined to `corp.markandrewmarquez.com` |
+| 7 — Smoke test + backups | ⏳ Planned | End-to-end verification + nightly state backup |
 
 ### Milestone 2 visual progression
 
@@ -44,7 +47,7 @@ Validation: `ansible.windows.win_ping` → `pong` against `ADDC01-corp` at `10.1
 | `UBUNTU01-corp` | Ubuntu 24.04 LTS Server | Domain-joined Linux server (realmd + sssd) |
 
 - **Forest:** `corp.markandrewmarquez.com` (NetBIOS: `CORP`)
-- **Subnet:** `10.10.0.0/24` — DC owns DHCP (scope `.100-.199`) with MAC-tied reservations for clients
+- **Subnet:** `10.10.0.0/24` — DC owns DHCP (single scope `.50-.199`, exclusion `.50-.99` carves out the reservation block, dynamic pool `.100-.199`, MAC-tied reservations punch through the exclusion)
 - **GPO baseline:** Microsoft Security Compliance Toolkit Server 2025 baseline + 12 lab-specific overrides
 - **AD state backup:** nightly `wbadmin systemstatebackup` to a host-side Samba share + `Backup-GPO`/`Backup-CARoleService`/`Export-DhcpServer` exports via WinRM `fetch`
 - **Snapshots:** automatic at each provisioning phase (`vm-built`, `ad-promoted`, `roles-installed`, `clients-joined`, `linux-joined`)
@@ -118,9 +121,12 @@ ansible-galaxy collection install -r ansible/requirements.yml
 ### 5. Set secrets
 
 ```bash
-ansible-vault edit ansible/group_vars/all/vault.yml
-# Set: vault_local_admin_password, vault_dsrm_password, vault_domain_admin_password,
-#      vault_ca_passphrase, vault_dcbackup_smb_password
+ansible-vault edit ansible/inventory/group_vars/all/vault.yml
+# Set: vault_dc_admin_password   (built-in local Administrator at install; also
+#                                  becomes built-in DOMAIN Administrator after dcpromo)
+#      vault_safe_mode_password  (DSRM password, distinct from the above per ADR-031)
+#      vault_named_admin_password (steady-state madmin-da identity post-promotion)
+#      vault_ubuntu_initial_password (cloud-init seed for UBUNTU01-corp)
 ```
 
 ### 6. Run the lab
@@ -128,12 +134,15 @@ ansible-vault edit ansible/group_vars/all/vault.yml
 ```bash
 cd ansible
 ansible-playbook playbooks/00-libvirt-network.yml         # ✅ Milestone 1
+ansible-playbook playbooks/slipstream-iso.yml             # ✅ Milestone 3.5 (one-time per LCU wave)
 ansible-playbook playbooks/01-provision-dc.yml            # ✅ Milestone 2
-ansible-playbook playbooks/02-configure-dc.yml            # 🚧 Milestone 3 (in progress)
-ansible-playbook playbooks/03-provision-clients.yml       # ⏳
-ansible-playbook playbooks/04-join-domain.yml             # ⏳
-ansible-playbook playbooks/05-provision-linux.yml         # ⏳
-ansible-playbook playbooks/06-join-linux.yml              # ⏳
+ansible-playbook playbooks/02-configure-dc.yml            # ✅ Milestone 3
+ansible-playbook playbooks/03-configure-services.yml      # ✅ Milestone 4 (DNS/DHCP/NTP)
+ansible-playbook playbooks/04-configure-services-advanced.yml  # 🚧 Milestone 5 (CS/GPO/WSUS, planned)
+ansible-playbook playbooks/05-provision-clients.yml       # ⏳
+ansible-playbook playbooks/06-join-domain.yml             # ⏳
+ansible-playbook playbooks/07-provision-linux.yml         # ⏳
+ansible-playbook playbooks/08-join-linux.yml              # ⏳
 ansible-playbook playbooks/99-smoke-test.yml              # ⏳
 ```
 
@@ -158,21 +167,24 @@ ansible-playbook playbooks/site.yml
 |---|---|---|
 | `kvm_network` | Define + start `corp-lab` libvirt network (10.10.0.0/24, NAT, no DHCP) | ✅ |
 | `kvm_windows_vm` | Generic Windows VM provisioning (custom install ISO, libvirt domain, post-WinPE CD-eject + cold-restart, WinRM HTTPS bootstrap) | ✅ |
+| `kvm_iso_slipstream` | DISM-slipstream cumulative updates into Server 2025 install ISO (re-run per LCU wave) | ✅ |
 | `kvm_linux_vm` | Generic Linux VM provisioning (cloud-init seed, boot, wait for SSH) | 🚧 |
-| `ad_dc` | Static IP, AD DS install, forest creation (`microsoft.ad.domain`) | 🚧 |
-| `ad_dns` | DNS forwarders, reverse zone | ⏳ |
-| `ad_dhcp` | DHCP scope + MAC-tied reservations for known clients | ⏳ |
-| `ad_cs` | Enterprise Root CA install + `cs_authority` + `cs_template` | ⏳ |
-| `ad_gpo` | Import MSFT SCT Server 2025 baseline + 12 lab-specific overrides | ⏳ |
-| `ad_ntp` | PDC NTP authority configuration | ⏳ |
-| `ad_wsus` | WSUS install + async sync trigger | ⏳ |
+| `ad_dc` | AD DS install, forest creation (`microsoft.ad.domain`), DNS settle + dcdiag verification | ✅ |
+| `ad_admins` | Create `madmin-da` named admin in `OU=Admins` as Domain Admin + Enterprise Admin (ADR-032) | ✅ |
+| `ad_harden_builtin_admin` | Apply Appendix D RID 500 hardening (`NOT_DELEGATED` + `SMARTCARD_REQUIRED`) | ✅ |
+| `ad_dns` | Quad9 forwarders, AD-integrated reverse zone, server scavenging + per-zone aging | ✅ |
+| `ad_dhcp` | DHCP install, AD-authorize, single-scope `/24` with reservation carve-out + options 003/006/015/042 | ✅ |
+| `ad_ntp` | PDC NTP authority pointing at `pool.ntp.org`, AnnounceFlags=5 | ✅ |
+| `ad_cs` | Enterprise Root CA install + `cs_authority` + `cs_template` | 🚧 |
+| `ad_gpo` | Import MSFT SCT Server 2025 baseline + 12 lab-specific overrides | 🚧 |
+| `ad_wsus` | WSUS install + async sync trigger | 🚧 |
 | `domain_join_windows` | Win 11 client domain join (`microsoft.ad.membership`) | ⏳ |
 | `domain_join_linux` | Ubuntu domain join via `realmd` + `sssd` | ⏳ |
 | `ops_backup` | AD state backup orchestration (SMB to host + WinRM `fetch`) | ⏳ |
 
 ## Playbooks
 
-`00-libvirt-network.yml`, `01-provision-dc.yml`, `02-configure-dc.yml`, `03-provision-clients.yml`, `04-join-domain.yml`, `05-provision-linux.yml`, `06-join-linux.yml`, `99-smoke-test.yml`, plus operational utilities: `snapshot.yml`, `rollback.yml`, `list-snapshots.yml`, `backup-ad.yml`, `fire-drill.yml`, `teardown.yml`.
+`00-libvirt-network.yml`, `slipstream-iso.yml`, `01-provision-dc.yml`, `02-configure-dc.yml`, `03-configure-services.yml`, `04-configure-services-advanced.yml` (M5), `05-provision-clients.yml`, `06-join-domain.yml`, `07-provision-linux.yml`, `08-join-linux.yml`, `99-smoke-test.yml`, plus operational utilities: `snapshot.yml`, `rollback.yml`, `list-snapshots.yml`, `backup-ad.yml`, `fire-drill.yml`, `teardown.yml`.
 
 ---
 
