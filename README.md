@@ -23,17 +23,17 @@ End-to-end automated build: from a bare Ubuntu 24.04 host, Ansible provisions a 
 | 6 — Client provisioning + domain join | ⏳ Planned | Win 11 + Ubuntu joined to `corp.markandrewmarquez.com` |
 | 7 — Smoke test + backups | ⏳ Planned | End-to-end verification + nightly state backup |
 
-### Milestone 2 visual progression
+### From install ISO to live forest
 
 | Stage | Screenshot |
 |---|---|
-| WinPE setup launching after CD-eject + cold-restart hand-off | ![Setup launching](docs/screenshots/milestone2-01-setup-launching.png) |
-| Install in progress (early phase) | ![Installing 24%](docs/screenshots/milestone2-02-installing-24pct.png) |
-| Install in progress (late phase) | ![Installing 83%](docs/screenshots/milestone2-03-installing-83pct.png) |
-| OOBE auto-skipped → autologon → desktop | ![Desktop](docs/screenshots/milestone2-04-desktop-after-autologon.png) |
-| Server Manager up, WinRM HTTPS:5986 reachable from host | ![Server Manager](docs/screenshots/milestone2-05-server-manager.png) |
+| Unattended Server 2025 install begins (WinPE handoff via deterministic CD-eject + cold restart) | ![Setup launching](docs/screenshots/milestone2-01-setup-launching.png) |
+| Install proceeds without intervention (~12 min wall-clock from cold boot to desktop) | ![Installing 83%](docs/screenshots/milestone2-03-installing-83pct.png) |
+| OOBE auto-skipped → autologon → desktop; WinRM HTTPS:5986 listening | ![Desktop](docs/screenshots/milestone2-04-desktop-after-autologon.png) |
+| Patched Server 2025 build `26100.32860` — slipstreamed at install time via DISM, no post-install patching window | ![Server Manager, patched](docs/screenshots/milestone-3.5-patched-pre-promotion.png) |
+| Forest `corp.markandrewmarquez.com` is live — ADDC01 holds all FSMOs, `madmin-da` named admin established, RID 500 hardened per Appendix D | ![DC promoted](docs/screenshots/milestone-3-dc-promoted.png) |
 
-Validation: `ansible.windows.win_ping` → `pong` against `ADDC01-corp` at `10.10.0.10:5986`.
+Validation: `ansible.windows.win_ping` → `pong` against `ADDC01-corp` at `10.10.0.10:5986`, authenticating as the steady-state named admin.
 
 ---
 
