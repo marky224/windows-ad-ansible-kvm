@@ -332,6 +332,65 @@
       $Ansible.Result  = @{ Action = 'linked'; Target = $DomainRootDn }
   register: r_lab_delta_link
 
+- name: "Ensure 'Lab - Autoenrollment' GPO exists (Computer + User AEPolicy=0x7)"
+  ansible.windows.win_powershell:
+    parameters:
+      GpoName: "{{ ad_gpo_autoenroll_name }}"
+      AEPolicy: "{{ ad_gpo_autoenroll_aepolicy | int }}"
+    script: |
+      param(
+          [string]$GpoName,
+          [int]$AEPolicy
+      )
+      Import-Module GroupPolicy -ErrorAction Stop
+      $changed = @()
+
+      $gpo = Get-GPO -Name $GpoName -ErrorAction SilentlyContinue
+      if (-not $gpo) {
+          $gpo = New-GPO -Name $GpoName -Comment 'ad_gpo role: certificate autoenrollment (Computer + User). ADR-038.' -ErrorAction Stop
+          $changed += 'gpo-created'
+      }
+
+      # AutoEnrollment\AEPolicy: HKLM key => Computer Config, HKCU key => User
+      # Config (GPOEditor convention). Get-GPRegistryValue compare is the
+      # silent-no-op defense (ADR-037) — Set-GPRegistryValue always reports
+      # changed, so we only write when the current value actually differs.
+      $subKey = 'SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment'
+      foreach ($hive in @('HKLM', 'HKCU')) {
+          $key = "$hive\$subKey"
+          $current = (Get-GPRegistryValue -Name $GpoName -Key $key -ValueName 'AEPolicy' -ErrorAction SilentlyContinue).Value
+          if ($current -ne $AEPolicy) {
+              Set-GPRegistryValue -Name $GpoName -Key $key -ValueName 'AEPolicy' -Type DWord -Value $AEPolicy -ErrorAction Stop | Out-Null
+              $changed += "$hive/AEPolicy"
+          }
+      }
+
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result  = @{ Updated = $changed; GpoId = $gpo.Id.ToString() }
+  register: r_autoenroll_gpo
+
+- name: "Link 'Lab - Autoenrollment' GPO at domain root (idempotent)"
+  ansible.windows.win_powershell:
+    parameters:
+      GpoName: "{{ ad_gpo_autoenroll_name }}"
+      DomainRootDn: "DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+    script: |
+      param(
+          [string]$GpoName,
+          [string]$DomainRootDn
+      )
+      Import-Module GroupPolicy -ErrorAction Stop
+      $existingLinks = (Get-GPInheritance -Target $DomainRootDn -ErrorAction Stop).GpoLinks
+      if ($existingLinks | Where-Object { $_.DisplayName -eq $GpoName }) {
+          $Ansible.Changed = $false
+          $Ansible.Result  = @{ Action = 'already-linked'; Target = $DomainRootDn }
+          return
+      }
+      New-GPLink -Name $GpoName -Target $DomainRootDn -ErrorAction Stop | Out-Null
+      $Ansible.Changed = $true
+      $Ansible.Result  = @{ Action = 'linked'; Target = $DomainRootDn }
+  register: r_autoenroll_link
+
 - name: "Trigger Invoke-GPUpdate /force on the DC (apply imports + delta immediately)"
   ansible.windows.win_powershell:
     script: |
@@ -353,12 +412,14 @@
       BaselineImports: "{{ ad_gpo_baseline_imports + (ad_gpo_ie11_imports if ad_gpo_import_ie11 else []) }}"
       BaselineLinks: "{{ ad_gpo_baseline_imports }}"
       DeltaName: "{{ ad_gpo_lab_delta_name }}"
+      AutoenrollName: "{{ ad_gpo_autoenroll_name }}"
       DomainRootDn: "DC={{ forest.fqdn.split('.') | join(',DC=') }}"
     script: |
       param(
           [object[]]$BaselineImports,
           [object[]]$BaselineLinks,
           [string]$DeltaName,
+          [string]$AutoenrollName,
           [string]$DomainRootDn
       )
       Import-Module GroupPolicy -ErrorAction Stop
@@ -377,6 +438,11 @@
           $missing += "GPO missing: $DeltaName"
       }
 
+      $autoenrollGpo = Get-GPO -Name $AutoenrollName -ErrorAction SilentlyContinue
+      if (-not $autoenrollGpo) {
+          $missing += "GPO missing: $AutoenrollName"
+      }
+
       $linkMissing = @()
       foreach ($entry in $BaselineLinks) {
           $name = $entry['display_name']
@@ -390,6 +456,9 @@
       if (-not ($domainRootLinks | Where-Object { $_.DisplayName -eq $DeltaName })) {
           $linkMissing += "$DeltaName not linked at $DomainRootDn"
       }
+      if (-not ($domainRootLinks | Where-Object { $_.DisplayName -eq $AutoenrollName })) {
+          $linkMissing += "$AutoenrollName not linked at $DomainRootDn"
+      }
 
       if ($missing.Count -gt 0 -or $linkMissing.Count -gt 0) {
           throw "Verification failed.`nMissing GPOs:`n  $($missing -join "`n  ")`nMissing links:`n  $($linkMissing -join "`n  ")"
@@ -398,9 +467,10 @@
       $allGpos = Get-GPO -All | Where-Object { $_.DisplayName -like 'MSFT *' -or $_.DisplayName -eq $DeltaName }
       $Ansible.Changed = $false
       $Ansible.Result  = @{
-          BaselineGpoCount = ($allGpos | Where-Object { $_.DisplayName -like 'MSFT *' }).Count
-          DeltaGpoPresent  = ($deltaGpo -ne $null)
-          AllLinksOk       = $true
+          BaselineGpoCount  = ($allGpos | Where-Object { $_.DisplayName -like 'MSFT *' }).Count
+          DeltaGpoPresent   = ($deltaGpo -ne $null)
+          AutoenrollPresent = ($autoenrollGpo -ne $null)
+          AllLinksOk        = $true
       }
   register: r_gpo_verify
   changed_when: false

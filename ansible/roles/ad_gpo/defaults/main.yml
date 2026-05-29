@@ -99,3 +99,17 @@ ad_gpo_firewall_log_success: false   # successful connections fill the log fast;
 # AD starts with this prefix + version tag, the role skips re-importing the GPO.
 # Re-imports only happen when the version tag changes (SCT upgrade).
 ad_gpo_description_marker: "Imported by ad_gpo role from {{ ad_gpo_sct_version_tag }}"
+
+# --- Autoenrollment GPO (M6 — ADR-038 deferred autoenrollment to ad_gpo) ---
+#
+# A DEDICATED GPO (separate from Lab Delta) so it is auditable + independently
+# toggleable. Configures BOTH Computer and User certificate autoenrollment and
+# links at the domain root, so it reaches the DC, all clients (OU=Workstations),
+# and all users regardless of OU.
+#
+# AEPolicy bitmask 0x7 = 1 (enabled) | 2 (update certs that use templates)
+# | 4 (renew expired / pending / revoked) — the MS-canonical "enabled, renew
+# and update" value. Registry: <hive>\SOFTWARE\Policies\Microsoft\Cryptography\
+# AutoEnrollment\AEPolicy (HKLM = Computer Config, HKCU = User Config).
+ad_gpo_autoenroll_name: "Lab - Autoenrollment"
+ad_gpo_autoenroll_aepolicy: 7
