@@ -1,0 +1,67 @@
+---
+# Join a Win 11 client to corp.markandrewmarquez.com and place it in OU=Workstations.
+#
+# HOST-SAFETY GUARD: this role only runs over WinRM against a declared 'clients'
+# host. The control host is not a WinRM target (not in the 'windows' group, no
+# listener), so it can never be reached here; the assert also prevents
+# accidentally re-joining the DC. `assert` runs on the controller — no connect,
+# no escalation — so a mis-target aborts before any change.
+
+- name: "domain_join_windows | SAFETY GUARD — only declared Windows clients over WinRM"
+  ansible.builtin.assert:
+    that:
+      - "ansible_connection == 'winrm'"
+      - "inventory_hostname in groups.get('clients', [])"
+      - "inventory_hostname not in groups.get('dc', [])"
+      - "inventory_hostname not in groups.get('kvm_host', [])"
+    fail_msg: |
+      ❌ REFUSING domain_join_windows on '{{ inventory_hostname }}'.
+      Must be a declared 'clients' host over WinRM (not the DC, not the control host).
+        ansible_connection = {{ ansible_connection | default('UNDEFINED') }}  (must be 'winrm')
+        in clients         = {{ inventory_hostname in groups.get('clients', []) }}
+    success_msg: "✅ Safe target: {{ inventory_hostname }} is a declared Win client over WinRM."
+  become: false
+
+- name: "domain_join_windows | ensure OU=Workstations exists (delegated to the DC, once)"
+  microsoft.ad.ou:
+    name: "{{ domain_join_ou_name }}"
+    path: "DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+    state: present
+    description: "Domain-joined Win 11 workstations. Client computer objects land here; the domain-root autoenrollment GPO reaches them."
+  delegate_to: "{{ groups['dc'][0] }}"
+  run_once: true
+
+- name: "domain_join_windows | query current domain membership (pre-join)"
+  ansible.windows.win_powershell:
+    script: |
+      $cs = Get-CimInstance -ClassName Win32_ComputerSystem
+      $Ansible.Changed = $false
+      $Ansible.Result  = @{ PartOfDomain = [bool]$cs.PartOfDomain; Domain = $cs.Domain }
+  register: r_pre_state
+  changed_when: false
+
+- name: "domain_join_windows | join {{ inventory_hostname }} to {{ domain_join_dns_domain }} (OU=Workstations)"
+  microsoft.ad.membership:
+    dns_domain_name: "{{ domain_join_dns_domain }}"
+    domain_admin_user: "{{ domain_join_admin_user }}"
+    domain_admin_password: "{{ domain_join_admin_password }}"
+    domain_ou_path: "{{ domain_join_ou }}"
+    state: domain
+    reboot: "{{ domain_join_reboot }}"
+  register: r_join
+
+- name: "domain_join_windows | verify domain membership after join"
+  ansible.windows.win_powershell:
+    script: |
+      $cs = Get-CimInstance -ClassName Win32_ComputerSystem
+      if (-not $cs.PartOfDomain) { throw "Host is NOT domain-joined after the membership task." }
+      $Ansible.Changed = $false
+      $Ansible.Result  = @{ PartOfDomain = [bool]$cs.PartOfDomain; Domain = $cs.Domain }
+  register: r_post_state
+  changed_when: false
+
+- name: "domain_join_windows | show join result"
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} -> domain={{ r_post_state.result.Domain }}
+      joined={{ r_post_state.result.PartOfDomain }} (changed={{ r_join.changed }})

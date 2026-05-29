@@ -1,0 +1,22 @@
+---
+# Join the Win 11 clients to corp.markandrewmarquez.com.
+#
+# The domain_join_windows role ensures OU=Workstations exists (delegated to the
+# DC, run_once), then joins each client there via microsoft.ad.membership using
+# the named domain admin (madmin-da). The module reboots + waits for WinRM.
+#
+# HOST SAFETY: scoped to the 'clients' group ONLY (CLIENT01-corp, CLIENT02-corp),
+# reached over WinRM. The control host is not a WinRM target and the role's
+# first task asserts connection==winrm + membership in 'clients'. Never localhost.
+#
+# Prereq: certificate autoenrollment GPO is delivered by ad_gpo (run via
+# 04-configure-services-advanced.yml) and linked at the domain root, so joined
+# clients pick it up on their next gpupdate.
+#
+# Run: ansible-playbook playbooks/06-join-domain.yml
+
+- name: "Join Win 11 clients to the domain (place in OU=Workstations)"
+  hosts: clients
+  gather_facts: false
+  roles:
+    - domain_join_windows

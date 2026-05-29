@@ -1,0 +1,17 @@
+---
+# domain_join_windows defaults. See tasks/main.yml for the host-safety guard.
+
+# --- Domain + credentials ---
+domain_join_dns_domain: "{{ forest.fqdn }}"                 # corp.markandrewmarquez.com
+domain_join_admin_user: "{{ named_admin.upn }}"             # madmin-da@corp... (Domain Admin; NOT the local admin)
+domain_join_admin_password: "{{ vault_named_admin_password }}"
+
+# --- Computer object placement ---
+# Workstations get a dedicated OU (CN=Computers is a container and can't be a
+# GPO link target). The role creates it on the DC if absent. The M6 autoenrollment
+# GPO is linked at the domain root so it reaches this OU regardless.
+domain_join_ou_name: "Workstations"
+domain_join_ou: "OU={{ domain_join_ou_name }},DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+
+# microsoft.ad.membership reboots + waits for the host to return over WinRM.
+domain_join_reboot: true
