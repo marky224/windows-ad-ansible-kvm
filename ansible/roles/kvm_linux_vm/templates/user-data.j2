@@ -1,0 +1,18 @@
+#cloud-config
+# Rendered by kvm_linux_vm. Drives first-boot setup of the labadmin bootstrap
+# user (local, non-AD) + SSH key so the control node can run domain_join_linux.
+hostname: {{ linux_hostname }}
+fqdn: {{ linux_fqdn }}
+preserve_hostname: false
+ssh_pwauth: true
+chpasswd:
+  expire: false
+users:
+  - name: {{ linux_admin_user }}
+    groups: [adm, sudo]
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: "{{ linux_admin_password | password_hash('sha512') }}"
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - "{{ lookup('file', linux_ssh_pubkey_path) }}"

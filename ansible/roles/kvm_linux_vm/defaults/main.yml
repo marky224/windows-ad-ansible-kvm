@@ -1,0 +1,47 @@
+---
+# kvm_linux_vm defaults. Generic Ubuntu cloud-image VM provisioner.
+#
+# Required from caller (playbook): vm_name, vm_mac.
+# Optional: linux_ssh_wait_host (the reserved DHCP IP to wait for SSH on).
+#
+# HOST SAFETY: every task here runs UNPRIVILEGED on kvm_host — qemu-img,
+# ssh-keygen, xorriso, virt-install, virsh only, plus files under ~/vm-lab and
+# /tmp. No become, no mounts, no edits to the host OS. (qemu:///system is
+# reachable without sudo per ADR-023: qemu.conf user=madmin, group=kvm.)
+
+# --- Source image + sizing ---
+vm_base_image: "{{ iso_paths.ubuntu_24_04 }}"   # noble-server-cloudimg-amd64.img (qcow2)
+vm_memory_mb: 2048
+vm_vcpus: 2
+vm_disk_gb: 30
+vm_machine_type: q35
+vm_os_variant: "ubuntu24.04"                    # libosinfo id; verify with `osinfo-query os | grep ubuntu24`
+
+# --- Network ---
+vm_network: "{{ corp_subnet.libvirt_network_name }}"   # corp-lab
+
+# --- cloud-init identity ---
+# The labadmin bootstrap user parallels the Windows local Administrator: it's a
+# LOCAL (non-AD) account used only to run the realm join. AD users arrive later
+# via sssd. (See feedback-never-touch-control-host: this is a guest account.)
+linux_admin_user: labadmin
+linux_admin_password: "{{ vault_ubuntu_initial_password }}"
+linux_hostname: "{{ vm_name | lower | replace('-corp', '') }}"     # ubuntu01
+linux_fqdn: "{{ linux_hostname }}.{{ forest.fqdn }}"               # ubuntu01.corp.markandrewmarquez.com
+
+# --- Control-node SSH key (generated if absent; lives OUTSIDE the repo) ---
+linux_ssh_key_path: "{{ vm_lab_root }}/ssh/corp-lab"
+linux_ssh_pubkey_path: "{{ linux_ssh_key_path }}.pub"
+
+# --- SSH wait (post-boot) ---
+linux_wait_for_ssh: true
+linux_ssh_port: 22
+linux_ssh_wait_timeout: 600
+linux_ssh_wait_delay: 20
+
+# --- Internal paths ---
+vm_disk_pool: "{{ libvirt_pools.disks }}"
+vm_disk_path: "{{ vm_lab_root }}/disks/{{ vm_name }}.qcow2"
+vm_seed_iso_dir: "{{ seed_iso_dir }}"
+vm_seed_iso_path: "{{ vm_seed_iso_dir }}/{{ vm_name }}-seed.iso"
+vm_seed_staging_dir: "/tmp/seed-{{ vm_name }}"

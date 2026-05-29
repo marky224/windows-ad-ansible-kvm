@@ -1,0 +1,133 @@
+---
+# Provision an Ubuntu 24.04 guest from the cloud image + a NoCloud seed ISO.
+#
+# HOST SAFETY: runs ONLY on kvm_host, UNPRIVILEGED. No become, no mounts, no
+# host-OS edits. The guard below also refuses to run anywhere but kvm_host so
+# this role can never execute inside a guest by mistake.
+
+- name: "kvm_linux_vm | SAFETY GUARD — runs only on the kvm_host, never a guest"
+  ansible.builtin.assert:
+    that:
+      - "inventory_hostname in groups.get('kvm_host', [])"
+      - "ansible_connection == 'local'"
+      - "vm_name is defined and vm_mac is defined"
+    fail_msg: "kvm_linux_vm must run on kvm_host (local connection) with vm_name + vm_mac set."
+  become: false
+
+- name: "kvm_linux_vm | assert base cloud image is present"
+  ansible.builtin.stat:
+    path: "{{ vm_base_image }}"
+  register: r_base_img
+
+- name: "kvm_linux_vm | fail if base cloud image is missing"
+  ansible.builtin.fail:
+    msg: >-
+      Ubuntu cloud image missing at {{ vm_base_image }}. Download the Noble
+      server cloud image (noble-server-cloudimg-amd64.img) into {{ iso_dir }}.
+  when: not r_base_img.stat.exists
+
+- name: "kvm_linux_vm | ensure data dirs exist (disks, seed, ssh key, staging)"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ vm_lab_root }}/disks", mode: "0755" }
+    - { path: "{{ vm_seed_iso_dir }}", mode: "0755" }
+    - { path: "{{ vm_lab_root }}/ssh", mode: "0700" }
+    - { path: "{{ vm_seed_staging_dir }}", mode: "0755" }
+
+- name: "kvm_linux_vm | ensure control-node lab SSH keypair exists (generated if absent)"
+  ansible.builtin.command:
+    cmd: ssh-keygen -t ed25519 -N "" -f {{ linux_ssh_key_path }} -C "corp-lab-ansible"
+    creates: "{{ linux_ssh_key_path }}"
+
+- name: "kvm_linux_vm | create qcow2 overlay backed by the cloud image ({{ vm_disk_gb }}G)"
+  ansible.builtin.command:
+    cmd: >-
+      qemu-img create -f qcow2 -F qcow2
+      -b {{ vm_base_image }}
+      {{ vm_disk_path }} {{ vm_disk_gb }}G
+    creates: "{{ vm_disk_path }}"
+
+- name: "kvm_linux_vm | refresh {{ vm_disk_pool }} pool"
+  community.libvirt.virt_pool:
+    name: "{{ vm_disk_pool }}"
+    command: refresh
+
+- name: "kvm_linux_vm | render cloud-init meta-data + user-data into staging"
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "{{ vm_seed_staging_dir }}/{{ item }}"
+    mode: "0644"
+  loop:
+    - meta-data
+    - user-data
+
+- name: "kvm_linux_vm | build NoCloud seed ISO (label CIDATA) via xorriso"
+  ansible.builtin.command:
+    argv:
+      - xorriso
+      - -as
+      - mkisofs
+      - -o
+      - "{{ vm_seed_iso_path }}"
+      - -V
+      - CIDATA
+      - -J
+      - -r
+      - -graft-points
+      - "/user-data={{ vm_seed_staging_dir }}/user-data"
+      - "/meta-data={{ vm_seed_staging_dir }}/meta-data"
+  changed_when: true
+
+- name: "kvm_linux_vm | refresh corp-iso pool"
+  community.libvirt.virt_pool:
+    name: "{{ libvirt_pools.iso }}"
+    command: refresh
+
+- name: "kvm_linux_vm | list existing libvirt domains (idempotency check)"
+  ansible.builtin.command:
+    cmd: virsh -c qemu:///system list --all --name
+  register: existing_domains
+  changed_when: false
+  check_mode: false
+
+# virt-install --import boots the existing overlay (no OS install); the seed
+# CDROM drives cloud-init on first boot. BIOS firmware (no --boot uefi) keeps
+# the Linux guest free of NVRAM/Secure-Boot moving parts — cloud images boot
+# cleanly on seabios. UEFI parity with the Windows VMs is deferred.
+- name: "kvm_linux_vm | provision libvirt domain {{ vm_name }} via virt-install --import"
+  ansible.builtin.command:
+    cmd: >-
+      virt-install --connect qemu:///system
+      --name {{ vm_name }}
+      --osinfo {{ vm_os_variant }}
+      --memory {{ vm_memory_mb }}
+      --vcpus {{ vm_vcpus }}
+      --machine {{ vm_machine_type }}
+      --cpu host-passthrough
+      --import
+      --disk path={{ vm_disk_path }},bus=virtio,format=qcow2
+      --disk path={{ vm_seed_iso_path }},device=cdrom,bus=sata
+      --network network={{ vm_network }},model=virtio,mac={{ vm_mac }}
+      --graphics spice,listen=127.0.0.1
+      --video qxl
+      --noautoconsole
+      --wait 0
+  when: vm_name not in existing_domains.stdout_lines
+
+- name: "kvm_linux_vm | ensure libvirt domain {{ vm_name }} is running"
+  community.libvirt.virt:
+    name: "{{ vm_name }}"
+    state: running
+
+- name: "kvm_linux_vm | wait for SSH on {{ linux_ssh_wait_host | default('the reserved IP') }}:{{ linux_ssh_port }}"
+  ansible.builtin.wait_for:
+    host: "{{ linux_ssh_wait_host }}"
+    port: "{{ linux_ssh_port }}"
+    timeout: "{{ linux_ssh_wait_timeout }}"
+    delay: "{{ linux_ssh_wait_delay }}"
+  when:
+    - linux_wait_for_ssh | bool
+    - linux_ssh_wait_host is defined

@@ -1,0 +1,23 @@
+---
+# Build UBUNTU01-corp from the Ubuntu 24.04 cloud image + a cloud-init NoCloud
+# seed (labadmin bootstrap user + SSH key + hostname).
+#
+# HOST SAFETY: runs only against kvm_host (localhost) for VM lifecycle, and the
+# kvm_linux_vm role is fully UNPRIVILEGED (qemu-img/xorriso/virt-install/virsh
+# + ~/vm-lab files only — no become, no mounts, no host-OS edits).
+#
+# Run: ansible-playbook playbooks/07-provision-linux.yml
+
+- name: "Provision the Ubuntu 24.04 client VM (UBUNTU01-corp)"
+  hosts: kvm_host
+  gather_facts: false
+  vars:
+    ubuntu_vm: UBUNTU01-corp
+  tasks:
+    - name: "Build UBUNTU01 via kvm_linux_vm"
+      ansible.builtin.include_role:
+        name: kvm_linux_vm
+      vars:
+        vm_name: "{{ ubuntu_vm }}"
+        vm_mac: "{{ hostvars[ubuntu_vm].linux_client_dhcp_reservations[ubuntu_vm].mac }}"
+        linux_ssh_wait_host: "{{ hostvars[ubuntu_vm].ansible_host }}"
