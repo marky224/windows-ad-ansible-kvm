@@ -268,11 +268,14 @@
 # BootOrder → firmware re-enters fresh WinPE setup → DiskConfiguration's
 # WillWipeDisk=true wipes ESP → next pass repeats forever.
 #
-# Workaround: detect WinPE-completes signal from outside the guest by
-# watching the SPICE screen — install-progress UI (~15 KB PNG) followed
-# by blank-screen (~3 KB PNG) reliably marks "WinPE committed bcdboot
-# and queued reboot." Eject the CD at that exact moment so the firmware
-# POST that follows picks the disk's Windows Boot Manager.
+# Workaround (ADR-043): detect "WinPE pass done" via a DISK-WRITE-STALL signal —
+# once install.wim is applied (disk grows past the threshold) and bcdboot has
+# written the disk's Windows Boot Manager, disk writes go idle just before WinPE
+# reboots. That stall is the safe moment to eject + cold-restart so the firmware
+# boots the DISK, not the CD again. (The old SPICE screen-blank detector never
+# fired on Win 11's solid-blue progress screen, so the CD stayed boot-priority-1
+# and WillWipeDisk re-wiped on every reboot — an endless install loop. The
+# disk-stall signal is OS-agnostic and fixed it.)
 - name: "kvm_windows_vm | check install CD attached (idempotency for replays)"
   ansible.builtin.command:
     cmd: virsh -c qemu:///system domblklist {{ vm_name }}
@@ -284,39 +287,38 @@
     - vm_eject_install_cd_after_winpe | bool
     - vm_custom_install_iso_path in domblklist_result.stdout
   block:
-    - name: "kvm_windows_vm | wait for install-progress UI → blank-screen transition (WinPE pass commit)"
+    - name: "kvm_windows_vm | wait for WinPE install.wim apply + write-stall (OS-agnostic eject trigger)"
       ansible.builtin.shell:
         cmd: |
           set -u
-          probe=/tmp/{{ vm_name }}-screen-probe.png
-          # Two-signal state machine. Run E (2026-05-27) showed that screen-size
-          # alone is too coarse — early OVMF/WBM transient screens can match both
-          # the install-progress (>10K) and blank (<5K) thresholds in 5 sec,
-          # causing eject during boot instead of after WinPE pass. Require disk
-          # growth past install.wim-extraction threshold to confirm WAIT_INSTALL
-          # is the REAL install-progress UI, not a transient boot screen.
-          state=WAIT_INSTALL
+          # Phase 1: wait until install.wim is being applied (disk past threshold).
+          # Phase 2: once applied (and bcdboot has written the disk's Windows Boot
+          # Manager), disk writes STALL right before WinPE reboots -> that stall is
+          # the safe eject moment. Poll fast + a short stall window to catch it
+          # BEFORE the reboot that would otherwise re-boot the CD and re-wipe.
+          disk={{ vm_disk_path }}
+          applied=0; stall=0; prev=-1
           for i in $(seq 1 {{ vm_eject_wait_max_iters }}); do
-            virsh -c qemu:///system screenshot {{ vm_name }} ${probe} >/dev/null 2>&1 || true
-            size=$(stat -c %s ${probe} 2>/dev/null || echo 0)
-            disk_bytes=$(stat -c %s {{ vm_disk_path }} 2>/dev/null || echo 0)
-            case ${state} in
-              WAIT_INSTALL)
-                if [ "${size}" -gt 10000 ] && [ "${disk_bytes}" -gt {{ vm_eject_winpe_disk_threshold_bytes }} ]; then
-                  echo "iter=${i} size=${size}B disk=${disk_bytes}B — confirmed WinPE writing install.wim"
-                  state=WAIT_REBOOT
-                fi
-                ;;
-              WAIT_REBOOT)
-                if [ "${size}" -lt 5000 ]; then
-                  echo "iter=${i} size=${size}B disk=${disk_bytes}B — WinPE → reboot transition detected"
+            size=$(stat -c %s "${disk}" 2>/dev/null || echo 0)
+            if [ "${applied}" -eq 0 ]; then
+              if [ "${size}" -gt {{ vm_eject_winpe_disk_threshold_bytes }} ]; then
+                echo "iter=${i} disk=${size}B — install.wim applied; watching for write-stall"
+                applied=1; prev=${size}
+              fi
+            else
+              if [ "${size}" -eq "${prev}" ]; then
+                stall=$((stall + 1))
+                if [ "${stall}" -ge {{ vm_eject_stall_samples }} ]; then
+                  echo "iter=${i} disk=${size}B — writes stalled ${stall}x ({{ vm_eject_stall_samples }}x{{ vm_eject_poll_secs }}s) -> WinPE done, eject now"
                   exit 0
                 fi
-                ;;
-            esac
-            sleep 5
+              else
+                stall=0; prev=${size}
+              fi
+            fi
+            sleep {{ vm_eject_poll_secs }}
           done
-          echo "ERROR: Timed out waiting for WinPE → reboot transition (last state=${state})" >&2
+          echo "ERROR: timed out waiting for install.wim apply + write-stall (applied=${applied}, stall=${stall})" >&2
           exit 1
       register: winpe_wait
       changed_when: false

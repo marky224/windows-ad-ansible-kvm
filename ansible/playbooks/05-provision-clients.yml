@@ -39,16 +39,12 @@
     # Win 11 requires TPM 2.0 + Secure Boot.
     vm_enable_tpm: true
     vm_secure_boot: true
-    # Skip the Server-2025 CD-boot-loop eject workaround. Empirically, Win 11
-    # 24H2 boots the disk's Windows Boot Manager after the WinPE pass even with
-    # the install CD still attached (verified 2026-05-29: CLIENT01 progressed to
-    # the online "Installing Windows 11" phase + OOBE with the CD attached, no
-    # re-wipe). The role's screen-watch detector also can't see Win 11's
-    # solid-blue progress screen as the "blank" reboot signal, so leaving the
-    # eject on produces a false-failure timeout. (ADR to be recorded.)
-    vm_eject_install_cd_after_winpe: false
-    # Win 11 on 2 vCPU / 4 GB installs slowly (several reboots through OOBE).
-    # Allow up to 60 min for WinRM to appear before declaring failure.
+    # CD-eject is ENABLED (role default) with the disk-write-stall detector
+    # (ADR-043). REQUIRED for Win 11 — without it the install CD stays
+    # boot-priority-1 and WillWipeDisk re-wipes the disk on every reboot, an
+    # endless install loop (hung two clients overnight 2026-05-30). My earlier
+    # "Win 11 doesn't need the eject" call was wrong — it was a lucky race.
+    # Allow up to 60 min for WinRM (several OOBE reboots).
     vm_winrm_timeout: 3600
   tasks:
     - name: "Build each Win 11 client via kvm_windows_vm"
