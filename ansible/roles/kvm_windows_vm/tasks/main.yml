@@ -361,12 +361,15 @@
         executable: /bin/bash
       changed_when: true
 
-- name: "kvm_windows_vm | wait for WinRM on {{ vm_static_ip | default('the host') }}:{{ vm_winrm_port }}"
+# DHCP clients have no vm_static_ip but DO have a known DHCP-reserved address
+# (MAC-tied in ad_dhcp). Callers pass that via vm_winrm_wait_host so the role
+# can still wait on the right IP. Falls back to vm_static_ip for the DC.
+- name: "kvm_windows_vm | wait for WinRM on {{ vm_winrm_wait_host | default(vm_static_ip) | default('the reserved IP') }}:{{ vm_winrm_port }}"
   ansible.builtin.wait_for:
-    host: "{{ vm_static_ip | default(omit) }}"
+    host: "{{ vm_winrm_wait_host | default(vm_static_ip) | default(omit) }}"
     port: "{{ vm_winrm_port }}"
     timeout: "{{ vm_winrm_timeout }}"
     delay: 60
   when:
     - vm_wait_for_winrm | bool
-    - vm_static_ip is defined
+    - (vm_winrm_wait_host is defined) or (vm_static_ip is defined)

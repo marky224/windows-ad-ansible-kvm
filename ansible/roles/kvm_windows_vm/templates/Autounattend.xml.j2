@@ -39,12 +39,12 @@
                xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <DriverPaths>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="1"><Path>D:\vioscsi\2k25\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="2"><Path>D:\viostor\2k25\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="3"><Path>D:\NetKVM\2k25\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="4"><Path>E:\vioscsi\2k25\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="5"><Path>E:\viostor\2k25\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="6"><Path>E:\NetKVM\2k25\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="1"><Path>D:\vioscsi\{{ vm_virtio_driver_os }}\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="2"><Path>D:\viostor\{{ vm_virtio_driver_os }}\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="3"><Path>D:\NetKVM\{{ vm_virtio_driver_os }}\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="4"><Path>E:\vioscsi\{{ vm_virtio_driver_os }}\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="5"><Path>E:\viostor\{{ vm_virtio_driver_os }}\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="6"><Path>E:\NetKVM\{{ vm_virtio_driver_os }}\amd64</Path></PathAndCredentials>
       </DriverPaths>
     </component>
 

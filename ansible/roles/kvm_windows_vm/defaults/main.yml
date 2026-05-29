@@ -41,6 +41,13 @@ vm_keyboard_layout: "0409:00000409"
 vm_virtio_win_iso: "{{ iso_paths.virtio_win }}"
 vm_seed_iso_dir: "{{ seed_iso_dir }}"     # output dir for the per-VM Autounattend ISO
 
+# virtio-win driver OS subfolder (the per-OS tree on the virtio-win ISO that the
+# Autounattend's PnpCustomizationsWinPE DriverPaths points at). Server 2025 = 2k25,
+# Windows 11 = w11. WRONG value here = WinPE can't load vioscsi for the install
+# target disk and Setup stalls with "no drives found". (Verified folder names on
+# virtio-win 0.1.271: /vioscsi/{2k25,w11}/amd64 both exist.)
+vm_virtio_driver_os: "2k25"
+
 # --- Custom install ISO (Server 2025's redesigned 24H2 "windlp" installer
 # does NOT auto-scan separate removable media for Autounattend.xml. Empirical
 # evidence: windlp.state.xml has no reference to a seed-ISO Autounattend even
@@ -48,8 +55,12 @@ vm_seed_iso_dir: "{{ seed_iso_dir }}"     # output dir for the per-VM Autounatte
 # with Autounattend.xml at its root + $WinpeDriver$ folder for vioscsi/viostor
 # (WinPE auto-loads anything in $WinpeDriver$). Shared stage is built once,
 # per-VM ISO is built every run since Autounattend has per-VM content.
-vm_install_stage_dir: "{{ vm_lab_root }}/install-iso-stage"
-vm_install_stage_mount: "/mnt/install-iso-pristine"     # ephemeral loop mount
+# Keyed by the install ISO's basename so each distinct OS image (Server 2025,
+# Win 11) extracts to its OWN stage. A single shared stage would let Win 11
+# clients silently build from a previously-staged Server 2025 image (the
+# setup.exe `creates:` guard would short-circuit re-extraction).
+vm_install_stage_dir: "{{ vm_lab_root }}/install-stage/{{ vm_install_iso | basename | splitext | first }}"
+vm_install_stage_mount: "/mnt/install-stage-{{ vm_install_iso | basename | splitext | first }}"  # ephemeral loop mount
 vm_custom_install_iso_path: "{{ vm_seed_iso_dir }}/{{ vm_name }}-install.iso"
 vm_install_iso_volid: "WINSRV2025_CORPLAB"
 
