@@ -20,7 +20,7 @@ End-to-end automated build: from a bare Ubuntu 24.04 host, Ansible provisions a 
 | 3.5 — DISM-slipstream Server 2025 install ISO | ✅ Done | `kvm_iso_slipstream` role → patched install media at build 26100.32860 |
 | 4 — DC-resident services (DNS / DHCP / NTP) | ✅ Done | `ad_dns` + `ad_dhcp` + `ad_ntp` → forwarders, reverse zone, scope with reservations, authoritative time |
 | 5 — Cert services + GPO baseline + WSUS | ✅ Done | `ad_cs` (Enterprise Root CA + Web Enrollment + 5 templates), `ad_gpo` (SCT v2602 baseline + Lab Delta), `ad_wsus` (D:\WSUS + 4 products + Default Approval Rule) |
-| 6 — Client provisioning + domain join | 🚧 In progress | Real vTPM 2.0 enabled on the host; `Lab - Autoenrollment` GPO live (Computer + User); Win 11 clients building at 4 vCPU/8 GB. Domain join + Ubuntu (`realmd`/`sssd`) next |
+| 6 — Client provisioning + domain join | 🚧 In progress | Win 11 clients built (real vTPM 2.0, 4 vCPU/8 GB) and **domain-joined** into `OU=Workstations`; **machine-cert autoenrollment working** — clients autoenroll a Client-Auth cert from the Enterprise CA via the `Corp Workstation Authentication` template. Ubuntu (`realmd`/`sssd`) join next |
 | 7 — Smoke test + backups | ⏳ Planned | End-to-end verification + nightly state backup |
 
 ### From install ISO to live forest
@@ -175,10 +175,10 @@ ansible-playbook playbooks/site.yml
 | `ad_dns` | Quad9 forwarders, AD-integrated reverse zone, server scavenging + per-zone aging | ✅ |
 | `ad_dhcp` | DHCP install, AD-authorize, single-scope `/24` with reservation carve-out + options 003/006/015/042 | ✅ |
 | `ad_ntp` | PDC NTP authority pointing at `pool.ntp.org`, AnnounceFlags=5 | ✅ |
-| `ad_cs` | Single-tier Enterprise Root CA + Web Enrollment + `cs_authority` (CDP/AIA) + `cs_template` (5 templates: Machine, WebServer, User, Workstation, KerberosAuthentication) | ✅ |
+| `ad_cs` | Single-tier Enterprise Root CA + Web Enrollment + `cs_authority` (CDP/AIA) + `cs_template` (5 templates: Machine, WebServer, User, Workstation, KerberosAuthentication) + machine-autoenrollment template (`Corp Workstation Authentication`, cloned from the built-in; Domain Computers Autoenroll — ADR-044) | ✅ |
 | `ad_gpo` | Import MSFT SCT Server 2025 v2602 baseline (6 GPOs linked to canonical OUs + 2 IE11 import-only) + Lab Delta GPO (firewall logging) + `Lab - Autoenrollment` GPO (Computer + User `AEPolicy=0x7`, domain root) | ✅ |
 | `ad_wsus` | WSUS install on dedicated `D:\WSUS` (200 GB qcow2) + 4 products + 4 classifications + Default Automatic Approval Rule + fire-and-forget sync | ✅ |
-| `domain_join_windows` | Win 11 client domain join (`microsoft.ad.membership`) into `OU=Workstations`; WinRM-only host-safety guard | 🚧 |
+| `domain_join_windows` | Win 11 client domain join (`microsoft.ad.membership`) into `OU=Workstations`; WinRM-only host-safety guard | ✅ |
 | `domain_join_linux` | Ubuntu domain join via `realmd` + `sssd`; dual host-safety guards (SSH-only + anti-self) | 🚧 |
 | `ops_backup` | AD state backup orchestration (SMB to host + WinRM `fetch`) | ⏳ |
 
