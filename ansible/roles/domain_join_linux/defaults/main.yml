@@ -1,0 +1,34 @@
+---
+# domain_join_linux defaults. See tasks/main.yml for the host-safety guard.
+
+# --- Realm identity ---
+realm_domain: "{{ forest.fqdn }}"                       # corp.markandrewmarquez.com
+realm_join_user: "{{ named_admin.upn }}"                # madmin-da@corp.markandrewmarquez.com (Domain Admin)
+realm_join_password: "{{ vault_named_admin_password }}"
+
+# Computer object placement. UBUNTU01 is a server-class host, so it lands in
+# OU=Member Servers alongside the SCT Member Server baseline target (the GPO
+# itself is inert on Linux, but the OU keeps the directory tidy + future-proof).
+realm_computer_ou: "OU=Member Servers,DC={{ forest.fqdn.split('.') | join(',DC=') }}"
+
+# --- Toolchain ---
+realm_packages:
+  - realmd
+  - sssd
+  - sssd-tools
+  - adcli
+  - samba-common-bin
+  - oddjob
+  - oddjob-mkhomedir
+  - packagekit
+  - krb5-user
+  - libnss-sss
+  - libpam-sss
+
+# --- sssd behavior ---
+# use_fully_qualified_names=true forces user@domain at the prompt, eliminating
+# any clash between AD usernames and local accounts (e.g. the labadmin bootstrap
+# user). This is the production-safe default.
+realm_use_fqns: true
+realm_fallback_homedir: "/home/%u@%d"
+realm_default_shell: "/bin/bash"

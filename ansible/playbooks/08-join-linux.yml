@@ -1,0 +1,29 @@
+---
+# Join UBUNTU01-corp to corp.markandrewmarquez.com via realmd/sssd.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ HOST SAFETY — TOP PRIORITY. Scoped to the linux_clients group ONLY         │
+# │ (UBUNTU01-corp, over SSH). The control host is ansible_connection=local    │
+# │ and is NOT in linux_clients (verified: linux_clients:&kvm_host = 0 hosts). │
+# │ The domain_join_linux role's first two tasks are hard host-safety asserts  │
+# │ (GUARD #1 + GUARD #2). The pre_tasks assert below is belt-and-suspenders.  │
+# │                                                                            │
+# │ Always preview before running:                                            │
+# │   ansible-playbook playbooks/08-join-linux.yml --list-hosts                │
+# │   ansible-playbook playbooks/08-join-linux.yml --check --limit UBUNTU01-corp│
+# └──────────────────────────────────────────────────────────────────────────┘
+
+- name: "Join UBUNTU01-corp to the domain (realmd/sssd)"
+  hosts: linux_clients
+  gather_facts: false
+  pre_tasks:
+    - name: "08-join-linux | belt-and-suspenders host-safety assert"
+      ansible.builtin.assert:
+        that:
+          - "inventory_hostname in groups.get('linux_clients', [])"
+          - "ansible_connection == 'ssh'"
+          - "inventory_hostname not in groups.get('kvm_host', [])"
+        fail_msg: "REFUSING: 08-join-linux must target linux_clients guests over SSH only — never the control host."
+      become: false
+  roles:
+    - domain_join_linux

@@ -1,0 +1,20 @@
+# Managed by Ansible (domain_join_linux role). Minimal realm config; sssd/adcli
+# resolve KDCs dynamically via DNS SRV records served by the DC.
+[libdefaults]
+    default_realm = {{ realm_domain | upper }}
+    dns_lookup_realm = true
+    dns_lookup_kdc = true
+    rdns = false
+    fcc-mit-ticketflags = true
+    forwardable = true
+
+[realms]
+    {{ realm_domain | upper }} = {
+        kdc = {{ corp_subnet.dc_ip }}
+        admin_server = {{ corp_subnet.dc_ip }}
+        default_domain = {{ realm_domain }}
+    }
+
+[domain_realm]
+    .{{ realm_domain }} = {{ realm_domain | upper }}
+    {{ realm_domain }} = {{ realm_domain | upper }}

@@ -1,0 +1,20 @@
+# Managed by Ansible (domain_join_linux role). Mode 0600 root:root — sssd
+# refuses to start otherwise. Regenerated on every run; realm-join's initial
+# version is intentionally overwritten to enforce these options.
+[sssd]
+domains = {{ realm_domain }}
+config_file_version = 2
+services = nss, pam
+
+[domain/{{ realm_domain }}]
+ad_domain = {{ realm_domain }}
+krb5_realm = {{ realm_domain | upper }}
+realmd_tags = manages-system joined-with-adcli
+cache_credentials = True
+id_provider = ad
+krb5_store_password_if_offline = True
+default_shell = {{ realm_default_shell }}
+ldap_id_mapping = True
+use_fully_qualified_names = {{ 'True' if realm_use_fqns else 'False' }}
+fallback_homedir = {{ realm_fallback_homedir }}
+access_provider = ad

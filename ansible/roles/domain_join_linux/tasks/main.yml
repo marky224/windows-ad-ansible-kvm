@@ -1,0 +1,165 @@
+---
+# Join an Ubuntu guest VM to corp.markandrewmarquez.com via realmd/sssd.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │  HOST-SAFETY GUARD (see feedback-never-touch-control-host memory)          │
+# │                                                                            │
+# │  This role apt-installs realmd/sssd/krb5 and REWRITES /etc/krb5.conf,      │
+# │  /etc/sssd/sssd.conf, PAM, and /etc/sudoers.d. The libvirt host is ALSO    │
+# │  the Ansible control node + the operator's daily-driver PC. If this role   │
+# │  ever ran against that host it would hijack its authentication stack.      │
+# │                                                                            │
+# │  TWO independent guards make that impossible. Each ALONE excludes the      │
+# │  control host; both are portable (no hardcoded hostnames/IPs — safe for a  │
+# │  public repo). `assert` runs on the controller and neither connects nor    │
+# │  escalates, so a mis-targeted run aborts before any package or file write. │
+# └──────────────────────────────────────────────────────────────────────────┘
+
+# GUARD #1 — static inventory facts. The control host is ansible_connection=local
+# (inventory/lab.yml); a 'local' connection can never satisfy `== 'ssh'`, so this
+# check alone makes running on the host impossible. The others are defense in depth.
+- name: "domain_join_linux | SAFETY GUARD #1 — only a declared linux_clients guest over SSH"
+  vars:
+    _expected_ip: "{{ (linux_client_dhcp_reservations[inventory_hostname].ip) | default('') }}"
+  ansible.builtin.assert:
+    that:
+      - "ansible_connection == 'ssh'"                                  # control host is 'local'
+      - "inventory_hostname in groups.get('linux_clients', [])"        # must be a declared Linux guest
+      - "inventory_hostname not in groups.get('kvm_host', [])"         # must NOT be the control-host group
+      - "inventory_hostname not in ['localhost', '127.0.0.1']"
+      - "_expected_ip | length > 0"                                    # guest must have a known reservation
+      - "ansible_host == _expected_ip"                                 # and be reached on exactly that IP
+    fail_msg: |
+      ❌ REFUSING domain_join_linux on '{{ inventory_hostname }}'.
+      Must target a declared linux_clients GUEST over SSH, never the control host.
+        ansible_connection = {{ ansible_connection | default('UNDEFINED') }}  (must be 'ssh'; control host is 'local')
+        in linux_clients   = {{ inventory_hostname in groups.get('linux_clients', []) }}
+        ansible_host       = {{ ansible_host | default('UNDEFINED') }}  (must equal reserved {{ _expected_ip | default('?') }})
+    success_msg: "✅ GUARD #1 pass: {{ inventory_hostname }} ({{ ansible_host }}) is a declared lab guest over SSH."
+  become: false
+
+# Discover the CONTROL HOST's own addresses at runtime (no hardcoded values),
+# so GUARD #2 can prove the SSH target is a different machine.
+- name: "domain_join_linux | capture control-host network identity (read-only, for GUARD #2)"
+  ansible.builtin.setup:
+    gather_subset: ["!all", "network"]
+  delegate_to: localhost
+  delegate_facts: true
+  run_once: true
+  become: false
+
+# GUARD #1 has confirmed this is an SSH guest, so gathering facts on the target
+# is safe. Then prove the target shares NO IP with the control host.
+- name: "domain_join_linux | gather target identity (read-only)"
+  ansible.builtin.setup:
+    gather_subset: ["!all", "network"]
+  become: false
+
+- name: "domain_join_linux | SAFETY GUARD #2 — abort if the SSH target IS the control host"
+  vars:
+    _control_ips: "{{ hostvars['localhost'].ansible_all_ipv4_addresses | default([]) }}"
+    _target_ips: "{{ ansible_all_ipv4_addresses | default([]) }}"
+  ansible.builtin.assert:
+    that:
+      # Same machine would share at least one IP — refuse if any overlap exists.
+      - "(_target_ips | intersect(_control_ips)) | length == 0"
+      - "ansible_hostname != (hostvars['localhost'].ansible_hostname | default('__none__'))"
+    fail_msg: |
+      ❌ The SSH target shares an IP/hostname with the control host. Aborting — this is NOT a lab guest.
+        target IPs : {{ _target_ips }}
+        control IPs: {{ _control_ips }}
+    success_msg: "✅ GUARD #2 pass: target shares no address with the control host."
+  become: false
+
+# ─── Provably on a lab guest. Safe to proceed. ───────────────────────────────
+
+- name: "domain_join_linux | install realmd/sssd/adcli/krb5 toolchain"
+  ansible.builtin.apt:
+    name: "{{ realm_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  become: true
+
+- name: "domain_join_linux | render minimal /etc/krb5.conf for the realm"
+  ansible.builtin.template:
+    src: krb5.conf.j2
+    dest: /etc/krb5.conf
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+
+- name: "domain_join_linux | check current realm membership (idempotency)"
+  ansible.builtin.command:
+    cmd: realm list --name-only
+  register: r_realm_list
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: "domain_join_linux | join the realm (adcli; password via stdin, never logged)"
+  ansible.builtin.command:
+    argv:
+      - realm
+      - join
+      - "--user={{ realm_join_user }}"
+      - "--computer-ou={{ realm_computer_ou }}"
+      - "{{ realm_domain }}"
+    stdin: "{{ realm_join_password }}"
+  no_log: true
+  become: true
+  register: r_join
+  changed_when: r_join.rc == 0
+  when: realm_domain not in (r_realm_list.stdout | default(''))
+
+- name: "domain_join_linux | enforce sssd.conf (FQNs, homedir, shell, AD access)"
+  ansible.builtin.template:
+    src: sssd.conf.j2
+    dest: /etc/sssd/sssd.conf
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  register: r_sssd_conf
+
+- name: "domain_join_linux | enable auto-create of home dirs on first login (mkhomedir)"
+  ansible.builtin.command:
+    cmd: pam-auth-update --enable mkhomedir
+  become: true
+  changed_when: false
+
+- name: "domain_join_linux | ensure sssd + oddjobd are enabled and running"
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: "{{ 'restarted' if (r_sssd_conf.changed and item == 'sssd') else 'started' }}"
+  loop:
+    - oddjobd
+    - sssd
+  become: true
+
+- name: "domain_join_linux | grant sudo to AD 'Domain Admins' (validated via visudo)"
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/domain-admins
+    content: |
+      # Managed by Ansible (domain_join_linux). AD group -> sudo.
+      %domain\ admins@{{ realm_domain }} ALL=(ALL:ALL) ALL
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "visudo -cf %s"
+  become: true
+
+- name: "domain_join_linux | VERIFY — AD identity resolves on the guest"
+  ansible.builtin.command:
+    cmd: "id {{ realm_join_user }}"
+  register: r_id
+  changed_when: false
+  become: true
+
+- name: "domain_join_linux | show join verification"
+  ansible.builtin.debug:
+    msg:
+      - "realm {{ realm_domain }} joined; computer object in {{ realm_computer_ou }}"
+      - "AD id lookup: {{ r_id.stdout }}"
