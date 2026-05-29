@@ -20,7 +20,7 @@ End-to-end automated build: from a bare Ubuntu 24.04 host, Ansible provisions a 
 | 3.5 — DISM-slipstream Server 2025 install ISO | ✅ Done | `kvm_iso_slipstream` role → patched install media at build 26100.32860 |
 | 4 — DC-resident services (DNS / DHCP / NTP) | ✅ Done | `ad_dns` + `ad_dhcp` + `ad_ntp` → forwarders, reverse zone, scope with reservations, authoritative time |
 | 5 — Cert services + GPO baseline + WSUS | ✅ Done | `ad_cs` (Enterprise Root CA + Web Enrollment + 5 templates), `ad_gpo` (SCT v2602 baseline + Lab Delta), `ad_wsus` (D:\WSUS + 4 products + Default Approval Rule) |
-| 6 — Client provisioning + domain join | 🚧 Next | Win 11 + Ubuntu joined to `corp.markandrewmarquez.com` |
+| 6 — Client provisioning + domain join | 🚧 In progress | Real vTPM 2.0 enabled on the host; `Lab - Autoenrollment` GPO live (Computer + User); Win 11 clients building at 4 vCPU/8 GB. Domain join + Ubuntu (`realmd`/`sssd`) next |
 | 7 — Smoke test + backups | ⏳ Planned | End-to-end verification + nightly state backup |
 
 ### From install ISO to live forest
@@ -168,7 +168,7 @@ ansible-playbook playbooks/site.yml
 | `kvm_network` | Define + start `corp-lab` libvirt network (10.10.0.0/24, NAT, no DHCP) | ✅ |
 | `kvm_windows_vm` | Generic Windows VM provisioning (custom install ISO, libvirt domain, post-WinPE CD-eject + cold-restart, WinRM HTTPS bootstrap) | ✅ |
 | `kvm_iso_slipstream` | DISM-slipstream cumulative updates into Server 2025 install ISO (re-run per LCU wave) | ✅ |
-| `kvm_linux_vm` | Generic Linux VM provisioning (cloud-init seed, boot, wait for SSH) | 🚧 |
+| `kvm_linux_vm` | Generic Linux VM provisioning (qcow2 cloud-image overlay, NoCloud cloud-init seed via xorriso, `virt-install --import`, wait for SSH) — unprivileged, no host-OS changes | 🚧 |
 | `ad_dc` | AD DS install, forest creation (`microsoft.ad.domain`), DNS settle + dcdiag verification | ✅ |
 | `ad_admins` | Create `madmin-da` named admin in `OU=Admins` as Domain Admin + Enterprise Admin (ADR-032) | ✅ |
 | `ad_harden_builtin_admin` | Apply Appendix D RID 500 hardening (`NOT_DELEGATED` + `SMARTCARD_REQUIRED`) | ✅ |
@@ -176,10 +176,10 @@ ansible-playbook playbooks/site.yml
 | `ad_dhcp` | DHCP install, AD-authorize, single-scope `/24` with reservation carve-out + options 003/006/015/042 | ✅ |
 | `ad_ntp` | PDC NTP authority pointing at `pool.ntp.org`, AnnounceFlags=5 | ✅ |
 | `ad_cs` | Single-tier Enterprise Root CA + Web Enrollment + `cs_authority` (CDP/AIA) + `cs_template` (5 templates: Machine, WebServer, User, Workstation, KerberosAuthentication) | ✅ |
-| `ad_gpo` | Import MSFT SCT Server 2025 v2602 baseline (6 GPOs linked to canonical OUs + 2 IE11 import-only) + Lab Delta GPO (firewall logging) | ✅ |
-| `ad_wsus` | WSUS install on dedicated `D:\WSUS` (60 GB qcow2) + 4 products + 4 classifications + Default Automatic Approval Rule + fire-and-forget sync | ✅ |
-| `domain_join_windows` | Win 11 client domain join (`microsoft.ad.membership`) | ⏳ |
-| `domain_join_linux` | Ubuntu domain join via `realmd` + `sssd` | ⏳ |
+| `ad_gpo` | Import MSFT SCT Server 2025 v2602 baseline (6 GPOs linked to canonical OUs + 2 IE11 import-only) + Lab Delta GPO (firewall logging) + `Lab - Autoenrollment` GPO (Computer + User `AEPolicy=0x7`, domain root) | ✅ |
+| `ad_wsus` | WSUS install on dedicated `D:\WSUS` (200 GB qcow2) + 4 products + 4 classifications + Default Automatic Approval Rule + fire-and-forget sync | ✅ |
+| `domain_join_windows` | Win 11 client domain join (`microsoft.ad.membership`) into `OU=Workstations`; WinRM-only host-safety guard | 🚧 |
+| `domain_join_linux` | Ubuntu domain join via `realmd` + `sssd`; dual host-safety guards (SSH-only + anti-self) | 🚧 |
 | `ops_backup` | AD state backup orchestration (SMB to host + WinRM `fetch`) | ⏳ |
 
 ## Playbooks
