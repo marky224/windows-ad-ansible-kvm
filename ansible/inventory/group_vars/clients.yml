@@ -1,14 +1,14 @@
 ---
-# Client-specific overrides. Pre-join: connect as local Administrator.
-# Post-join (after domain_join_windows role): switch to named admin UPN
-# (madmin-da@corp.markandrewmarquez.com) — same identity as dc.yml steady-state.
+# Client-specific overrides. Pre-join: connect as the local Administrator whose
+# password is baked at install time by the Autounattend (05-provision-clients.yml
+# passes vm_local_admin_password from this same vault key).
 #
-# TODO (Milestone 4 / client provisioning): split clients onto their own
-# vault_client_local_admin_password so the DC's bootstrap admin password is not
-# shared with workstation local admins. For now (no clients built yet),
-# vault_dc_admin_password is reused — dormant code path.
+# Per the M6 design decision (2026-05-30): workstation local admin is split from
+# the DC bootstrap admin — its own vault_client_local_admin_password (one shared
+# value across both clients). LAPS is the eventual per-machine-unique endgame.
+# Steady-state Ansible identity post-join remains the named domain admin.
 ansible_user: Administrator
-ansible_password: "{{ vault_dc_admin_password }}"
+ansible_password: "{{ vault_client_local_admin_password }}"
 
 # Per-host network reservations (consumed by ad_dhcp role).
 # IPs match inventory ansible_host values + NETWORK.md.

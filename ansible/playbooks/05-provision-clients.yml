@@ -1,0 +1,70 @@
+---
+# Build the Win 11 Enterprise client VMs (CLIENT01-corp, CLIENT02-corp).
+#
+# Reuses the battle-tested kvm_windows_vm role with Win-11 overrides:
+#   - install ISO + WIM image = Win 11 Enterprise (edition index 1)
+#   - vm_virtio_driver_os=w11  (WinPE loads the w11 vioscsi/NetKVM tree, NOT 2k25)
+#   - TPM 2.0 + Secure Boot (Win 11 hard requirements)
+#   - DHCP (no static-IP Autounattend block) — MAC-tied reservations in ad_dhcp
+#     hand out 10.10.0.50/.51; the role waits for WinRM on that reserved IP.
+#   - local Administrator password = vault_client_local_admin_password (split
+#     from the DC bootstrap admin per the M6 design decision).
+#
+# HOST SAFETY: runs only against kvm_host (localhost) for VM lifecycle. It does
+# NOTHING to the host OS — only qemu-img/virsh/xorriso + files under ~/vm-lab.
+# Builds sequentially (the post-WinPE CD-eject logic watches one VM's SPICE
+# screen at a time).
+#
+# Run: ansible-playbook playbooks/05-provision-clients.yml
+
+- name: "Provision Win 11 client VMs (CLIENT01-corp, CLIENT02-corp)"
+  hosts: kvm_host
+  gather_facts: false
+  vars:
+    vm_install_iso: "{{ iso_paths.windows_11_enterprise }}"
+    vm_install_iso_sha256: "{{ iso_checksums.windows_11_enterprise | default('') }}"
+    vm_wim_image_name: "Windows 11 Enterprise Evaluation"
+    vm_virtio_driver_os: "w11"
+    vm_install_iso_volid: "WIN11ENT_CORPLAB"
+    vm_local_admin_password: "{{ vault_client_local_admin_password }}"
+    # Win 11 client sizing. Bumped from 2 vCPU/4 GB to 4 vCPU/8 GB (2026-05-29):
+    # 4 GB is Win 11's painful floor and 2 vCPU made the 24H2 install ~50 min.
+    # Host (5800X3D 8c/16t, 78 GB) has ample headroom — idle clients cost ~0 CPU;
+    # install bursts ~4 threads each. Faster installs + a realistic workstation.
+    # (ADR to be recorded; fleet table to be updated.)
+    vm_memory_mb: 8192
+    vm_vcpus: 4
+    vm_disk_gb: 40
+    vm_os_variant: win11
+    # Win 11 requires TPM 2.0 + Secure Boot.
+    vm_enable_tpm: true
+    vm_secure_boot: true
+    # Skip the Server-2025 CD-boot-loop eject workaround. Empirically, Win 11
+    # 24H2 boots the disk's Windows Boot Manager after the WinPE pass even with
+    # the install CD still attached (verified 2026-05-29: CLIENT01 progressed to
+    # the online "Installing Windows 11" phase + OOBE with the CD attached, no
+    # re-wipe). The role's screen-watch detector also can't see Win 11's
+    # solid-blue progress screen as the "blank" reboot signal, so leaving the
+    # eject on produces a false-failure timeout. (ADR to be recorded.)
+    vm_eject_install_cd_after_winpe: false
+    # Win 11 on 2 vCPU / 4 GB installs slowly (several reboots through OOBE).
+    # Allow up to 60 min for WinRM to appear before declaring failure.
+    vm_winrm_timeout: 3600
+  tasks:
+    - name: "Build each Win 11 client via kvm_windows_vm"
+      ansible.builtin.include_role:
+        name: kvm_windows_vm
+      vars:
+        vm_name: "{{ client_vm }}"
+        vm_mac: "{{ hostvars[client_vm].client_dhcp_reservations[client_vm].mac }}"
+        # DHCP client: no static IP, but we know the reserved lease — wait for
+        # WinRM there (matches the inventory ansible_host).
+        vm_winrm_wait_host: "{{ hostvars[client_vm].ansible_host }}"
+      # clients_to_build allows (re)building a single client in isolation — e.g.
+      # in parallel background runs. Defaults to all clients.
+      loop: "{{ clients_to_build | default(groups['clients']) }}"
+      # Distinct loop_var so the role's internal loops (which use `item`) don't
+      # collide with this play's loop variable.
+      loop_control:
+        loop_var: client_vm
+        label: "{{ client_vm }}"
