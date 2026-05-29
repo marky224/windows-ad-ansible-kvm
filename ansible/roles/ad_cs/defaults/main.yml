@@ -84,3 +84,41 @@ ad_cs_templates_to_publish:
   - User
   - Workstation
   - KerberosAuthentication
+
+# --- Machine-certificate autoenrollment templates (ADR-044) ---
+#
+# Production-canonical autoenrollment: rather than weaken a pristine built-in
+# template's ACL, CLONE it into a lab-owned template and grant the Autoenroll
+# right on the COPY. This keeps the built-ins untouched (the same "leave
+# built-ins pristine" stance as the single-tier-CA compression in ADR-038).
+#
+# microsoft.ad.cs_template (native, v1.11.0+) does the clone via `source_template`
+# — it mints the new template OID + msPKI-Enterprise-Oid object internally, so we
+# avoid the fragile raw-LDAP OID-minting that community modules (GoateePFE
+# ADCSTemplate) hand-roll. The one thing cs_template does NOT manage is the
+# template ACL, so the role grants Read+Enroll+Autoenroll on the copy via inline
+# PS (the canonical ActiveDirectoryAccessRule pattern).
+#
+# Why this was needed: the built-in "Workstation Authentication" already carries
+# CT_FLAG_AUTO_ENROLLMENT (msPKI-Enrollment-Flag=0x20) but grants Domain Computers
+# only Read+Enroll — never Autoenroll. So the domain-root autoenrollment GPO
+# (ad_gpo: AEPolicy=0x7) fired on joined clients but had no template they were
+# permitted to autoenroll against. The Autoenroll ACE is the missing piece.
+#
+# Schema version is kept at V2 (faithful to the built-in source). A V3/V4 CNG-KSP
+# clone with TPM key attestation (the vTPMs are real per ADR-040) is a defensible
+# future showcase but carries documented Win 11 24H2 autoenrollment regressions —
+# tracked as a follow-up in ADR-044, not adopted now.
+#
+# Each entry:
+#   name            CN of the new template (no spaces; this is what is published)
+#   display_name    human-readable name shown in the Certificate Templates MMC
+#   source_template DISPLAY name of the built-in to clone (cs_template wants the
+#                   display name here, e.g. "Workstation Authentication")
+#   autoenroll_principals  AD groups granted Read+Enroll+Autoenroll on the copy
+ad_cs_autoenroll_templates:
+  - name: "CorpWorkstationAuthentication"
+    display_name: "Corp Workstation Authentication"
+    source_template: "Workstation Authentication"
+    autoenroll_principals:
+      - "Domain Computers"

@@ -20,12 +20,14 @@ a single DC. See ADR-038 for the full rationale.
 6. **First CRL issue** — `certutil -CRL` (skipped if a `.crl` file already exists in `C:\Windows\System32\CertSrv\CertEnroll`). Without this, newly-issued certs reference a CRL that does not yet exist on disk → HTTP 404 on validation.
 7. **Template publishing** — `microsoft.ad.cs_template` (native, v1.11.0+) publishes the production-canonical 5-template set: `Machine` (V1 Computer), `WebServer` (V1), `User` (V1), `Workstation` (V2 Workstation Authentication), `KerberosAuthentication` (V2, modern DC cert per RFC 4556).
 8. **End-to-end verification** — `certutil -ping` + `certutil -CAInfo` (asserts CA name + Enterprise Root) + `certutil -CATemplates` (asserts all 5 expected templates are published).
+9. **Machine-autoenrollment template** (ADR-044) — clones the built-in `Workstation Authentication` into a lab-owned `Corp Workstation Authentication` (CN `CorpWorkstationAuthentication`) via `microsoft.ad.cs_template`'s `source_template` (native clone + OID mint + publish), then grants `Domain Computers` **Read + Enroll + Autoenroll** on the copy via inline PS (the one thing `cs_template` doesn't manage). Built-ins stay pristine. This is the piece that makes the domain-root `Lab - Autoenrollment` GPO actually issue machine certs — the built-ins grant Domain Computers only Read+Enroll, never Autoenroll.
 
 ## ADRs
 
 - **ADR-016** — Ansible-native architecture (use `microsoft.ad.cs_authority` + `cs_template` where they fit; inline PS elsewhere).
 - **ADR-037** — DSC vs inline PS evaluation: inline PS + native modules for `ad_cs` (DSC `ActiveDirectoryCSDsc` is on 2020 stable with no Server 2025 validation; `CertificateDsc` is healthy but doesn't beat the already-native `microsoft.ad.cs_template`).
 - **ADR-038** — AD CS deployment shape: single-tier Enterprise Root, Web Enrollment installed, HTTP CDP/AIA published, production-canonical 5-template baseline.
+- **ADR-044** — machine-cert autoenrollment via a cloned template: clone `Workstation Authentication` → `Corp Workstation Authentication` (native `cs_template`, chosen over hand-rolled raw-LDAP cloning), grant Domain Computers Autoenroll on the copy. Kept V2; V4 + TPM key attestation tracked as a future showcase.
 
 ## Variables
 
@@ -40,6 +42,7 @@ See `defaults/main.yml`. Key knobs:
 | `ad_cs_install_web_enrollment` | `true` | Set `false` to skip IIS + Web Enrollment install (drops HTTP CDP/AIA). |
 | `ad_cs_http_pki_host` | `addc01.{{ forest.fqdn }}` | DNS name embedded in HTTP CDP/AIA URLs. Must resolve from anywhere a cert is validated. |
 | `ad_cs_templates_to_publish` | 5 production-canonical CNs | See defaults file for the list + display-name mapping. |
+| `ad_cs_autoenroll_templates` | `Corp Workstation Authentication` ← clone of `Workstation Authentication`, Domain Computers Autoenroll | Machine-cert autoenrollment templates (ADR-044). Each entry: `name` (new CN), `display_name`, `source_template` (built-in display name to clone), `autoenroll_principals` (groups granted Read+Enroll+Autoenroll). |
 
 ## Server 2025 gotchas (from ADR-038 research)
 

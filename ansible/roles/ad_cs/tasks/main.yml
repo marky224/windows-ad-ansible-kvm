@@ -339,3 +339,128 @@
 - name: "Show CA verification summary"
   ansible.builtin.debug:
     var: r_ca_verify.result
+
+# --- Machine-certificate autoenrollment templates (ADR-044) -------------------
+#
+# Clone a built-in template into a lab-owned copy and grant the Autoenroll right
+# on the copy (built-ins stay pristine). cs_template (native) does the clone +
+# OID mint + publish; it does NOT manage the template ACL, so the Autoenroll ACE
+# is granted via inline PS. See defaults/main.yml (ad_cs_autoenroll_templates)
+# and ADR-044 for the production-vs-lab framing.
+
+- name: "Clone built-in template into lab autoenrollment copy + publish to CA"
+  microsoft.ad.cs_template:
+    name: "{{ item.name }}"
+    display_name: "{{ item.display_name }}"
+    source_template: "{{ item.source_template }}"
+    # The built-in source already carries CT_FLAG_AUTO_ENROLLMENT (0x20); set it
+    # explicitly on the copy so the clone can't silently drop it.
+    enrollment_flag:
+      - auto_enrollment
+    publish_to_ca:
+      - "{{ ad_cs_ca_common_name }}"
+    state: present
+  loop: "{{ ad_cs_autoenroll_templates }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: r_autoenroll_templates
+
+- name: "Grant Read+Enroll+Autoenroll to principals on the lab template(s)"
+  ansible.windows.win_powershell:
+    parameters:
+      TemplateCn: "{{ item.name }}"
+      Principals: "{{ item.autoenroll_principals }}"
+    script: |
+      param(
+          [string]$TemplateCn,
+          [string[]]$Principals
+      )
+      # Importing the AD module mounts the AD: PSDrive used by Get-Acl/Set-Acl.
+      Import-Module ActiveDirectory -ErrorAction Stop
+
+      $enrollGuid     = [guid]'0e10c968-78fb-11d2-90d4-00c04f79dc55'   # Certificate-Enrollment
+      $autoEnrollGuid = [guid]'a05b8cc2-17bc-4802-a710-e7c15ab866a2'   # Certificate-AutoEnrollment
+      $empty          = [guid]'00000000-0000-0000-0000-000000000000'
+
+      $cfg = (Get-ADRootDSE).configurationNamingContext
+      $dn  = "CN=$TemplateCn,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
+      $adPath = "AD:$dn"
+      if (-not (Test-Path $adPath)) {
+          throw "Template object not found at $dn (cs_template clone did not create it?)."
+      }
+
+      # Read+Enroll+Autoenroll is the canonical autoenrollment grant. Read is the
+      # GenericRead generic right (empty ObjectType); Enroll/Autoenroll are
+      # ExtendedRight ACEs keyed by their control-access-right GUID.
+      $want = @(
+          @{ Right = 'GenericRead';   Obj = $empty },
+          @{ Right = 'ExtendedRight'; Obj = $enrollGuid },
+          @{ Right = 'ExtendedRight'; Obj = $autoEnrollGuid }
+      )
+
+      $acl = Get-Acl -Path $adPath
+      $changed = $false
+      $applied = @()
+      foreach ($p in $Principals) {
+          $sid = (New-Object System.Security.Principal.NTAccount($p)).Translate([System.Security.Principal.SecurityIdentifier])
+          foreach ($w in $want) {
+              $rightEnum = [System.DirectoryServices.ActiveDirectoryRights]$w.Right
+              # Already-present check: same identity, Allow, ObjectType, and the
+              # right bit set. Converges to no-op on the 2nd run regardless of
+              # whether the clone inherited the source ACL. GetAccessRules(...,
+              # [SecurityIdentifier]) returns identities as SIDs so -eq compares
+              # SID-to-SID (Get-Acl's default NTAccount form never equals a SID).
+              $present = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Where-Object {
+                  $_.IdentityReference -eq $sid -and
+                  $_.AccessControlType -eq 'Allow' -and
+                  $_.ObjectType -eq $w.Obj -and
+                  ($_.ActiveDirectoryRights -band $rightEnum)
+              }
+              if (-not $present) {
+                  $ace = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                      $sid, $rightEnum, 'Allow', $w.Obj, 'None', $empty)
+                  $acl.AddAccessRule($ace)
+                  $changed = $true
+                  $applied += "$p :: $($w.Right)/$($w.Obj)"
+              }
+          }
+      }
+      if ($changed) { Set-Acl -Path $adPath -AclObject $acl }
+
+      # Post-write verify (ADR-037 silent-no-op defense): re-read and confirm the
+      # Autoenroll ACE is present for every principal.
+      $aclAfter = Get-Acl -Path $adPath
+      $missing = @()
+      foreach ($p in $Principals) {
+          $sid = (New-Object System.Security.Principal.NTAccount($p)).Translate([System.Security.Principal.SecurityIdentifier])
+          $hasAuto = $aclAfter.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Where-Object {
+              $_.IdentityReference -eq $sid -and
+              $_.AccessControlType -eq 'Allow' -and
+              $_.ObjectType -eq $autoEnrollGuid -and
+              ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]'ExtendedRight')
+          }
+          if (-not $hasAuto) { $missing += $p }
+      }
+      if ($missing.Count -gt 0) {
+          throw "Autoenroll ACE missing after Set-Acl on '$TemplateCn' for: $($missing -join ', ')"
+      }
+
+      $Ansible.Changed = $changed
+      $Ansible.Result = @{
+          Template = $TemplateCn
+          Applied  = $applied
+          Verified = $Principals
+      }
+  loop: "{{ ad_cs_autoenroll_templates }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: r_autoenroll_acl
+
+- name: "Show autoenrollment template ACL grant summary"
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item.name }}: changed={{ item.result.Applied | default([]) | length > 0 }}
+      verified_principals={{ item.result.Verified | default([]) }}
+  loop: "{{ r_autoenroll_acl.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
