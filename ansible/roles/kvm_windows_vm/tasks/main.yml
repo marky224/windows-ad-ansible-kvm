@@ -239,6 +239,7 @@
       --vcpus {{ vm_vcpus }}
       --machine {{ vm_machine_type }}
       --cpu host-passthrough
+      {% for e in vm_hyperv_enlightenments %}--xml ./features/hyperv/{{ e }}/@state=on {% endfor %}
       --boot uefi{{ ',firmware.feature0.enabled=no,firmware.feature0.name=secure-boot' if not vm_secure_boot else '' }},nvram={{ vm_nvram_path }}
       {% if vm_enable_tpm | bool %}--tpm model=tpm-crb,backend.type=emulator,backend.version={{ vm_tpm_version }}{% else %}--tpm none{% endif %}
       --controller scsi,model=virtio-scsi

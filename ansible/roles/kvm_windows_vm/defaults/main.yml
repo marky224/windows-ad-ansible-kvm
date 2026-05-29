@@ -27,6 +27,26 @@ vm_uefi_vars_template: "/usr/share/OVMF/OVMF_VARS_4M{{ '.ms' if vm_secure_boot e
 vm_enable_tpm: true              # set false to skip TPM (e.g. while swtpm perms TBD)
 vm_tpm_version: "2.0"
 
+# Hyper-V enlightenments injected via virt-install --xml. --osinfo only sets the
+# bare set (relaxed/vapic/spinlocks); WITHOUT the synthetic-timer + clock ones
+# below, Win 11 24H2 storms hardware-timer VM-exits and the install hangs while
+# burning ~3.5 host cores (QEMU #3256 — observed 2026-05-30, ADR-042). These add
+# the missing enlightenments so the guest uses synthetic timers instead of
+# spinning. (virt-install's --features parser rejects these newer keys, so we
+# inject via --xml XPath, which creates the nested nodes.) Server 2025 benefits
+# too. stimer/direct is nested under stimer (both listed).
+vm_hyperv_enlightenments:
+  - synic
+  - stimer
+  - stimer/direct
+  - frequencies
+  - reenlightenment
+  - vpindex
+  - runtime
+  - tlbflush
+  - ipi
+  - reset
+
 # --- Network ---
 vm_network: "{{ corp_subnet.libvirt_network_name }}"
 vm_netmask_prefix: 24
