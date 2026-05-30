@@ -63,6 +63,7 @@
   loop:
     - meta-data
     - user-data
+    - network-config
 
 - name: "kvm_linux_vm | build NoCloud seed ISO (label CIDATA) via xorriso"
   ansible.builtin.command:
@@ -79,6 +80,7 @@
       - -graft-points
       - "/user-data={{ vm_seed_staging_dir }}/user-data"
       - "/meta-data={{ vm_seed_staging_dir }}/meta-data"
+      - "/network-config={{ vm_seed_staging_dir }}/network-config"
   changed_when: true
 
 - name: "kvm_linux_vm | refresh corp-iso pool"

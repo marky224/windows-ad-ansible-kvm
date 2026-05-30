@@ -1,0 +1,16 @@
+# Rendered by kvm_linux_vm into the NoCloud seed ISO (label CIDATA) as the
+# top-level `network-config` file. cloud-init v2 format (maps to netplan).
+#
+# WHY dhcp-identifier: mac — systemd-networkd defaults to an RFC 4361 DUID/IAID
+# DHCP client-id (option 61), which does NOT match a Windows-DHCP reservation
+# keyed on the MAC. Forcing `mac` makes the guest send its hardware address so
+# the DC reservation ({{ vm_mac }} -> reserved IP) matches and the lease binds
+# to the intended address instead of a dynamic one.
+version: 2
+ethernets:
+  primary:
+    match:
+      macaddress: "{{ vm_mac }}"
+    set-name: enp1s0
+    dhcp4: true
+    dhcp-identifier: mac
