@@ -12,7 +12,13 @@ users:
     groups: [adm, sudo]
     shell: /bin/bash
     lock_passwd: false
-    passwd: "{{ linux_admin_password | password_hash('sha512') }}"
+    # Deterministic salt (derived per-host from user+FQDN) so this seed renders
+    # byte-identically every run — password_hash() with no salt mints a RANDOM
+    # one each time, which made user-data (and the seed ISO built from it) report
+    # 'changed' on every re-run. The salt is not a secret (the password itself is
+    # vaulted); it only needs to be stable. hash('sha512') is hex ([0-9a-f]), a
+    # subset of the crypt salt charset; sliced to the 16-char sha512-crypt max.
+    passwd: "{{ linux_admin_password | password_hash('sha512', salt=((linux_admin_user ~ linux_fqdn) | hash('sha512'))[:16]) }}"
     sudo: "ALL=(ALL) NOPASSWD:ALL"
     ssh_authorized_keys:
       - "{{ lookup('file', linux_ssh_pubkey_path) }}"

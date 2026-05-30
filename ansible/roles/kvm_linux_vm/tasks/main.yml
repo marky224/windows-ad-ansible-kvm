@@ -64,7 +64,17 @@
     - meta-data
     - user-data
     - network-config
+  register: r_seed_files
 
+- name: "kvm_linux_vm | stat existing seed ISO (idempotency)"
+  ansible.builtin.stat:
+    path: "{{ vm_seed_iso_path }}"
+  register: r_seed_iso
+
+# Rebuild the ISO ONLY when a rendered source changed or the ISO is absent.
+# xorriso has no creates-guard of its own, so without this gate the build runs
+# (and reports 'changed') every time. The seed sources are deterministic, so a
+# steady-state re-run now skips this and the role is idempotent.
 - name: "kvm_linux_vm | build NoCloud seed ISO (label CIDATA) via xorriso"
   ansible.builtin.command:
     argv:
@@ -81,6 +91,7 @@
       - "/user-data={{ vm_seed_staging_dir }}/user-data"
       - "/meta-data={{ vm_seed_staging_dir }}/meta-data"
       - "/network-config={{ vm_seed_staging_dir }}/network-config"
+  when: r_seed_files is changed or not r_seed_iso.stat.exists
   changed_when: true
 
 - name: "kvm_linux_vm | refresh corp-iso pool"
