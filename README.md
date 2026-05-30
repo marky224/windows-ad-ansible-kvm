@@ -23,7 +23,7 @@ End-to-end automated build: from a bare Ubuntu 24.04 host, Ansible provisions a 
 | 6 — Client provisioning + domain join | ✅ Done | Win 11 clients built (real vTPM 2.0, 4 vCPU/8 GB) and **domain-joined** into `OU=Workstations` with **machine-cert autoenrollment** (Client-Auth cert from the Enterprise CA via the `Corp Workstation Authentication` template); Ubuntu 24.04 **domain-joined** via `realmd`/`sssd` (MAC-based DHCP reservation + Server 2025 Kerberos canonicalize fix) |
 | 7 — Smoke test + backups | 🚧 In progress | `99-smoke-test.yml` end-to-end verification ✅ green across the fleet; nightly state backup planned |
 
-### From install ISO to live forest
+### From install ISO to a domain-joined fleet
 
 | Stage | Screenshot |
 |---|---|
@@ -32,8 +32,10 @@ End-to-end automated build: from a bare Ubuntu 24.04 host, Ansible provisions a 
 | OOBE auto-skipped → autologon → desktop; WinRM HTTPS:5986 listening | ![Desktop](docs/screenshots/milestone2-04-desktop-after-autologon.png) |
 | Patched Server 2025 build `26100.32860` — slipstreamed at install time via DISM, no post-install patching window | ![Server Manager, patched](docs/screenshots/milestone-3.5-patched-pre-promotion.png) |
 | Forest `corp.markandrewmarquez.com` is live — ADDC01 holds all FSMOs, `madmin-da` named admin established, RID 500 hardened per Appendix D | ![DC promoted](docs/screenshots/milestone-3-dc-promoted.png) |
+| `CLIENT01` — Windows 11 Enterprise client (real vTPM 2.0), domain-joined into `OU=Workstations` with machine-certificate autoenrollment from the Enterprise CA | ![Win 11 client joined](docs/screenshots/milestone-6-client01-win11-desktop.png) |
+| `UBUNTU01` — Ubuntu 24.04 domain-joined via `realmd`/`sssd`: `realm list` shows `kerberos-member`, `id madmin-da@corp…` resolves the AD identity, on reserved `10.10.0.60` | ![Ubuntu domain-joined](docs/screenshots/milestone-6-ubuntu01-domain-joined.png) |
 
-Validation: `ansible.windows.win_ping` → `pong` against `ADDC01-corp` at `10.10.0.10:5986`, authenticating as the steady-state named admin.
+Validation: `ansible.windows.win_ping` → `pong` against `ADDC01-corp` at `10.10.0.10:5986` (and `ansible -m ping` against `UBUNTU01-corp`), authenticating as the steady-state named admin; `99-smoke-test.yml` passes across the whole fleet.
 
 ---
 
