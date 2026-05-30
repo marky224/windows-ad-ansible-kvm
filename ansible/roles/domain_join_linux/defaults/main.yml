@@ -25,6 +25,12 @@ realm_packages:
   - libnss-sss
   - libpam-sss
 
+# --- Kerberos principal canonicalization ---
+# Single source of truth for BOTH krb5.conf [libdefaults] canonicalize (governs
+# the adcli/realm-join kinit) AND sssd.conf krb5_canonicalize (governs runtime
+# auth). Required for joins against modern AD KDCs (Server 2025) — see krb5.conf.j2.
+realm_krb5_canonicalize: true
+
 # --- sssd behavior ---
 # use_fully_qualified_names=true forces user@domain at the prompt, eliminating
 # any clash between AD usernames and local accounts (e.g. the labadmin bootstrap

@@ -12,6 +12,10 @@ krb5_realm = {{ realm_domain | upper }}
 realmd_tags = manages-system joined-with-adcli
 cache_credentials = True
 id_provider = ad
+# Match krb5.conf [libdefaults] canonicalize: AD KDCs (Server 2025) canonicalize
+# the client principal, so steady-state Kerberos auth must accept a returned
+# principal that differs from the requested one. SSSD defaults this to False.
+krb5_canonicalize = {{ 'True' if realm_krb5_canonicalize | default(true) else 'False' }}
 krb5_store_password_if_offline = True
 default_shell = {{ realm_default_shell }}
 ldap_id_mapping = True

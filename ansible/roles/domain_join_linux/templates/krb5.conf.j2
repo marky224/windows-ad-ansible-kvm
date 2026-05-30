@@ -7,6 +7,13 @@
     rdns = false
     fcc-mit-ticketflags = true
     forwardable = true
+    # AD KDCs (notably Server 2025) canonicalize the client principal in the
+    # AS-REP; MIT krb5's default (canonicalize=false) then rejects the reply as
+    # "KDC reply did not match expectations" and the realm/adcli join fails even
+    # though preauth + AES256 decryption succeed. Requesting canonicalization
+    # makes krb5 accept the returned principal. Proven via kinit bake-off; the
+    # twin sssd setting (krb5_canonicalize) covers steady-state auth. See ADR.
+    canonicalize = {{ realm_krb5_canonicalize | default(true) | lower }}
 
 [realms]
     {{ realm_domain | upper }} = {
