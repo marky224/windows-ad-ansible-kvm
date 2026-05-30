@@ -1,0 +1,219 @@
+---
+# End-to-end smoke test — verifies the whole lab converged. READ-ONLY.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ HOST SAFETY: every play targets a GUEST group only (dc / clients /         │
+# │ linux_clients) — never localhost/kvm_host. All tasks are read-only         │
+# │ (changed_when: false); no package installs, no config writes. `become`     │
+# │ on Linux is only used to read root-owned files (sssd state).               │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Run:  ansible-playbook playbooks/99-smoke-test.yml
+# Scope a single layer with --limit dc | clients | linux_clients.
+
+# ===========================================================================
+# PLAY 1 — Domain Controller: DNS, AD, DHCP, AD CS, NTP
+# ===========================================================================
+- name: "Smoke test — Domain Controller services"
+  hosts: dc
+  gather_facts: false
+  tasks:
+    - name: "DC | AD domain + FSMO roles present"
+      ansible.windows.win_powershell:
+        script: |
+          $d = Get-ADDomain
+          $f = Get-ADForest
+          $Ansible.Changed = $false
+          $Ansible.Result = @{
+            Domain     = $d.DNSRoot
+            NetBIOS    = $d.NetBIOSName
+            PDCEmulator= $d.PDCEmulator
+            FSMO       = @($d.RIDMaster, $d.InfrastructureMaster, $f.SchemaMaster, $f.DomainNamingMaster)
+          }
+      register: r_ad
+      changed_when: false
+
+    - name: "DC | assert forest identity matches inventory"
+      ansible.builtin.assert:
+        that:
+          - "r_ad.result.Domain == forest.fqdn"
+          - "r_ad.result.NetBIOS == forest.netbios"
+        success_msg: "✅ AD: {{ r_ad.result.Domain }} (NetBIOS {{ r_ad.result.NetBIOS }}), PDC {{ r_ad.result.PDCEmulator }}"
+
+    - name: "DC | DNS resolves forest FQDN + key SRV record"
+      ansible.windows.win_powershell:
+        script: |
+          $a   = Resolve-DnsName -Name "{{ forest.fqdn }}" -Type A -ErrorAction Stop
+          $srv = Resolve-DnsName -Name "_ldap._tcp.{{ forest.fqdn }}" -Type SRV -ErrorAction Stop
+          $rev = Resolve-DnsName -Name "{{ corp_subnet.dc_ip }}" -Type PTR -ErrorAction SilentlyContinue
+          $Ansible.Changed = $false
+          $Ansible.Result = @{
+            A_count   = @($a).Count
+            SRV_target= ($srv | Where-Object QueryType -eq 'SRV' | Select-Object -First 1).NameTarget
+            PTR       = ($rev | Select-Object -First 1).NameHost
+          }
+      register: r_dns
+      changed_when: false
+
+    - name: "DC | assert DNS healthy"
+      ansible.builtin.assert:
+        that:
+          - "r_dns.result.A_count | int > 0"
+          - "'addc01' in (r_dns.result.SRV_target | default('') | lower)"
+        success_msg: "✅ DNS: A records={{ r_dns.result.A_count }}, _ldap SRV→{{ r_dns.result.SRV_target }}, PTR={{ r_dns.result.PTR }}"
+
+    - name: "DC | DHCP scope active + reservation count"
+      ansible.windows.win_powershell:
+        script: |
+          $scope = Get-DhcpServerv4Scope -ScopeId 10.10.0.0 -ErrorAction Stop
+          $res   = @(Get-DhcpServerv4Reservation -ScopeId 10.10.0.0 -ErrorAction Stop)
+          $Ansible.Changed = $false
+          $Ansible.Result = @{ State = [string]$scope.State; Reservations = $res.Count }
+      register: r_dhcp
+      changed_when: false
+
+    - name: "DC | assert DHCP healthy (active scope, 3 reservations)"
+      ansible.builtin.assert:
+        that:
+          - "r_dhcp.result.State == 'Active'"
+          - "r_dhcp.result.Reservations | int >= 3"
+        success_msg: "✅ DHCP: scope {{ r_dhcp.result.State }}, {{ r_dhcp.result.Reservations }} reservations"
+
+    - name: "DC | AD CS online + autoenroll template published"
+      ansible.windows.win_powershell:
+        script: |
+          $ca   = certutil -ping 2>&1 | Out-String
+          $tmpl = certutil -CATemplates 2>&1 | Out-String
+          $Ansible.Changed = $false
+          $Ansible.Result = @{
+            CaPingOk     = [bool]($ca -match 'interface is alive|Server .* ICertRequest')
+            HasCorpWSAuth= [bool]($tmpl -match 'CorpWorkstationAuthentication|Corp Workstation Authentication')
+          }
+      register: r_cs
+      changed_when: false
+
+    - name: "DC | assert CA online + autoenroll template published"
+      ansible.builtin.assert:
+        that:
+          - "r_cs.result.CaPingOk"
+          - "r_cs.result.HasCorpWSAuth"
+        success_msg: "✅ AD CS: CA alive, 'Corp Workstation Authentication' template published"
+
+    - name: "DC | NTP source is a reliable time source"
+      ansible.windows.win_powershell:
+        script: |
+          $src = (w32tm /query /source) 2>&1 | Out-String
+          $Ansible.Changed = $false
+          $Ansible.Result = @{ Source = $src.Trim() }
+      register: r_ntp
+      changed_when: false
+
+    - name: "DC | report NTP source"
+      ansible.builtin.debug:
+        msg: "✅ NTP source: {{ r_ntp.result.Source }}"
+
+# ===========================================================================
+# PLAY 2 — Windows clients: domain membership, DNS, machine cert
+# ===========================================================================
+- name: "Smoke test — Windows clients"
+  hosts: clients
+  gather_facts: false
+  tasks:
+    - name: "Client | domain membership + DNS + autoenrolled machine cert"
+      ansible.windows.win_powershell:
+        script: |
+          $cs  = Get-CimInstance Win32_ComputerSystem
+          $dns = (Get-DnsClientServerAddress -AddressFamily IPv4 |
+                  Where-Object { $_.ServerAddresses }).ServerAddresses
+          $cert = Get-ChildItem Cert:\LocalMachine\My |
+                  Where-Object { $_.Issuer -match 'CORP-ADDC01-CA' -and $_.HasPrivateKey } |
+                  Select-Object -First 1
+          $Ansible.Changed = $false
+          $Ansible.Result = @{
+            PartOfDomain = [bool]$cs.PartOfDomain
+            Domain       = $cs.Domain
+            DnsServers   = @($dns)
+            HasMachineCert = [bool]$cert
+            CertSubject  = if ($cert) { $cert.Subject } else { '' }
+          }
+      register: r_client
+      changed_when: false
+
+    - name: "Client | assert joined + DNS→DC + machine cert autoenrolled"
+      ansible.builtin.assert:
+        that:
+          - "r_client.result.PartOfDomain"
+          - "r_client.result.Domain == forest.fqdn"
+          - "corp_subnet.dc_ip in r_client.result.DnsServers"
+          - "r_client.result.HasMachineCert"
+        success_msg: >-
+          ✅ {{ inventory_hostname }}: joined {{ r_client.result.Domain }},
+          DNS→{{ r_client.result.DnsServers | join(',') }},
+          machine cert [{{ r_client.result.CertSubject }}]
+
+# ===========================================================================
+# PLAY 3 — Linux client: realm membership, AD identity, sudo, CA trust
+# ===========================================================================
+- name: "Smoke test — Linux client (UBUNTU01)"
+  hosts: linux_clients
+  gather_facts: false
+  tasks:
+    - name: "Linux | realm membership"
+      ansible.builtin.command: realm list --name-only
+      register: r_realm
+      changed_when: false
+
+    - name: "Linux | AD identity resolves"
+      ansible.builtin.command: "id {{ named_admin.upn }}"
+      register: r_id
+      changed_when: false
+
+    - name: "Linux | sssd active"
+      ansible.builtin.command: systemctl is-active sssd
+      register: r_sssd
+      changed_when: false
+      failed_when: false
+
+    - name: "Linux | Domain Admins sudo rule present"
+      ansible.builtin.command: cat /etc/sudoers.d/domain-admins
+      register: r_sudo
+      changed_when: false
+      become: true
+
+    - name: "Linux | reserved IP bound on the NIC"
+      ansible.builtin.shell:
+        cmd: "ip -4 -o addr show | grep -o '{{ ansible_host }}/' | head -1"
+      register: r_ip
+      changed_when: false
+      failed_when: false
+
+    - name: "Linux | CA cert is fetchable + valid from the AD web-enrollment endpoint"
+      ansible.builtin.shell:
+        cmd: >-
+          curl -fsS "http://addc01.{{ forest.fqdn }}/CertEnroll/ADDC01.{{ forest.fqdn }}_CORP-ADDC01-CA.crt"
+          -o /tmp/corp-ca-smoke.crt &&
+          openssl x509 -inform DER -in /tmp/corp-ca-smoke.crt -noout -subject 2>/dev/null
+          || openssl x509 -in /tmp/corp-ca-smoke.crt -noout -subject;
+          rm -f /tmp/corp-ca-smoke.crt
+      register: r_ca
+      changed_when: false
+      failed_when: false
+
+    - name: "Linux | assert domain-joined + identity + sudo + reserved IP"
+      ansible.builtin.assert:
+        that:
+          - "forest.fqdn in r_realm.stdout"
+          - "'no such user' not in r_id.stderr"
+          - "named_admin.sam in r_id.stdout"
+          - "r_sssd.stdout == 'active'"
+          # sudoers escapes the space: "%domain\ admins@corp..." — match on the
+          # unambiguous "admins@<realm>" token rather than the literal "domain admins".
+          - "('admins@' ~ forest.fqdn) in (r_sudo.stdout | lower)"
+          - "ansible_host in r_ip.stdout"
+        success_msg: >-
+          ✅ {{ inventory_hostname }}: realm {{ r_realm.stdout }}, AD id OK, sssd active,
+          Domain Admins sudo present, on reserved {{ ansible_host }}
+
+    - name: "Linux | report CA-trust fetch result"
+      ansible.builtin.debug:
+        msg: "CA fetch from web-enrollment endpoint: {{ r_ca.stdout | default('(no subject returned)') }} (rc={{ r_ca.rc }})"
