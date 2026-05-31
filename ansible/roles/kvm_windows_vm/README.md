@@ -18,4 +18,4 @@ Generic Windows VM provisioner. Renders `Autounattend.xml` (with inline WinRM bo
 
 **ADRs implemented.** ADR-018, ADR-020, ADR-021, ADR-024.
 
-**Used by playbooks.** `01-provision-dc.yml`, `03-provision-clients.yml`.
+**Used by playbooks.** `01-provision-dc.yml`, `05-provision-clients.yml`.

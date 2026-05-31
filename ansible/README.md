@@ -37,11 +37,13 @@ ansible-vault edit inventory/group_vars/all/vault.yml   # replace the PLACEHOLDE
 cd ansible/
 ansible-playbook playbooks/00-libvirt-network.yml
 ansible-playbook playbooks/01-provision-dc.yml
-ansible-playbook playbooks/02-configure-dc.yml
-ansible-playbook playbooks/03-provision-clients.yml
-ansible-playbook playbooks/04-join-domain.yml
-ansible-playbook playbooks/05-provision-linux.yml
-ansible-playbook playbooks/06-join-linux.yml
+ansible-playbook playbooks/02-configure-dc.yml                  # ad_dc + named admin + RID 500 harden
+ansible-playbook playbooks/03-configure-services.yml           # ad_dns + ad_dhcp + ad_ntp
+ansible-playbook playbooks/04-configure-services-advanced.yml  # ad_cs + ad_gpo + ad_wsus
+ansible-playbook playbooks/05-provision-clients.yml
+ansible-playbook playbooks/06-join-domain.yml
+ansible-playbook playbooks/07-provision-linux.yml
+ansible-playbook playbooks/08-join-linux.yml
 ansible-playbook playbooks/99-smoke-test.yml
 ```
 

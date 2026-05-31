@@ -14,8 +14,8 @@
 # Ordering rationale:
 #   - DNS first because DHCP option 006 hands out the DC IP as DNS server,
 #     and we want DNS healthy before clients can lease addresses.
-#   - DHCP second because clients (built in 03-provision-clients.yml, next
-#     milestone) need to be able to lease IPs to reach WinRM.
+#   - DHCP second because clients (built in 05-provision-clients.yml) need to
+#     be able to lease IPs to reach WinRM.
 #   - NTP last because it's lowest-coupling — nothing else depends on time
 #     being authoritative for the role bring-up itself; domain-joined
 #     clients will sync from PDC via NT5DS once they're built.

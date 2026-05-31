@@ -10,4 +10,4 @@ Join an Ubuntu host to `corp.markandrewmarquez.com` via `realmd`/`sssd`.
 
 **Idempotency.** `realm discover` + `realm list` to skip if already joined.
 
-**Used by playbook.** `06-join-linux.yml`.
+**Used by playbook.** `08-join-linux.yml`.
