@@ -1,0 +1,102 @@
+---
+# Domain-Controller health checks — the single source of truth for "a healthy DC".
+# READ-ONLY (every task is changed_when: false). Included by:
+#   - 99-smoke-test.yml  (Play 1, against the live `dc` group)
+#   - fire-drill.yml     (against the restored sandbox in the `firedrill` group)
+#
+# Relies only on group_vars/all (forest.*, corp_subnet.*), so it runs unchanged
+# against the live DC or a restored copy. Connection (WinRM) is the caller's.
+
+- name: "DC | AD domain + FSMO roles present"
+  ansible.windows.win_powershell:
+    script: |
+      $d = Get-ADDomain
+      $f = Get-ADForest
+      $Ansible.Changed = $false
+      $Ansible.Result = @{
+        Domain     = $d.DNSRoot
+        NetBIOS    = $d.NetBIOSName
+        PDCEmulator= $d.PDCEmulator
+        FSMO       = @($d.RIDMaster, $d.InfrastructureMaster, $f.SchemaMaster, $f.DomainNamingMaster)
+      }
+  register: r_ad
+  changed_when: false
+
+- name: "DC | assert forest identity matches inventory"
+  ansible.builtin.assert:
+    that:
+      - "r_ad.result.Domain == forest.fqdn"
+      - "r_ad.result.NetBIOS == forest.netbios"
+    success_msg: "✅ AD: {{ r_ad.result.Domain }} (NetBIOS {{ r_ad.result.NetBIOS }}), PDC {{ r_ad.result.PDCEmulator }}"
+
+- name: "DC | DNS resolves forest FQDN + key SRV record"
+  ansible.windows.win_powershell:
+    script: |
+      $a   = Resolve-DnsName -Name "{{ forest.fqdn }}" -Type A -ErrorAction Stop
+      $srv = Resolve-DnsName -Name "_ldap._tcp.{{ forest.fqdn }}" -Type SRV -ErrorAction Stop
+      $rev = Resolve-DnsName -Name "{{ corp_subnet.dc_ip }}" -Type PTR -ErrorAction SilentlyContinue
+      $Ansible.Changed = $false
+      $Ansible.Result = @{
+        A_count   = @($a).Count
+        SRV_target= ($srv | Where-Object QueryType -eq 'SRV' | Select-Object -First 1).NameTarget
+        PTR       = ($rev | Select-Object -First 1).NameHost
+      }
+  register: r_dns
+  changed_when: false
+
+- name: "DC | assert DNS healthy"
+  ansible.builtin.assert:
+    that:
+      - "r_dns.result.A_count | int > 0"
+      - "'addc01' in (r_dns.result.SRV_target | default('') | lower)"
+    success_msg: "✅ DNS: A records={{ r_dns.result.A_count }}, _ldap SRV→{{ r_dns.result.SRV_target }}, PTR={{ r_dns.result.PTR }}"
+
+- name: "DC | DHCP scope active + reservation count"
+  ansible.windows.win_powershell:
+    script: |
+      $scope = Get-DhcpServerv4Scope -ScopeId 10.10.0.0 -ErrorAction Stop
+      $res   = @(Get-DhcpServerv4Reservation -ScopeId 10.10.0.0 -ErrorAction Stop)
+      $Ansible.Changed = $false
+      $Ansible.Result = @{ State = [string]$scope.State; Reservations = $res.Count }
+  register: r_dhcp
+  changed_when: false
+
+- name: "DC | assert DHCP healthy (active scope, 3 reservations)"
+  ansible.builtin.assert:
+    that:
+      - "r_dhcp.result.State == 'Active'"
+      - "r_dhcp.result.Reservations | int >= 3"
+    success_msg: "✅ DHCP: scope {{ r_dhcp.result.State }}, {{ r_dhcp.result.Reservations }} reservations"
+
+- name: "DC | AD CS online + autoenroll template published"
+  ansible.windows.win_powershell:
+    script: |
+      $ca   = certutil -ping 2>&1 | Out-String
+      $tmpl = certutil -CATemplates 2>&1 | Out-String
+      $Ansible.Changed = $false
+      $Ansible.Result = @{
+        CaPingOk     = [bool]($ca -match 'interface is alive|Server .* ICertRequest')
+        HasCorpWSAuth= [bool]($tmpl -match 'CorpWorkstationAuthentication|Corp Workstation Authentication')
+      }
+  register: r_cs
+  changed_when: false
+
+- name: "DC | assert CA online + autoenroll template published"
+  ansible.builtin.assert:
+    that:
+      - "r_cs.result.CaPingOk"
+      - "r_cs.result.HasCorpWSAuth"
+    success_msg: "✅ AD CS: CA alive, 'Corp Workstation Authentication' template published"
+
+- name: "DC | NTP source is a reliable time source"
+  ansible.windows.win_powershell:
+    script: |
+      $src = (w32tm /query /source) 2>&1 | Out-String
+      $Ansible.Changed = $false
+      $Ansible.Result = @{ Source = $src.Trim() }
+  register: r_ntp
+  changed_when: false
+
+- name: "DC | report NTP source"
+  ansible.builtin.debug:
+    msg: "✅ NTP source: {{ r_ntp.result.Source }}"
