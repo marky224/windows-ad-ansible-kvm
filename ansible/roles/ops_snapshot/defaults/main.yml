@@ -1,0 +1,37 @@
+---
+# ops_snapshot defaults. Drives snapshot.yml / list-snapshots.yml / rollback.yml.
+# See ADR-008 (amended M7) for the design. Disk-level qcow2 cp — NOT libvirt
+# internal snapshots (those fail on these UEFI/pflash VMs).
+#
+# HOST SAFETY: runs on kvm_host, UNPRIVILEGED (virsh + cp + files under
+# {{ vm_lab_root }} only). The guard (tasks/guard.yml) refuses to run anywhere
+# but the control host and against anything but a declared *-corp lab VM.
+
+# Which action main.yml dispatches to: snapshot | list | rollback.
+ops_snapshot_action: list
+
+# Required for snapshot/rollback (the playbooks pass these via -e):
+#   vm_name        — the lab VM, e.g. ADDC01-corp
+#   snapshot_label — the label, e.g. m7-complete  (no path/space chars)
+
+# Disk selection (ADR-008 amendment):
+# Default captures the OS disk only. Data disks (e.g. the 172 GB WSUS content
+# disk) are opt-in. The backup disk lives outside the disks pool (/mnt/dc-backups)
+# and is therefore never eligible.
+include_data_disks: false
+snapshot_include_nvram: true
+
+# Quiesce: graceful ACPI shutdown, polled up to this many seconds, then a
+# virsh destroy fallback (crash-consistent). 180 s is generous for the DC's AD DB.
+snapshot_graceful_timeout: 180
+
+# Refuse to overwrite an existing snapshot label unless explicitly allowed.
+snapshot_overwrite: false
+
+# Rollback is destructive — it must be explicitly confirmed (-e confirm_rollback=yes)
+# and it auto-snapshots the current OS disk to <label>-pre-rollback first.
+confirm_rollback: "no"
+
+# Internal: where lab disk images live (the pool). Disks outside this dir
+# (e.g. the /mnt/dc-backups backup disk) are never snapshotted.
+snapshot_disks_pool: "{{ vm_lab_root }}/disks"

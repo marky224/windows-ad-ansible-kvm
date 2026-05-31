@@ -1,0 +1,12 @@
+---
+# Dispatch: guard first (always), then the requested action.
+- ansible.builtin.import_tasks: guard.yml
+
+- ansible.builtin.import_tasks: list.yml
+  when: ops_snapshot_action == 'list'
+
+- ansible.builtin.import_tasks: snapshot.yml
+  when: ops_snapshot_action == 'snapshot'
+
+- ansible.builtin.import_tasks: rollback.yml
+  when: ops_snapshot_action == 'rollback'

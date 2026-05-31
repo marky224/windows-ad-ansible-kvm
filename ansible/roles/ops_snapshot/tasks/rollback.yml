@@ -1,0 +1,78 @@
+---
+# Roll a VM back to a labeled snapshot. DESTRUCTIVE — overwrites live disks.
+# Safety (ADR-008 amendment): requires confirm_rollback=yes; auto-saves the
+# current disks to .<label>-pre-rollback first (reversible); restores ONLY the
+# files captured under the label (never WSUS/backup unless they were captured
+# AND opted in); qemu-img checks each restored disk.
+
+- ansible.builtin.import_tasks: resolve.yml
+
+- name: "ops_snapshot | require explicit rollback confirmation"
+  ansible.builtin.assert:
+    that: "(confirm_rollback | string | lower) == 'yes'"
+    fail_msg: >-
+      ❌ Rollback is destructive (overwrites {{ vm_name }}'s live disk). Re-run with
+      -e confirm_rollback=yes. (The current disks are auto-saved to
+      .{{ snapshot_label }}-pre-rollback first, so a rollback can itself be undone.)
+  become: false
+
+- name: "ops_snapshot | which selected disks have a '{{ snapshot_label }}' snapshot?"
+  ansible.builtin.stat:
+    path: "{{ item }}.{{ snapshot_label }}"
+  loop: "{{ snapshot_selected_disks }}"
+  register: r_have
+
+- name: "ops_snapshot | the OS disk snapshot must exist for this label"
+  ansible.builtin.assert:
+    that: "(r_have.results | selectattr('item', 'equalto', snapshot_os_disk) | map(attribute='stat.exists') | list) == [true]"
+    fail_msg: "No snapshot '{{ snapshot_label }}' for the OS disk {{ snapshot_os_disk | basename }}. Run list-snapshots.yml."
+  become: false
+
+- name: "ops_snapshot | disks to restore (selected ∧ have a .label copy)"
+  ansible.builtin.set_fact:
+    rollback_disks: "{{ r_have.results | selectattr('stat.exists') | map(attribute='item') | list }}"
+
+- name: "ops_snapshot | is there an NVRAM snapshot for this label?"
+  ansible.builtin.stat:
+    path: "{{ snapshot_nvram_path }}.{{ snapshot_label }}"
+  register: r_have_nvram
+
+- ansible.builtin.import_tasks: quiesce.yml
+
+# Reversibility: save the CURRENT (now-stopped) disks before overwriting.
+- name: "ops_snapshot | auto-save current disks → .{{ snapshot_label }}-pre-rollback (undo path)"
+  ansible.builtin.command:
+    cmd: "cp -f --reflink=auto '{{ item }}' '{{ item }}.{{ snapshot_label }}-pre-rollback'"
+  loop: "{{ rollback_disks }}"
+  changed_when: true
+
+- name: "ops_snapshot | restore disks from .{{ snapshot_label }}"
+  ansible.builtin.command:
+    cmd: "cp -f --reflink=auto '{{ item }}.{{ snapshot_label }}' '{{ item }}'"
+  loop: "{{ rollback_disks }}"
+  changed_when: true
+
+- name: "ops_snapshot | restore NVRAM from .{{ snapshot_label }} (if captured)"
+  ansible.builtin.command:
+    cmd: "cp -f '{{ snapshot_nvram_path }}.{{ snapshot_label }}' '{{ snapshot_nvram_path }}'"
+  changed_when: true
+  when: r_have_nvram.stat.exists
+
+- name: "ops_snapshot | qemu-img check each restored disk"
+  ansible.builtin.command:
+    cmd: "qemu-img check '{{ item }}'"
+  loop: "{{ rollback_disks }}"
+  register: r_check
+  changed_when: false
+  failed_when: r_check.rc not in [0, 2]
+
+- ansible.builtin.import_tasks: restart.yml
+
+- name: "ops_snapshot | rollback summary"
+  ansible.builtin.debug:
+    msg:
+      - "✅ Rolled {{ vm_name }} back to '{{ snapshot_label }}'"
+      - "Restored    : {{ rollback_disks | map('basename') | list }}{{ ' + NVRAM' if r_have_nvram.stat.exists else '' }}"
+      - "Undo (saved): .{{ snapshot_label }}-pre-rollback copies of the same disks"
+      - "Integrity   : {{ 'qemu-img check clean/benign' if (r_check.results | map(attribute='rc') | map('int') | max <= 2) else 'CHECK FAILED — review!' }}"
+      - "VM state    : {{ 'restarted' if (snapshot_was_running | bool) else 'left stopped' }}"

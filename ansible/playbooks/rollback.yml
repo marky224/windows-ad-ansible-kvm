@@ -1,0 +1,21 @@
+---
+# Roll a lab VM back to a labeled snapshot (ADR-008, amended M7). DESTRUCTIVE —
+# overwrites the live disk. Requires explicit confirmation; the current disks
+# are auto-saved to .<label>-pre-rollback first (so the rollback is reversible).
+#
+#   ansible-playbook playbooks/rollback.yml \
+#     -e vm_name=ADDC01-corp -e snapshot_label=m6-complete -e confirm_rollback=yes
+#   # also roll back data disks captured under that label:
+#   ... -e include_data_disks=true
+#
+# Restores ONLY the disks captured under the label (OS + NVRAM by default); it
+# does not touch the WSUS / backup disks. Shuts the VM down for the copy, then
+# restarts it.
+
+- name: "Roll a lab VM back to a snapshot"
+  hosts: kvm_host
+  gather_facts: false
+  vars:
+    ops_snapshot_action: rollback
+  roles:
+    - ops_snapshot

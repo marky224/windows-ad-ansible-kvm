@@ -1,0 +1,56 @@
+---
+# Quiesce the guest before copying its disks: graceful ACPI shutdown, polled up
+# to snapshot_graceful_timeout, then a virsh destroy fallback (crash-consistent
+# — fine for AD's ESE/NTDS.dit, which recovers on next boot). Records the initial
+# running state so the caller can restart only if it was running, and the
+# consistency level for the report. See ADR-008 amendment.
+
+- name: "ops_snapshot | record initial VM state"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system domstate {{ vm_name }}"
+  register: r_state0
+  changed_when: false
+
+- name: "ops_snapshot | set was-running flag"
+  ansible.builtin.set_fact:
+    snapshot_was_running: "{{ 'running' in r_state0.stdout }}"
+
+- name: "ops_snapshot | request graceful ACPI shutdown"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system shutdown {{ vm_name }}"
+  changed_when: true
+  when: snapshot_was_running | bool
+
+- name: "ops_snapshot | wait for clean shutdown (up to {{ snapshot_graceful_timeout }}s)"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system domstate {{ vm_name }}"
+  register: r_state
+  until: "'shut off' in r_state.stdout"
+  retries: "{{ ((snapshot_graceful_timeout | int) // 10) | int }}"
+  delay: 10
+  changed_when: false
+  failed_when: false
+  when: snapshot_was_running | bool
+
+- name: "ops_snapshot | force off if it didn't shut down (crash-consistent fallback)"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system destroy {{ vm_name }}"
+  register: r_destroy
+  changed_when: true
+  when:
+    - snapshot_was_running | bool
+    - "'shut off' not in (r_state.stdout | default(''))"
+
+- name: "ops_snapshot | record the consistency level of this copy"
+  ansible.builtin.set_fact:
+    snapshot_consistency: >-
+      {{ 'offline (VM was already stopped)' if not (snapshot_was_running | bool)
+         else ('crash-consistent (destroy fallback)' if (r_destroy is defined and r_destroy is changed)
+               else 'clean (graceful shutdown)') }}
+
+- name: "ops_snapshot | confirm the VM is stopped before copying"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system domstate {{ vm_name }}"
+  register: r_state_final
+  changed_when: false
+  failed_when: "'shut off' not in r_state_final.stdout"

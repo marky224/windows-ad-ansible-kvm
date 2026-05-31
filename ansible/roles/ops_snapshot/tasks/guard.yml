@@ -1,0 +1,39 @@
+---
+# HOST-SAFETY GUARD — runs on the control host (kvm_host), never a guest, and
+# only ever touches a declared *-corp lab VM + paths under {{ vm_lab_root }}.
+# `assert` neither connects nor escalates, so a mis-target aborts before any
+# virsh/cp. See feedback-never-touch-control-host + ADR-008.
+
+- name: "ops_snapshot | SAFETY GUARD — control host only"
+  ansible.builtin.assert:
+    that:
+      - "inventory_hostname in groups.get('kvm_host', [])"
+      - "ansible_connection == 'local'"
+    fail_msg: "❌ ops_snapshot must run on kvm_host (local connection), never a guest."
+    success_msg: "✅ GUARD pass: running on the control host."
+  become: false
+
+# vm_name + label are required for snapshot/rollback (list can run fleet-wide).
+- name: "ops_snapshot | SAFETY GUARD — a declared lab VM + a clean label"
+  ansible.builtin.assert:
+    that:
+      - "vm_name is defined and vm_name | length > 0"
+      - "vm_name is match('^[A-Za-z0-9-]+-corp$')"            # lab VMs only; no wildcards
+      - "vm_name in groups.get('all', [])"                    # must be a declared inventory host
+      - "snapshot_label is defined and snapshot_label | length > 0"
+      - "snapshot_label is match('^[A-Za-z0-9._-]+$')"        # no path/space chars
+    fail_msg: |
+      ❌ REFUSING. snapshot/rollback need a declared '*-corp' vm_name and a clean
+      snapshot_label ([A-Za-z0-9._-]). vm_name={{ vm_name | default('UNDEFINED') }}
+      snapshot_label={{ snapshot_label | default('UNDEFINED') }}
+    success_msg: "✅ GUARD pass: {{ vm_name }} / label '{{ snapshot_label }}'."
+  become: false
+  when: ops_snapshot_action in ['snapshot', 'rollback']
+
+- name: "ops_snapshot | confirm the libvirt domain exists"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system domstate {{ vm_name }}"
+  register: r_domstate
+  changed_when: false
+  failed_when: r_domstate.rc != 0
+  when: ops_snapshot_action in ['snapshot', 'rollback']

@@ -1,0 +1,14 @@
+---
+# List disk-level snapshots under the disks pool (read-only). Optionally filter
+# by VM.
+#
+#   ansible-playbook playbooks/list-snapshots.yml
+#   ansible-playbook playbooks/list-snapshots.yml -e vm_name=ADDC01-corp
+
+- name: "List lab VM snapshots"
+  hosts: kvm_host
+  gather_facts: false
+  vars:
+    ops_snapshot_action: list
+  roles:
+    - ops_snapshot

@@ -1,0 +1,46 @@
+---
+# Resolve which disk images + NVRAM belong to this VM's snapshot set.
+# Shared by snapshot.yml and rollback.yml.
+
+- name: "ops_snapshot | list device='disk' images under the disks pool (excludes backup + cdroms)"
+  # domblklist --details columns: Type Device Target Source. Keep Device=disk
+  # whose Source is under the disks pool — that drops CD-ROMs (Device=cdrom)
+  # AND the backup disk (Source under /mnt/dc-backups, not the pool). No $? after
+  # the pipe; grep's no-match exit is swallowed by '|| true'.
+  ansible.builtin.shell:
+    cmd: >-
+      virsh -c qemu:///system domblklist "{{ vm_name }}" --details
+      | awk 'NR>2 && $2=="disk" {print $4}'
+      | grep -F "{{ snapshot_disks_pool }}/" || true
+  register: r_blk
+  changed_when: false
+
+- name: "ops_snapshot | compute OS disk, data disks, and the selected set"
+  ansible.builtin.set_fact:
+    snapshot_os_disk: "{{ snapshot_disks_pool }}/{{ vm_name }}.qcow2"
+    snapshot_data_disks: "{{ r_blk.stdout_lines | reject('equalto', snapshot_disks_pool ~ '/' ~ vm_name ~ '.qcow2') | list }}"
+    snapshot_nvram_path: "{{ snapshot_disks_pool }}/{{ vm_name }}_VARS.fd"
+
+- name: "ops_snapshot | assert the OS disk was found in the domain"
+  ansible.builtin.assert:
+    that: "snapshot_os_disk in r_blk.stdout_lines"
+    fail_msg: "OS disk {{ snapshot_os_disk }} not attached to {{ vm_name }}. Disks seen: {{ r_blk.stdout_lines }}"
+  become: false
+
+- name: "ops_snapshot | select disks to act on (OS always; data disks opt-in)"
+  ansible.builtin.set_fact:
+    snapshot_selected_disks: "{{ [snapshot_os_disk] + (snapshot_data_disks if (include_data_disks | bool) else []) }}"
+
+- name: "ops_snapshot | does the NVRAM file exist?"
+  ansible.builtin.stat:
+    path: "{{ snapshot_nvram_path }}"
+  register: r_nvram
+
+- name: "ops_snapshot | show the resolved snapshot set"
+  ansible.builtin.debug:
+    msg:
+      - "VM            : {{ vm_name }}"
+      - "OS disk       : {{ snapshot_os_disk }}"
+      - "Data disks    : {{ snapshot_data_disks }} (included: {{ include_data_disks | bool }})"
+      - "Selected      : {{ snapshot_selected_disks }}"
+      - "NVRAM         : {{ snapshot_nvram_path if (r_nvram.stat.exists and (snapshot_include_nvram | bool)) else '(none / skipped)' }}"

@@ -1,0 +1,21 @@
+---
+# Take a disk-level snapshot of a lab VM (ADR-008, amended M7). Host-side,
+# UNPRIVILEGED (virsh + cp + ~/vm-lab only); guarded to the control host + a
+# declared *-corp VM. Captures the OS disk + NVRAM by default.
+#
+#   ansible-playbook playbooks/snapshot.yml -e vm_name=ADDC01-corp -e snapshot_label=m7-complete
+#   # also capture data disks (e.g. WSUS, 172 GB):
+#   ansible-playbook playbooks/snapshot.yml -e vm_name=ADDC01-corp -e snapshot_label=m7-complete -e include_data_disks=true
+#   # replace an existing label:
+#   ... -e snapshot_overwrite=true
+#
+# NOTE: this shuts the VM down (graceful → destroy fallback) for the copy, then
+# restarts it. For the DC that briefly takes AD/DNS/DHCP offline.
+
+- name: "Snapshot a lab VM (disk-level cp)"
+  hosts: kvm_host
+  gather_facts: false
+  vars:
+    ops_snapshot_action: snapshot
+  roles:
+    - ops_snapshot

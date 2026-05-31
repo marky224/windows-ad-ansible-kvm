@@ -1,0 +1,54 @@
+---
+# Take a disk-level snapshot: quiesce → cp selected disks (+NVRAM) to .<label>
+# → qemu-img check → restart. See ADR-008 amendment.
+
+- ansible.builtin.import_tasks: resolve.yml
+
+- name: "ops_snapshot | check for an existing snapshot with this label"
+  ansible.builtin.stat:
+    path: "{{ item }}.{{ snapshot_label }}"
+  loop: "{{ snapshot_selected_disks }}"
+  register: r_existing
+
+- name: "ops_snapshot | refuse to clobber an existing label (unless snapshot_overwrite)"
+  ansible.builtin.assert:
+    that: "(r_existing.results | selectattr('stat.exists') | list | length == 0) or (snapshot_overwrite | bool)"
+    fail_msg: >-
+      Snapshot label '{{ snapshot_label }}' already exists for {{ vm_name }}
+      ({{ r_existing.results | selectattr('stat.exists') | map(attribute='item') | map('basename') | list }}).
+      Pass -e snapshot_overwrite=true to replace it.
+  become: false
+
+- ansible.builtin.import_tasks: quiesce.yml
+
+- name: "ops_snapshot | copy selected disks → .{{ snapshot_label }}"
+  ansible.builtin.command:
+    cmd: "cp -f --reflink=auto '{{ item }}' '{{ item }}.{{ snapshot_label }}'"
+  loop: "{{ snapshot_selected_disks }}"
+  changed_when: true
+
+- name: "ops_snapshot | copy NVRAM → .{{ snapshot_label }}"
+  ansible.builtin.command:
+    cmd: "cp -f '{{ snapshot_nvram_path }}' '{{ snapshot_nvram_path }}.{{ snapshot_label }}'"
+  changed_when: true
+  when: r_nvram.stat.exists and (snapshot_include_nvram | bool)
+
+- name: "ops_snapshot | qemu-img check each new disk snapshot"
+  ansible.builtin.command:
+    cmd: "qemu-img check '{{ item }}.{{ snapshot_label }}'"
+  loop: "{{ snapshot_selected_disks }}"
+  register: r_check
+  changed_when: false
+  failed_when: r_check.rc not in [0, 2]   # 0 = clean, 2 = benign leaked clusters
+
+- ansible.builtin.import_tasks: restart.yml
+
+- name: "ops_snapshot | snapshot summary"
+  ansible.builtin.debug:
+    msg:
+      - "✅ Snapshot '{{ snapshot_label }}' of {{ vm_name }}"
+      - "Disks       : {{ snapshot_selected_disks | map('basename') | list }} → .{{ snapshot_label }}"
+      - "NVRAM       : {{ (vm_name ~ '_VARS.fd.' ~ snapshot_label) if (r_nvram.stat.exists and (snapshot_include_nvram | bool)) else '(skipped)' }}"
+      - "Consistency : {{ snapshot_consistency }}"
+      - "Integrity   : {{ 'all qemu-img check clean' if (r_check.results | map(attribute='rc') | unique | list | sort == [0]) else 'qemu-img reported leaks (rc=2) — benign' }}"
+      - "VM state    : {{ 'restarted' if (snapshot_was_running | bool) else 'left stopped' }}"

@@ -183,6 +183,7 @@ ansible-playbook playbooks/site.yml
 | `domain_join_windows` | Win 11 client domain join (`microsoft.ad.membership`) into `OU=Workstations`; WinRM-only host-safety guard | ✅ |
 | `domain_join_linux` | Ubuntu domain join via `realmd` + `sssd` (Kerberos `canonicalize` for Server 2025 KDC); dual host-safety guards (SSH-only + anti-self) | ✅ |
 | `ops_backup` | AD state backup: `wbadmin` system-state → dedicated backup disk + config exports (GPO/CA/DHCP/DNS/csvde) zipped + WinRM `fetch`; guest-side, mount-sentinel guard (ADR-046) | ✅ |
+| `ops_snapshot` | Disk-level snapshot trio (`snapshot`/`list-snapshots`/`rollback`): OS disk + NVRAM cp (data disks opt-in), graceful→destroy quiesce, reversible+confirmed rollback (ADR-008) | ✅ |
 
 ## Playbooks
 

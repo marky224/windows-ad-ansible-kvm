@@ -1,0 +1,14 @@
+---
+# Restart the VM only if it was running before we quiesced it (leave a
+# deliberately-stopped VM stopped).
+
+- name: "ops_snapshot | restart {{ vm_name }} (it was running before)"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system start {{ vm_name }}"
+  changed_when: true
+  when: snapshot_was_running | bool
+
+- name: "ops_snapshot | note that {{ vm_name }} was left stopped"
+  ansible.builtin.debug:
+    msg: "{{ vm_name }} was not running before the operation — left stopped."
+  when: not (snapshot_was_running | bool)

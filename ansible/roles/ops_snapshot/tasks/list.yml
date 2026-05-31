@@ -1,0 +1,28 @@
+---
+# Read-only: enumerate disk-level snapshots under the disks pool. Optionally
+# filter by vm_name (a substring/regex match on the filename). No quiesce, no cp.
+
+- name: "ops_snapshot | find snapshot copies (*.qcow2.<label> + *_VARS.fd.<label>)"
+  ansible.builtin.find:
+    paths: "{{ snapshot_disks_pool }}"
+    patterns: ['*.qcow2.*', '*_VARS.fd.*']
+    file_type: file
+  register: r_snaps
+
+- name: "ops_snapshot | snapshots{{ (' matching ' ~ vm_name) if (vm_name | default('') | length > 0) else ' (all VMs)' }} — name · size · mtime"
+  ansible.builtin.debug:
+    msg: >-
+      {{ '%-48s %7sG  %s' | format(item.path | basename,
+         (item.size / 1073741824) | round(1),
+         '%Y-%m-%d %H:%M' | strftime(item.mtime)) }}
+  loop: "{{ r_snaps.files | sort(attribute='path') }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: (vm_name | default('') | length == 0) or (item.path | basename is search(vm_name))
+
+- name: "ops_snapshot | totals"
+  ansible.builtin.debug:
+    msg: >-
+      {{ r_snaps.files | length }} snapshot files,
+      {{ (r_snaps.files | map(attribute='size') | sum / 1073741824) | round(1) }} GB total
+      under {{ snapshot_disks_pool }}.
