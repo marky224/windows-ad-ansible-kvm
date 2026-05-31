@@ -1,0 +1,47 @@
+---
+# Resolve each target VM's ATTACHED in-pool disks (the live OS + data disks) and
+# build teardown_plan. domblklist returns only disks attached to the domain, so
+# the .<label> snapshot siblings in the same pool are NOT listed (preserved by
+# default). The backup disk under /mnt/dc-backups is outside the pool and is
+# likewise never surfaced. Same awk+grep approach as ops_snapshot/resolve.yml.
+
+- name: "ops_teardown | list each target's device='disk' images under the disks pool"
+  # domblklist --details cols: Type Device Target Source. Keep Device=disk whose
+  # Source is under the disks pool — drops CD-ROMs and the /mnt/dc-backups disk.
+  # No $? after the pipe; grep's no-match exit is swallowed by '|| true'.
+  ansible.builtin.shell:
+    cmd: >-
+      virsh -c qemu:///system domblklist "{{ item }}" --details
+      | awk 'NR>2 && $2=="disk" {print $4}'
+      | grep -F "{{ teardown_disks_pool }}/" || true
+  register: r_blk
+  changed_when: false
+  failed_when: false
+  loop: "{{ teardown_targets }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: "ops_teardown | read each target's libvirt domain state (existence check)"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system domstate {{ item }}"
+  register: r_state
+  changed_when: false
+  failed_when: false
+  loop: "{{ teardown_targets }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: "ops_teardown | build the teardown plan (vm, disks, nvram, exists, state)"
+  ansible.builtin.set_fact:
+    teardown_plan: >-
+      {{ teardown_plan | default([]) + [{
+        'vm': item,
+        'disks': r_blk.results[idx].stdout_lines,
+        'nvram': teardown_disks_pool ~ '/' ~ item ~ '_VARS.fd',
+        'exists': r_state.results[idx].rc == 0,
+        'state': (r_state.results[idx].stdout | trim) if r_state.results[idx].rc == 0 else 'absent'
+      }] }}
+  loop: "{{ teardown_targets }}"
+  loop_control:
+    index_var: idx
+    label: "{{ item }}"

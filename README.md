@@ -184,6 +184,8 @@ ansible-playbook playbooks/site.yml
 | `domain_join_linux` | Ubuntu domain join via `realmd` + `sssd` (Kerberos `canonicalize` for Server 2025 KDC); dual host-safety guards (SSH-only + anti-self) | ✅ |
 | `ops_backup` | AD state backup: `wbadmin` system-state → dedicated backup disk + config exports (GPO/CA/DHCP/DNS/csvde) zipped + WinRM `fetch`; guest-side, mount-sentinel guard (ADR-046) | ✅ |
 | `ops_snapshot` | Disk-level snapshot trio (`snapshot`/`list-snapshots`/`rollback`): OS disk + NVRAM cp (data disks opt-in), graceful→destroy quiesce, reversible+confirmed rollback (ADR-008) | ✅ |
+| `ops_firedrill` | Restore a DC snapshot/backup into an **isolated** sandbox, run the DC smoke checks, **always** tear down — proves recoverability without touching prod or the host (ADR-047) | ✅ |
+| `ops_teardown` | Destroy `*-corp` VMs + their live disks (preview unless `-e confirm=DESTROY`); `domblklist`-driven so `/mnt/dc-backups` + `.<label>` snapshots are preserved; opt-in network/snapshot purge (ADR-048) | ✅ |
 
 ## Playbooks
 

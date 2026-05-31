@@ -1,0 +1,62 @@
+---
+# Dispatch (ADR-048). Guard first (always) → resolve the target set + each VM's
+# ATTACHED disks → print the PREVIEW (armed or not) → act ONLY when armed
+# (confirm=DESTROY). Mirrors the ops_snapshot / ops_firedrill "guard-first" shape.
+
+- ansible.builtin.import_tasks: guard.yml
+
+- ansible.builtin.import_tasks: resolve.yml
+
+# --- PREVIEW (always shown; this IS the entire output of a dry run) ---
+- name: "ops_teardown | PREVIEW — summary"
+  ansible.builtin.debug:
+    msg:
+      - "—— TEARDOWN PREVIEW ——————————————————————————————"
+      - "Mode      : {{ 'ARMED — will DESTROY' if teardown_armed else 'PREVIEW only (not armed)' }}"
+      - "Targets   : {{ teardown_plan | length }} VM(s) — {{ teardown_plan | map(attribute='vm') | list | join(', ') }}"
+      - "Network   : {{ 'corp-lab WILL be destroyed' if (teardown_include_network | bool) else 'corp-lab preserved' }}"
+      - "Snapshots : {{ 'in-pool .<label> copies WILL be PURGED' if (teardown_purge_snapshots | bool) else 'preserved' }}"
+      - "Backups   : /mnt/dc-backups ALWAYS preserved (outside the disks pool)"
+
+- name: "ops_teardown | PREVIEW — per VM"
+  ansible.builtin.debug:
+    msg: >-
+      {{ tgt.vm }} [{{ tgt.state }}]{{ ' — NOT DEFINED in libvirt (nothing to destroy; disk files still cleaned if present)'
+         if not tgt.exists else '' }}
+      → disks: {{ (tgt.disks | join(', ')) if (tgt.disks | length > 0) else '(none attached under the pool)' }}
+      | NVRAM: {{ tgt.nvram }}
+  loop: "{{ teardown_plan }}"
+  loop_control:
+    loop_var: tgt
+    label: "{{ tgt.vm }}"
+
+- name: "ops_teardown | PREVIEW ONLY — not armed"
+  ansible.builtin.debug:
+    msg: >-
+      🛡️  PREVIEW ONLY — nothing was destroyed. Re-run with
+      -e confirm={{ teardown_confirm_token }} to execute the teardown shown above.
+  when: not teardown_armed
+
+# --- ACT (armed only) ---
+- name: "ops_teardown | tear down each target VM"
+  ansible.builtin.include_tasks: teardown-vm.yml
+  loop: "{{ teardown_plan }}"
+  loop_control:
+    loop_var: tgt
+    label: "{{ tgt.vm }}"
+  when: teardown_armed
+
+- name: "ops_teardown | tear down the corp-lab network (opt-in)"
+  ansible.builtin.import_tasks: network.yml
+  when:
+    - teardown_armed
+    - teardown_include_network | bool
+
+- name: "ops_teardown | DONE"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ TEARDOWN COMPLETE — destroyed {{ teardown_plan | map(attribute='vm') | list | join(', ') }}{{
+      ' + corp-lab network' if (teardown_include_network | bool) else '' }}.
+      Snapshots {{ 'PURGED' if (teardown_purge_snapshots | bool) else 'preserved' }};
+      /mnt/dc-backups untouched. Rebuild with playbooks/site.yml (or 00→99).
+  when: teardown_armed

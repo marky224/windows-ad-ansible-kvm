@@ -1,0 +1,100 @@
+---
+# Tear down ONE target VM (tgt). Re-assert the *-corp + in-pool invariants INLINE
+# — this file runs in a loop from main.yml, and an inline guard means no code path
+# can ever destroy a non-*-corp VM or delete a file outside the disks pool. virsh
+# ops are failed_when:false (idempotent: already-off / already-undefined are fine).
+# Disks come straight from domblklist (resolve.yml), so only ATTACHED images are
+# removed — the .<label> snapshot siblings survive unless teardown_purge_snapshots.
+
+- name: "ops_teardown | {{ tgt.vm }} | INLINE GUARD — *-corp + in-pool disks only"
+  ansible.builtin.assert:
+    that:
+      - "tgt.vm is match('^[A-Za-z0-9-]+-corp$')"
+      - "tgt.vm in groups.get('all', [])"
+      - "tgt.disks | reject('match', '^' ~ (teardown_disks_pool | regex_escape) ~ '/') | list | length == 0"
+    fail_msg: >-
+      ❌ REFUSING {{ tgt.vm }} — not a declared *-corp host, or a resolved disk
+      lies outside {{ teardown_disks_pool }}. Disks: {{ tgt.disks }}
+  become: false
+
+- name: "ops_teardown | {{ tgt.vm }} | destroy (force power-off; ok if already off)"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system destroy {{ tgt.vm }}"
+  register: r_destroy
+  changed_when: "'destroyed' in (r_destroy.stdout | default(''))"
+  failed_when: false
+
+- name: "ops_teardown | {{ tgt.vm }} | undefine (+nvram, +any managed-save / snapshot / checkpoint metadata)"
+  # --nvram is REQUIRED: every Windows VM has an OVMF varstore and `virsh undefine`
+  # FAILS without it (man virsh, libvirt 10.0.0). The three metadata flags make
+  # undefine robust if a VM ever carries a managedsave image / libvirt snapshot /
+  # checkpoint (none today — verified — but a teardown must never half-fail).
+  # TPM is deliberately NOT passed: the clients' emulator TPM has persistent_state
+  # unset (=no), so libvirt cleans the swtpm state itself on undefine, and undefine
+  # does NOT fail for TPM the way it does for nvram — so --tpm would only add a risk
+  # of erroring on the no-TPM DC. The disk-delete below is gated on the domain
+  # actually being gone, so a surprise undefine failure can't orphan a defined VM.
+  ansible.builtin.command:
+    cmd: >-
+      virsh -c qemu:///system undefine {{ tgt.vm }}
+      --nvram --managed-save --snapshots-metadata --checkpoints-metadata
+  register: r_undef
+  changed_when: "'undefined' in (r_undef.stdout | default(''))"
+  failed_when: false
+
+- name: "ops_teardown | {{ tgt.vm }} | VERIFY the domain is gone BEFORE deleting any disk"
+  # Idempotent gate: an absent domain (domstate rc!=0) is success; a STILL-defined
+  # domain means undefine failed — refuse to delete its disks (no half-state).
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system domstate {{ tgt.vm }}"
+  register: r_gone
+  changed_when: false
+  failed_when: false
+
+- name: "ops_teardown | {{ tgt.vm }} | assert undefine actually removed the domain"
+  ansible.builtin.assert:
+    that: "r_gone.rc != 0"
+    fail_msg: >-
+      ❌ {{ tgt.vm }} is STILL defined after undefine — refusing to delete its
+      disks (would orphan a defined domain pointing at deleted images).
+      undefine stderr: {{ r_undef.stderr | default('') }}
+    success_msg: "✅ {{ tgt.vm }} undefined; safe to delete its disks."
+  become: false
+
+- name: "ops_teardown | {{ tgt.vm }} | delete the live disk image(s)"
+  ansible.builtin.file:
+    path: "{{ disk }}"
+    state: absent
+  loop: "{{ tgt.disks }}"
+  loop_control:
+    loop_var: disk
+    label: "{{ disk }}"
+
+# undefine --nvram already removes the VARS file, but delete defensively in case
+# the domain was already gone (undefine no-op) yet the file lingered.
+- name: "ops_teardown | {{ tgt.vm }} | delete the NVRAM file if it lingers"
+  ansible.builtin.file:
+    path: "{{ tgt.nvram }}"
+    state: absent
+
+# --- Opt-in: purge the .<label> snapshot siblings of this VM's disks + NVRAM ---
+- name: "ops_teardown | {{ tgt.vm }} | find in-pool snapshot siblings"
+  ansible.builtin.find:
+    paths: "{{ teardown_disks_pool }}"
+    patterns: >-
+      {{ (tgt.disks | map('basename') | map('regex_replace', '$', '.*') | list)
+         + [(tgt.nvram | basename) ~ '.*'] }}
+    use_regex: false
+    file_type: file
+  register: r_snaps
+  when: teardown_purge_snapshots | bool
+
+- name: "ops_teardown | {{ tgt.vm }} | purge snapshot siblings"
+  ansible.builtin.file:
+    path: "{{ snap.path }}"
+    state: absent
+  loop: "{{ r_snaps.files | default([]) }}"
+  loop_control:
+    loop_var: snap
+    label: "{{ snap.path }}"
+  when: teardown_purge_snapshots | bool

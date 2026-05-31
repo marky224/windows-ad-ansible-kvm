@@ -1,0 +1,62 @@
+---
+# HOST-SAFETY GUARD (ADR-048 + [[feedback-never-touch-control-host]]). Runs on the
+# control host, never a guest; only ever destroys a declared *-corp VM + its
+# in-pool disks (+ opt-in corp-lab net / in-pool snapshots). `assert` neither
+# connects nor escalates, so a mis-target aborts BEFORE any virsh/file delete.
+# Mirrors the ops_snapshot / ops_firedrill guard style.
+
+- name: "ops_teardown | SAFETY GUARD — control host only"
+  ansible.builtin.assert:
+    that:
+      - "inventory_hostname in groups.get('kvm_host', [])"
+      - "ansible_connection == 'local'"
+    fail_msg: "❌ ops_teardown must run on kvm_host (local connection), never a guest."
+    success_msg: "✅ GUARD pass: running on the control host."
+  become: false
+
+# If a single VM was named, it must be a declared *-corp host (no wildcards).
+- name: "ops_teardown | SAFETY GUARD — named vm_name is a declared *-corp host"
+  ansible.builtin.assert:
+    that:
+      - "vm_name is match('^[A-Za-z0-9-]+-corp$')"
+      - "vm_name in groups.get('all', [])"
+    fail_msg: "❌ REFUSING. vm_name='{{ vm_name }}' must be a declared '*-corp' inventory host."
+    success_msg: "✅ GUARD pass: single target {{ vm_name }}."
+  become: false
+  when: vm_name | length > 0
+
+# Resolve the target set HERE so the next assert can vet every member.
+- name: "ops_teardown | resolve targets (named vm_name, else the declared *-corp fleet)"
+  ansible.builtin.set_fact:
+    teardown_targets: >-
+      {{ [vm_name] if (vm_name | length > 0)
+         else (groups.get('all', []) | select('match', '^[A-Za-z0-9-]+-corp$') | list) }}
+
+- name: "ops_teardown | SAFETY GUARD — non-empty, and EVERY target is a declared *-corp host"
+  ansible.builtin.assert:
+    that:
+      - "teardown_targets | length > 0"
+      - "teardown_targets | reject('match', '^[A-Za-z0-9-]+-corp$') | list | length == 0"
+      - "teardown_targets | difference(groups.get('all', [])) | length == 0"
+    fail_msg: >-
+      ❌ REFUSING. Target set must be non-empty and every member a declared
+      '*-corp' host. Resolved: {{ teardown_targets }}
+    success_msg: "✅ GUARD pass: {{ teardown_targets | length }} target(s): {{ teardown_targets | join(', ') }}."
+  become: false
+
+# Arm/preview decision. confirm='' => preview (valid). confirm==token => armed.
+# A non-empty, non-token confirm is a HARD ERROR — never a silent no-op
+# ([[feedback-powershell-silent-noop-defenses]] discipline, applied here).
+- name: "ops_teardown | compute armed-vs-preview"
+  ansible.builtin.set_fact:
+    teardown_armed: "{{ confirm == teardown_confirm_token }}"
+
+- name: "ops_teardown | confirm-token sanity"
+  ansible.builtin.assert:
+    that:
+      - "confirm | length == 0 or confirm == teardown_confirm_token"
+    fail_msg: >-
+      ❌ confirm='{{ confirm }}' is not the arming token. Pass exactly
+      -e confirm={{ teardown_confirm_token }} to execute, or omit it for a preview.
+    success_msg: "✅ {{ 'ARMED — confirm token matched' if teardown_armed else 'PREVIEW (not armed)' }}."
+  become: false

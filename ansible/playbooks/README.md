@@ -17,7 +17,7 @@ Each playbook is named `NN-verb-noun.yml`. The numeric prefix implies execution 
 | `list-snapshots.yml` | Enumerate snapshots |
 | `backup-ad.yml` | Run `ops_backup` role against the DC |
 | `fire-drill.yml` | Restore latest backup into a sandbox; run smoke test |
-| `teardown.yml` | Destroy all VMs (prompts for confirmation) |
+| `teardown.yml` | Destroy `*-corp` VMs + their live disks; preview unless `-e confirm=DESTROY`; preserves `/mnt/dc-backups` + `.<label>` snapshots (ADR-048) |
 | `site.yml` | Orchestrator: 00 → 99 end-to-end |
 
 Playbooks are implemented one at a time alongside the roles they consume. Initial commit (this scaffolding) ships only this README; playbook files arrive with their corresponding roles.

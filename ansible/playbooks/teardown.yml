@@ -1,0 +1,35 @@
+---
+# Tear down the corp lab — destroy *-corp VMs + their LIVE disks (ADR-048).
+# DESTRUCTIVE + GUARDED. Host-side, UNPRIVILEGED (virsh + file deletes under
+# ~/vm-lab/disks only). Mirrors snapshot.yml / rollback.yml; runs the ops_teardown
+# role on the control host.
+#
+# SAFE BY DEFAULT: with no `confirm`, it only PREVIEWS what would be destroyed.
+# Arm it with -e confirm=DESTROY. A wrong/typo'd confirm is a hard error, never a
+# silent no-op.
+#
+#   # preview the whole fleet (no changes):
+#   ansible-playbook playbooks/teardown.yml
+#
+#   # tear down the whole *-corp fleet + their live disks:
+#   ansible-playbook playbooks/teardown.yml -e confirm=DESTROY
+#
+#   # tear down a single VM:
+#   ansible-playbook playbooks/teardown.yml -e vm_name=CLIENT01-corp -e confirm=DESTROY
+#
+#   # also tear down the corp-lab network (00-libvirt-network.yml recreates it):
+#   ansible-playbook playbooks/teardown.yml -e confirm=DESTROY -e teardown_include_network=true
+#
+#   # also purge the in-pool .<label> snapshot copies (clean slate):
+#   ansible-playbook playbooks/teardown.yml -e confirm=DESTROY -e teardown_purge_snapshots=true
+#
+# ALWAYS PRESERVED: /mnt/dc-backups (the dedicated backup drive, ADR-046) and —
+# unless -e teardown_purge_snapshots=true — the .<label> snapshot copies in the
+# disks pool. Snapshots are siblings in ~/vm-lab/disks; teardown deletes only the
+# disks ATTACHED to each domain (virsh domblklist), so they survive by default.
+
+- name: "Tear down the corp lab (destroy *-corp VMs + live disks)"
+  hosts: kvm_host
+  gather_facts: false
+  roles:
+    - ops_teardown

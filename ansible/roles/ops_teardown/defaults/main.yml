@@ -1,0 +1,34 @@
+---
+# ops_teardown — destroy lab *-corp VMs + their LIVE disks, then OPTIONALLY the
+# corp-lab network and the in-pool .<label> snapshot copies. Host-side,
+# UNPRIVILEGED (virsh + file deletes under {{ vm_lab_root }}/disks only). See
+# ADR-048.
+#
+# HOST SAFETY ([[feedback-never-touch-control-host]], #1 priority): runs on
+# kvm_host, never a guest; the guard refuses anything but a declared *-corp VM and
+# never touches /mnt/dc-backups (it lives OUTSIDE the disks pool, so `virsh
+# domblklist` can't even surface it). Disk deletion is domblklist-driven — only
+# the images ATTACHED to each domain are removed, so the .<label> snapshot
+# siblings sitting in the same pool are preserved by default.
+
+# --- Confirmation gate (ADR-048) ---
+# Destructive. A run is "armed" ONLY when `confirm` equals this token; otherwise
+# it is a harmless PREVIEW that prints exactly what WOULD be destroyed and stops.
+# A non-empty `confirm` that is NOT the token is a hard error (no silent no-op).
+teardown_confirm_token: "DESTROY"
+confirm: ""                       # operator passes -e confirm=DESTROY to arm
+
+# --- Targeting ---
+# Empty vm_name => the whole declared *-corp fleet. Set -e vm_name=CLIENT01-corp
+# to tear down a single VM. Either way the guard requires a declared *-corp host.
+vm_name: ""
+
+# --- Scope (default = VMs + their live disks only) ---
+# Opt-in to widen the blast radius. /mnt/dc-backups is ALWAYS preserved.
+teardown_include_network: false   # also net-destroy/undefine corp-lab
+teardown_purge_snapshots: false   # also delete the .<label> snapshot siblings in the pool
+
+# --- Internal paths (NOT meant to be widened by the operator) ---
+teardown_disks_pool: "{{ vm_lab_root }}/disks"
+teardown_network_name: "{{ corp_subnet.libvirt_network_name }}"   # corp-lab
+teardown_backups_dir: "{{ backups_dir }}"                         # /mnt/dc-backups (NEVER touched)

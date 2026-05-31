@@ -1,0 +1,32 @@
+---
+# OPT-IN corp-lab network teardown (-e teardown_include_network=true). Re-assert
+# the exact prod net name INLINE — never 'default', never a *-firedrill net, only
+# the declared corp_subnet.libvirt_network_name. virsh ops failed_when:false.
+
+- name: "ops_teardown | NET GUARD — only ever the declared corp-lab network"
+  ansible.builtin.assert:
+    that:
+      - "teardown_network_name == corp_subnet.libvirt_network_name"
+      - "teardown_network_name is match('^[A-Za-z0-9-]+-lab$')"
+      - "teardown_network_name != 'default'"
+    fail_msg: "❌ REFUSING network teardown — '{{ teardown_network_name }}' is not the declared corp-lab network."
+    success_msg: "✅ NET GUARD pass: {{ teardown_network_name }}."
+  become: false
+
+- name: "ops_teardown | net-destroy corp-lab (if active)"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system net-destroy {{ teardown_network_name }}"
+  register: r_netdestroy
+  changed_when: "'destroyed' in (r_netdestroy.stdout | default(''))"
+  failed_when: false
+
+- name: "ops_teardown | net-undefine corp-lab (if defined)"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system net-undefine {{ teardown_network_name }}"
+  register: r_netundef
+  changed_when: "'undefined' in (r_netundef.stdout | default(''))"
+  failed_when: false
+
+- name: "ops_teardown | network teardown note"
+  ansible.builtin.debug:
+    msg: "🌐 corp-lab network destroyed + undefined. Recreate with playbooks/00-libvirt-network.yml."
