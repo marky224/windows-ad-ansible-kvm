@@ -1,0 +1,73 @@
+---
+# Copy the latest (or named) DC OS snapshot + matching NVRAM into the workdir.
+# FULL copy (not a backing-file overlay) so the sandbox is fully independent and
+# the snapshot base is never touched. Snapshots live in the disks pool.
+
+- name: "ops_firedrill | find OS-disk snapshots for {{ fire_drill_source_vm }}"
+  ansible.builtin.find:
+    paths: "{{ vm_lab_root }}/disks"
+    patterns: "{{ fire_drill_source_vm }}.qcow2.*"
+    excludes: "*-pre-rollback"
+    file_type: file
+  register: r_fd_snaps
+
+- name: "ops_firedrill | assert a snapshot exists to restore"
+  ansible.builtin.assert:
+    that: "r_fd_snaps.files | length > 0"
+    fail_msg: "No '{{ fire_drill_source_vm }}.qcow2.<label>' snapshots in {{ vm_lab_root }}/disks. Run snapshot.yml first."
+  become: false
+
+- name: "ops_firedrill | resolve the snapshot label to restore (newest by mtime unless named)"
+  ansible.builtin.set_fact:
+    fire_drill_resolved_label: >-
+      {{ fire_drill_label if (fire_drill_label | length > 0)
+         else (((r_fd_snaps.files | sort(attribute='mtime') | last).path | basename).split('.qcow2.')) | last }}
+
+- name: "ops_firedrill | set source + destination paths"
+  ansible.builtin.set_fact:
+    fire_drill_src_os: "{{ vm_lab_root }}/disks/{{ fire_drill_source_vm }}.qcow2.{{ fire_drill_resolved_label }}"
+    fire_drill_src_nvram: "{{ vm_lab_root }}/disks/{{ fire_drill_source_vm }}_VARS.fd.{{ fire_drill_resolved_label }}"
+    fire_drill_src_nvram_live: "{{ vm_lab_root }}/disks/{{ fire_drill_source_vm }}_VARS.fd"
+    fire_drill_os_disk: "{{ fire_drill_workdir }}/{{ fire_drill_vm_name }}.qcow2"
+    fire_drill_nvram_path: "{{ fire_drill_workdir }}/{{ fire_drill_vm_name }}_VARS.fd"
+
+- name: "ops_firedrill | assert the resolved OS-disk snapshot exists"
+  ansible.builtin.stat:
+    path: "{{ fire_drill_src_os }}"
+  register: r_fd_src_os
+
+- name: "ops_firedrill | fail clearly if the labeled OS snapshot is missing"
+  ansible.builtin.assert:
+    that: "r_fd_src_os.stat.exists"
+    fail_msg: "Snapshot OS disk {{ fire_drill_src_os | basename }} not found. Run list-snapshots.yml."
+  become: false
+
+- name: "ops_firedrill | does a label-matched NVRAM snapshot exist?"
+  ansible.builtin.stat:
+    path: "{{ fire_drill_src_nvram }}"
+  register: r_fd_nvram_snap
+
+- name: "ops_firedrill | copy snapshot OS disk → sandbox ({{ fire_drill_resolved_label }})"
+  ansible.builtin.command:
+    cmd: "cp -f --reflink=auto '{{ fire_drill_src_os }}' '{{ fire_drill_os_disk }}'"
+  changed_when: true
+
+- name: "ops_firedrill | copy NVRAM → sandbox (label-matched if present, else live)"
+  ansible.builtin.command:
+    cmd: "cp -f '{{ fire_drill_src_nvram if r_fd_nvram_snap.stat.exists else fire_drill_src_nvram_live }}' '{{ fire_drill_nvram_path }}'"
+  changed_when: true
+
+- name: "ops_firedrill | qemu-img check the restored OS disk"
+  ansible.builtin.command:
+    cmd: "qemu-img check '{{ fire_drill_os_disk }}'"
+  register: r_fd_check
+  changed_when: false
+  failed_when: r_fd_check.rc not in [0, 2]   # 0 = clean, 2 = benign leaked clusters
+
+- name: "ops_firedrill | snapshot restore summary"
+  ansible.builtin.debug:
+    msg:
+      - "Source label : {{ fire_drill_resolved_label }}"
+      - "OS disk      : {{ fire_drill_src_os | basename }} → {{ fire_drill_os_disk }}"
+      - "NVRAM        : {{ (fire_drill_src_nvram if r_fd_nvram_snap.stat.exists else fire_drill_src_nvram_live) | basename }}"
+      - "Integrity    : {{ 'clean' if r_fd_check.rc == 0 else 'benign leaks (rc=2)' }}"

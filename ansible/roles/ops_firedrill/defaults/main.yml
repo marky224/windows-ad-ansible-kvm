@@ -1,0 +1,62 @@
+---
+# ops_firedrill — restore a DC backup/snapshot into an ISOLATED sandbox, smoke-test
+# it, then tear it all down. See ADR-047. Host-side, UNPRIVILEGED (virsh/qemu-img/cp
+# + files under {{ vm_lab_root }}/firedrill only). Guarded to kvm_host + a declared
+# *-corp SOURCE VM; the sandbox + network are *-firedrill and teardown refuses
+# anything else, so a prod *-corp VM can never be destroyed.
+
+# Which artifact to restore: snapshot (default, validated) | backup (scaffold — see
+# ADR-047 Decision 5; validates the backup MEDIA, full DSRM restore is a follow-up).
+fire_drill_source: snapshot
+
+# The production VM whose backup/snapshot we drill. Must be a declared *-corp host.
+fire_drill_source_vm: ADDC01-corp
+
+# Snapshot label to restore (snapshot source). Empty => the newest
+# <source_vm>.qcow2.<label> by mtime, excluding *-pre-rollback copies.
+fire_drill_label: ""
+
+# Derived sandbox identity. Never ends in -corp, so *-corp tooling (snapshot /
+# rollback / teardown) can't touch it, and this role's teardown only ever acts on
+# a *-firedrill name.
+fire_drill_vm_name: "{{ fire_drill_source_vm | regex_replace('-corp$', '') }}-firedrill"
+
+# Per-run work area for the restored clones. ALWAYS wiped on teardown.
+fire_drill_workdir: "{{ vm_lab_root }}/firedrill"
+
+# Sandbox compute. Memory trimmed below the prod DC's 12 GB to stay gentle on the
+# daily-driver host; AD services are happy in 8 GB for a brief smoke test.
+fire_drill_memory_mb: 8192
+fire_drill_vcpus: 4
+
+# --- Isolated network (ADR-047) ---
+# A SEPARATE subnet so it never collides with corp-lab (10.10.0.0/24) or
+# virbr-corp's 10.10.0.1 on the host. No <forward> => no NAT, no route off the
+# bridge. dnsmasq DHCP pins the sandbox MAC to fire_drill_vm_ip.
+fire_drill_network_name: corp-firedrill
+fire_drill_bridge: virbr-fd
+fire_drill_net_gateway: 10.10.1.1
+fire_drill_net_netmask: 255.255.255.0
+fire_drill_dhcp_start: 10.10.1.50
+fire_drill_dhcp_end: 10.10.1.199
+fire_drill_vm_ip: 10.10.1.10                 # DHCP reservation for the sandbox NIC
+fire_drill_vm_mac: "52:54:00:fd:00:10"       # FRESH MAC => Windows sees a NEW NIC => DHCP
+
+# Firmware (mirrors the prod DC dumpxml: secure-boot pflash + the RESTORED NVRAM).
+fire_drill_ovmf_code: "/usr/share/OVMF/OVMF_CODE_4M.ms.fd"
+
+# Backup source: the prod backup qcow2 to COPY + drill (read-only; never mutated).
+fire_drill_backup_src: "{{ backups_dir }}/{{ fire_drill_source_vm }}-backup.qcow2"
+
+# Whether the domain XML renders the attached backup disk. Set true by
+# restore-backup.yml; false for the snapshot path.
+fire_drill_attach_backup_disk: false
+
+# WinRM identity for the restored sandbox — the post-promotion named admin
+# (RID 500 is hardened to break-glass, ADR-033). Same creds the snapshot baked in.
+fire_drill_winrm_user: "{{ named_admin.upn }}"
+fire_drill_winrm_pass: "{{ vault_named_admin_password }}"
+
+# Boot/connect waits.
+fire_drill_lease_retries: 24      # × 10s = up to 4 min for the NIC to DHCP
+fire_drill_winrm_timeout: 360     # seconds to wait for 5986 to open on the sandbox

@@ -1,0 +1,103 @@
+---
+# Fire-drill — restore a DC backup/snapshot into an ISOLATED sandbox, run the DC
+# health checks against it, then ALWAYS tear it down. The capstone that proves the
+# ops_backup / ops_snapshot artifacts are actually recoverable. See ADR-047 + the
+# ops_firedrill role README.
+#
+#   ansible-playbook playbooks/fire-drill.yml                          # latest snapshot
+#   ansible-playbook playbooks/fire-drill.yml -e fire_drill_label=m7-complete
+#   ansible-playbook playbooks/fire-drill.yml -e fire_drill_source=backup
+#
+# HOST SAFETY: host-side plays run on kvm_host (localhost) UNPRIVILEGED — only
+# virsh/qemu-img/cp + files under {{ vm_lab_root }}/firedrill, and an isolated
+# libvirt network. Never touches prod (*-corp) VMs, the corp-lab network, or
+# /mnt/dc-backups. The sandbox is a throwaway *-firedrill copy on an isolated net.
+
+# ===========================================================================
+# PLAY 1 — set up the sandbox (tears itself down + aborts if setup fails)
+# ===========================================================================
+- name: "Fire-drill — set up the isolated sandbox + restore"
+  hosts: kvm_host
+  gather_facts: false
+  tasks:
+    - name: "fire-drill | set up (guarded; tears down on any failure)"
+      block:
+        - ansible.builtin.include_role:
+            name: ops_firedrill          # main.yml: guard → network → restore → define+boot → add_host
+      rescue:
+        - name: "fire-drill | setup failed — tear the sandbox down"
+          ansible.builtin.include_role:
+            name: ops_firedrill
+            tasks_from: teardown.yml
+        - name: "fire-drill | abort after cleanup"
+          ansible.builtin.fail:
+            msg: "❌ Fire-drill SETUP failed — sandbox torn down. See the error above."
+
+# ===========================================================================
+# PLAY 2 — verify the restored DC over WinRM (never aborts; result captured)
+# ===========================================================================
+- name: "Fire-drill — verify the restored DC"
+  hosts: firedrill
+  gather_facts: false
+  # The sandbox's WinRM listener opens BEFORE AD/Netlogon is ready to validate a
+  # domain account, so the first connections come back 'credentials rejected' /
+  # unreachable. `ignore_unreachable` (a) lets the win_ping `until` loop retry until
+  # AD is up, and (b) — critically — keeps an unreachable sandbox from aborting the
+  # run before Play 3's teardown (rescue does NOT catch unreachable). See ADR-047.
+  ignore_unreachable: true
+  tasks:
+    - name: "fire-drill | verify (result recorded for the teardown play)"
+      block:
+        # Setup already gated on LDAP(389) + WinRM(5986). wait_for_connection retries
+        # the WinRM connection (the right tool — `until` does NOT retry an unreachable
+        # result) and only returns once a DOMAIN-AUTHENTICATED win_ping succeeds — which
+        # itself proves Netlogon is un-paused + advertising (a DC can be "running but
+        # paused" with TCP 389 already open, so the authenticated ping is the real
+        # auth-ready signal, not the port). Generous timeout for AD/Netlogon init.
+        - name: "fire-drill | wait until the sandbox authenticates over WinRM (Netlogon-ready)"
+          ansible.builtin.wait_for_connection:
+            timeout: 300
+            delay: 5
+            sleep: 10
+
+        - name: "fire-drill | run the shared domain-controller health checks"
+          ansible.builtin.include_tasks: tasks/smoke-dc.yml
+
+        - name: "fire-drill | validate backup media (backup source only)"
+          ansible.builtin.include_tasks: tasks/firedrill-backup-checks.yml
+          when: fire_drill_source | default('snapshot') == 'backup'
+
+        - name: "fire-drill | mark drill PASSED"
+          ansible.builtin.set_fact:
+            firedrill_passed: true
+      rescue:
+        - name: "fire-drill | mark drill FAILED"
+          ansible.builtin.set_fact:
+            firedrill_passed: false
+        - name: "fire-drill | note the failure (sandbox will still be torn down)"
+          ansible.builtin.debug:
+            msg: "❌ Fire-drill verification FAILED — see the error above. Tearing the sandbox down."
+
+# ===========================================================================
+# PLAY 3 — ALWAYS tear down, then report the verdict
+# ===========================================================================
+- name: "Fire-drill — teardown + verdict"
+  hosts: kvm_host
+  gather_facts: false
+  tasks:
+    - name: "fire-drill | tear down the sandbox + isolated network (always)"
+      ansible.builtin.include_role:
+        name: ops_firedrill
+        tasks_from: teardown.yml
+
+    # Resolve the sandbox host from the `firedrill` group (add_host'd in Play 1),
+    # not the role default — role defaults from include_role aren't in play scope here.
+    - name: "fire-drill | final verdict"
+      vars:
+        fd_host: "{{ groups['firedrill'] | default([]) | first | default('') }}"
+      ansible.builtin.assert:
+        that:
+          - "(fd_host | length > 0) and (hostvars[fd_host].firedrill_passed | default(false) | bool)"
+        fail_msg: "❌ FIRE-DRILL FAILED — the restored DC did not pass health checks (sandbox torn down)."
+        success_msg: "✅ FIRE-DRILL PASSED — restored DC came up healthy on the isolated network and was torn down."
+      become: false

@@ -1,0 +1,53 @@
+---
+# ALWAYS-run teardown (ADR-047 Decision 6). Idempotent + failsafe. Re-asserts the
+# *-firedrill naming guard INLINE — this file is also called directly via
+# tasks_from on fire-drill.yml's rescue/always paths, which bypass main.yml's guard.
+# Nothing here can touch a *-corp VM, the corp-lab network, or /mnt/dc-backups.
+
+- name: "ops_firedrill | TEARDOWN GUARD — only ever a *-firedrill sandbox + net + workdir"
+  ansible.builtin.assert:
+    that:
+      - "inventory_hostname in groups.get('kvm_host', [])"
+      - "ansible_connection == 'local'"
+      - "fire_drill_vm_name is match('^[A-Za-z0-9-]+-firedrill$')"
+      - "fire_drill_network_name is match('^[A-Za-z0-9-]+-firedrill$')"
+      - "'firedrill' in fire_drill_workdir"
+    fail_msg: "❌ REFUSING teardown — target is not an unambiguous *-firedrill sandbox/network/workdir."
+  become: false
+
+- name: "ops_firedrill | destroy the sandbox VM (if running)"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system destroy {{ fire_drill_vm_name }}"
+  register: r_td_destroy
+  changed_when: "'destroyed' in (r_td_destroy.stdout | default(''))"
+  failed_when: false
+
+- name: "ops_firedrill | undefine the sandbox VM + its NVRAM"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system undefine {{ fire_drill_vm_name }} --nvram"
+  register: r_td_undef
+  changed_when: "'undefined' in (r_td_undef.stdout | default(''))"
+  failed_when: false
+
+- name: "ops_firedrill | delete the per-run workdir (restored clones)"
+  ansible.builtin.file:
+    path: "{{ fire_drill_workdir }}"
+    state: absent
+
+- name: "ops_firedrill | destroy the isolated network (if active)"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system net-destroy {{ fire_drill_network_name }}"
+  register: r_td_netdestroy
+  changed_when: "'destroyed' in (r_td_netdestroy.stdout | default(''))"
+  failed_when: false
+
+- name: "ops_firedrill | undefine the isolated network (if defined)"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system net-undefine {{ fire_drill_network_name }}"
+  register: r_td_netundef
+  changed_when: "'undefined' in (r_td_netundef.stdout | default(''))"
+  failed_when: false
+
+- name: "ops_firedrill | teardown summary"
+  ansible.builtin.debug:
+    msg: "🧹 Torn down {{ fire_drill_vm_name }} + {{ fire_drill_network_name }}; workdir {{ fire_drill_workdir }} removed. Host + /mnt/dc-backups left untouched."

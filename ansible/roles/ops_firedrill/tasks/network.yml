@@ -1,0 +1,22 @@
+---
+# Create the isolated corp-firedrill network (idempotent). No <forward> element =>
+# fully isolated: the sandbox reaches the host bridge + nothing else (not corp-lab,
+# not the internet). dnsmasq pins the sandbox MAC to fire_drill_vm_ip.
+
+- name: "ops_firedrill | clear any stale {{ fire_drill_network_name }} from a crashed run"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system net-destroy {{ fire_drill_network_name }}"
+  register: r_fd_net_pre
+  changed_when: "'destroyed' in (r_fd_net_pre.stdout | default(''))"
+  failed_when: false
+
+- name: "ops_firedrill | define isolated network {{ fire_drill_network_name }}"
+  community.libvirt.virt_net:
+    command: define
+    name: "{{ fire_drill_network_name }}"
+    xml: "{{ lookup('template', 'firedrill-net.xml.j2') }}"
+
+- name: "ops_firedrill | start {{ fire_drill_network_name }}"
+  community.libvirt.virt_net:
+    name: "{{ fire_drill_network_name }}"
+    state: active

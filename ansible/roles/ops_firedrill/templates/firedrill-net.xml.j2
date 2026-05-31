@@ -1,0 +1,14 @@
+<network>
+  <name>{{ fire_drill_network_name }}</name>
+  <bridge name='{{ fire_drill_bridge }}' stp='on' delay='0'/>
+  <mac address='52:54:00:fd:00:01'/>
+  {# No <forward> element => fully ISOLATED: the sandbox reaches the host bridge   #}
+  {# and other guests on this net only — never corp-lab or the internet (ADR-047). #}
+  <ip address='{{ fire_drill_net_gateway }}' netmask='{{ fire_drill_net_netmask }}'>
+    <dhcp>
+      <range start='{{ fire_drill_dhcp_start }}' end='{{ fire_drill_dhcp_end }}'/>
+      {# Pin the sandbox NIC to a known IP so the control host can WinRM straight to it. #}
+      <host mac='{{ fire_drill_vm_mac }}' name='{{ fire_drill_vm_name }}' ip='{{ fire_drill_vm_ip }}'/>
+    </dhcp>
+  </ip>
+</network>

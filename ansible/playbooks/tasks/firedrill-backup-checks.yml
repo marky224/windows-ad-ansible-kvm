@@ -1,0 +1,33 @@
+---
+# Backup-MEDIA validation for fire_drill_source=backup (ADR-047 Decision 5) — SCAFFOLD.
+# Runs against the sandbox over WinRM; a COPY of the backup qcow2 is attached (NTFS
+# label 'DCBackup'). This REPORTS the wbadmin system-state versions found; it is
+# deliberately NON-GATING, because copying the backup qcow2 while the production DC
+# has it mounted yields a crash-consistent NTFS that wbadmin may not read cleanly
+# (validation 2026-05-31 found 0 enumerable versions this way). Making the media
+# reliably readable (quiesce/snapshot the backup volume before copy) and a full
+# `wbadmin start systemstaterecovery` via DSRM are the documented next iterations.
+
+- name: "fire-drill | locate the backup volume + enumerate wbadmin versions"
+  ansible.windows.win_powershell:
+    script: |
+      $vol = Get-Volume | Where-Object { $_.FileSystemLabel -eq 'DCBackup' } | Select-Object -First 1
+      $letter = if ($vol -and $vol.DriveLetter) { "$($vol.DriveLetter):" } else { 'E:' }
+      $raw = (wbadmin get versions -backupTarget:$letter) 2>&1 | Out-String
+      $count = ([regex]::Matches($raw, 'Version identifier')).Count
+      $Ansible.Changed = $false
+      $Ansible.Result = @{ Drive = $letter; VersionCount = $count; Raw = $raw.Trim() }
+  register: r_fd_ver
+  changed_when: false
+  failed_when: false
+
+- name: "fire-drill | backup-media validation (SCAFFOLD — informational, non-gating)"
+  ansible.builtin.debug:
+    msg:
+      - "Backup volume     : {{ r_fd_ver.result.Drive | default('E:') }}"
+      - "System-state vers : {{ r_fd_ver.result.VersionCount | default(0) }}"
+      - >-
+        {{ ('✅ backup media readable — ' ~ (r_fd_ver.result.VersionCount | string) ~ ' recovery point(s) enumerable')
+           if ((r_fd_ver.result.VersionCount | default(0)) | int >= 1)
+           else '⚠️ no recovery points enumerable from this LIVE-copied backup volume — crash-consistent NTFS that wbadmin may not read. ITERATION: quiesce/snapshot the backup volume before copying (ADR-047).' }}
+      - "Full `wbadmin start systemstaterecovery` via DSRM is the deferred next step (ADR-047)."

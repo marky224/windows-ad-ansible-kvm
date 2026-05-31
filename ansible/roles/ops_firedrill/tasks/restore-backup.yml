@@ -1,0 +1,61 @@
+---
+# BACKUP SOURCE (scaffold — ADR-047 Decision 5). A full `wbadmin systemstaterecovery`
+# needs a same-version Windows to restore INTO + a DSRM boot, which is its own
+# milestone. This path therefore:
+#   (a) clones the latest snapshot as a bootable, same-version base (reuses
+#       restore-snapshot.yml), then
+#   (b) attaches a COPY of the backup qcow2 so the verify play can VALIDATE the
+#       backup MEDIA (wbadmin versions + the config-export zip) over WinRM.
+# The prod backup qcow2 on /mnt/dc-backups is only ever READ (copied), never mutated.
+
+- name: "ops_firedrill | confirm the backup drive is mounted (read-only check)"
+  ansible.builtin.command:
+    cmd: "mountpoint -q '{{ backups_dir }}'"
+  changed_when: false
+
+- name: "ops_firedrill | stat the production backup qcow2"
+  ansible.builtin.stat:
+    path: "{{ fire_drill_backup_src }}"
+  register: r_fd_bkp
+
+- name: "ops_firedrill | assert the backup qcow2 exists"
+  ansible.builtin.assert:
+    that: "r_fd_bkp.stat.exists"
+    fail_msg: "Backup qcow2 {{ fire_drill_backup_src }} not found — run backup-ad.yml first."
+  become: false
+
+# Bootable, same-version base + OS/NVRAM clone (sets fire_drill_os_disk / _nvram_path).
+- ansible.builtin.import_tasks: restore-snapshot.yml
+
+- name: "ops_firedrill | set backup-disk paths + render flag"
+  ansible.builtin.set_fact:
+    fire_drill_backup_disk: "{{ fire_drill_workdir }}/{{ fire_drill_vm_name }}-backup.qcow2"
+    fire_drill_attach_backup_disk: true
+
+- name: "ops_firedrill | copy the backup qcow2 → sandbox (source is read-only)"
+  ansible.builtin.command:
+    cmd: "cp -f --reflink=auto '{{ fire_drill_backup_src }}' '{{ fire_drill_backup_disk }}'"
+  changed_when: true
+
+- name: "ops_firedrill | find the newest config-export zip"
+  ansible.builtin.find:
+    paths: "{{ backups_dir }}"
+    patterns: "*.zip"
+    file_type: file
+  register: r_fd_zips
+
+- name: "ops_firedrill | integrity-test the newest config-export zip (best-effort)"
+  ansible.builtin.command:
+    cmd: "unzip -t '{{ (r_fd_zips.files | sort(attribute='mtime') | last).path }}'"
+  register: r_fd_ziptest
+  changed_when: false
+  failed_when: false
+  when: r_fd_zips.files | length > 0
+
+- name: "ops_firedrill | backup restore summary"
+  ansible.builtin.debug:
+    msg:
+      - "Base (bootable) : snapshot {{ fire_drill_resolved_label }} → {{ fire_drill_os_disk }}"
+      - "Backup media    : {{ fire_drill_backup_src | basename }} → {{ fire_drill_backup_disk }} (attached as sdf/E:)"
+      - "Config zip      : {{ ((r_fd_zips.files | sort(attribute='mtime') | last).path | basename) if (r_fd_zips.files | length > 0) else '(none found)' }}{{ ' — unzip -t ok' if (r_fd_ziptest.rc | default(1)) == 0 else (' — unzip -t FAILED/skipped' if (r_fd_zips.files | length > 0) else '') }}"
+      - "NOTE            : full wbadmin systemstaterecovery (DSRM) is the documented next iteration — ADR-047. This path validates the backup MEDIA + boots a same-version base."

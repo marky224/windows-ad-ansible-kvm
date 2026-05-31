@@ -1,0 +1,89 @@
+<domain type='kvm'>
+  {# Mirrors the prod DC's boot-critical shape (captured from `virsh dumpxml         #}
+  {# ADDC01-corp`, 2026-05-31) so the restored disk boots identically: q35, OVMF     #}
+  {# secure-boot pflash + the RESTORED NVRAM, hyperv custom, smm, host-passthrough,   #}
+  {# localtime, virtio-scsi. New name/UUID + a FRESH NIC MAC; WSUS/backup disks +     #}
+  {# install CDs dropped. No TPM — the live DC runs without one. See ADR-047.         #}
+  <name>{{ fire_drill_vm_name }}</name>
+  {# Fresh VM-GenerationID: a modern Windows DC (Server 2016+) reads this and, seeing #}
+  {# it differ from the value baked into the cloned NTDS.dit, resets its InvocationID #}
+  {# + discards the RID pool on boot — AD's own "I was restored" safeguard. Pure       #}
+  {# defense-in-depth BEHIND the network isolation (which already prevents USN         #}
+  {# rollback). Auto-generated each define. See ADR-047 (validation).                  #}
+  <genid/>
+  <memory unit='MiB'>{{ fire_drill_memory_mb }}</memory>
+  <currentMemory unit='MiB'>{{ fire_drill_memory_mb }}</currentMemory>
+  <vcpu placement='static'>{{ fire_drill_vcpus }}</vcpu>
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <loader readonly='yes' secure='yes' type='pflash'>{{ fire_drill_ovmf_code }}</loader>
+    <nvram>{{ fire_drill_nvram_path }}</nvram>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+    </hyperv>
+    <vmport state='off'/>
+    <smm state='on'/>
+  </features>
+  <cpu mode='host-passthrough' check='none' migratable='on'/>
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='hypervclock' present='yes'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <controller type='scsi' index='0' model='virtio-scsi'/>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='{{ fire_drill_os_disk }}'/>
+      <target dev='sda' bus='scsi'/>
+    </disk>
+{% if fire_drill_attach_backup_disk | default(false) %}
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none'/>
+      <source file='{{ fire_drill_backup_disk }}'/>
+      <target dev='sdf' bus='scsi'/>
+    </disk>
+{% endif %}
+    {# TWO NICs for reachability (ADR-047, revised). Windows keys IP config to the   #}
+    {# adapter's PCI/PnP identity, NOT the MAC — so the clone keeps its STATIC        #}
+    {# 10.10.0.10 on whichever NIC matches its known adapter. NIC0 carries the source #}
+    {# DC's ORIGINAL MAC to absorb that match (parked, off-subnet on this bridge);    #}
+    {# NIC1's FRESH MAC is a genuinely new adapter → DHCPs onto the isolated subnet,  #}
+    {# which is how the control host reaches it.                                      #}
+    <interface type='network'>
+      <mac address='{{ fire_drill_orig_mac }}'/>
+      <source network='{{ fire_drill_network_name }}'/>
+      <model type='virtio'/>
+    </interface>
+    <interface type='network'>
+      <mac address='{{ fire_drill_vm_mac }}'/>
+      <source network='{{ fire_drill_network_name }}'/>
+      <model type='virtio'/>
+    </interface>
+    <input type='tablet' bus='usb'/>
+    <graphics type='spice' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+      <image compression='off'/>
+    </graphics>
+    <video>
+      <model type='qxl'/>
+    </video>
+    <memballoon model='virtio'/>
+  </devices>
+</domain>

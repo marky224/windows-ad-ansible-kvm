@@ -1,0 +1,15 @@
+---
+# Dispatch the restore to the requested source. Both paths land a bootable OS disk
+# + NVRAM in the per-run workdir and set fire_drill_os_disk / fire_drill_nvram_path.
+
+- name: "ops_firedrill | ensure the per-run workdir exists"
+  ansible.builtin.file:
+    path: "{{ fire_drill_workdir }}"
+    state: directory
+    mode: "0755"
+
+- ansible.builtin.import_tasks: restore-snapshot.yml
+  when: fire_drill_source == 'snapshot'
+
+- ansible.builtin.import_tasks: restore-backup.yml
+  when: fire_drill_source == 'backup'

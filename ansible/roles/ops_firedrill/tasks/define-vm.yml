@@ -1,0 +1,119 @@
+---
+# Define + boot the sandbox from the restored disk on the isolated network, discover
+# its DHCP IP, then register it (add_host) for the verify play.
+#
+# REACHABILITY (ADR-047, revised after the first validation run). Windows binds a
+# NIC's IP config to the adapter's PCI/PnP identity, NOT its MAC — so a cloned DC
+# with only a changed MAC keeps its STATIC 10.10.0.10 and never DHCPs (proven: zero
+# lease in run 1, DC sitting at the login screen). Fix: give the sandbox TWO NICs —
+# NIC0 with the source VM's ORIGINAL MAC (Windows matches it to the clone's known
+# adapter → keeps the static IP, parked on the isolated bridge) and NIC1 with a
+# FRESH MAC (a genuinely new adapter → DHCP onto the isolated subnet). We connect to
+# whatever lease appears. 'WinRM HTTPS-In' is Profile=Any + listener Address=*, so
+# reachability needs no NLA cooperation.
+
+- name: "ops_firedrill | capture the source VM's NIC MAC (NIC0 = the clone's known adapter)"
+  ansible.builtin.shell:
+    cmd: "virsh -c qemu:///system domiflist {{ fire_drill_source_vm }} | awk 'NR>2 && NF>=5 {print $5; exit}'"
+  register: r_fd_srcmac
+  changed_when: false
+
+- name: "ops_firedrill | set the original MAC"
+  ansible.builtin.set_fact:
+    fire_drill_orig_mac: "{{ r_fd_srcmac.stdout | trim }}"
+
+- name: "ops_firedrill | assert we captured a valid source MAC"
+  ansible.builtin.assert:
+    that: "fire_drill_orig_mac is match('^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$')"
+    fail_msg: "Could not read {{ fire_drill_source_vm }}'s NIC MAC (got '{{ fire_drill_orig_mac | default('') }}')."
+  become: false
+
+- name: "ops_firedrill | remove any stale sandbox domain from a prior run"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system undefine {{ fire_drill_vm_name }} --nvram"
+  register: r_fd_pre_undef
+  changed_when: "'undefined' in (r_fd_pre_undef.stdout | default(''))"
+  failed_when: false
+
+- name: "ops_firedrill | render the sandbox domain XML (2 NICs)"
+  ansible.builtin.template:
+    src: firedrill-domain.xml.j2
+    dest: "{{ fire_drill_workdir }}/{{ fire_drill_vm_name }}.xml"
+    mode: "0644"
+
+- name: "ops_firedrill | define the sandbox domain"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system define '{{ fire_drill_workdir }}/{{ fire_drill_vm_name }}.xml'"
+  changed_when: true
+
+- name: "ops_firedrill | start the sandbox {{ fire_drill_vm_name }}"
+  ansible.builtin.command:
+    cmd: "virsh -c qemu:///system start {{ fire_drill_vm_name }}"
+  changed_when: true
+
+- name: "ops_firedrill | wait for the sandbox to take a DHCP lease on {{ fire_drill_network_name }}"
+  # Prefer the fresh-MAC (reserved 10.10.1.10) lease; fall back to ANY ipv4 lease on
+  # the isolated net (the sandbox is the only guest there). No-match awk exits 0.
+  ansible.builtin.shell:
+    cmd: |
+      LEASES=$(virsh -c qemu:///system net-dhcp-leases {{ fire_drill_network_name }})
+      IP=$(echo "$LEASES" | awk -v m='{{ fire_drill_vm_mac }}' 'tolower($0) ~ tolower(m) {print $5}' | cut -d/ -f1 | head -1)
+      [ -z "$IP" ] && IP=$(echo "$LEASES" | awk '/ipv4/ {print $5}' | cut -d/ -f1 | head -1)
+      echo "$IP"
+  register: r_fd_lease
+  until: "(r_fd_lease.stdout | trim) | length > 0"
+  retries: "{{ fire_drill_lease_retries | int }}"
+  delay: 10
+  changed_when: false
+  failed_when: false
+
+- name: "ops_firedrill | resolve the sandbox IP from the lease"
+  ansible.builtin.set_fact:
+    fire_drill_vm_ip_actual: "{{ r_fd_lease.stdout | trim }}"
+
+- name: "ops_firedrill | assert a DHCP lease appeared (else the clone kept a static IP)"
+  ansible.builtin.assert:
+    that: "(fire_drill_vm_ip_actual | default('')) | length > 0"
+    fail_msg: >-
+      Sandbox took NO DHCP lease on {{ fire_drill_network_name }} after
+      {{ (fire_drill_lease_retries | int) * 10 }}s — the cloned DC may have kept a
+      static IP on every NIC. Inspect the SPICE console / `virsh domiflist`.
+  become: false
+
+- name: "ops_firedrill | wait for WinRM (5986) to open on {{ fire_drill_vm_ip_actual }}"
+  ansible.builtin.wait_for:
+    host: "{{ fire_drill_vm_ip_actual }}"
+    port: 5986
+    timeout: "{{ fire_drill_winrm_timeout | int }}"
+    delay: 5
+
+# The WinRM listener opens well before AD is ready to validate a domain account,
+# so gate on LDAP (389) too: once NTDS is listening, Netlogon can authenticate the
+# named admin. This is the real "DC is up" signal (a connectivity check — no auth,
+# no ambiguity). Without it the verify play connects too early → 'credentials
+# rejected'. See ADR-047 (validation).
+- name: "ops_firedrill | wait for AD/LDAP (389) — the Netlogon-readiness gate"
+  ansible.builtin.wait_for:
+    host: "{{ fire_drill_vm_ip_actual }}"
+    port: 389
+    timeout: "{{ fire_drill_winrm_timeout | int }}"
+    delay: 5
+
+- name: "ops_firedrill | register the sandbox for the verify play"
+  ansible.builtin.add_host:
+    name: "{{ fire_drill_vm_name }}"
+    groups: firedrill
+    ansible_host: "{{ fire_drill_vm_ip_actual }}"
+    ansible_connection: winrm
+    ansible_port: 5986
+    ansible_winrm_transport: ntlm
+    ansible_winrm_scheme: https
+    ansible_winrm_server_cert_validation: ignore
+    ansible_user: "{{ fire_drill_winrm_user }}"
+    ansible_password: "{{ fire_drill_winrm_pass }}"
+    fire_drill_source: "{{ fire_drill_source }}"
+  changed_when: false
+
+- name: "ops_firedrill | sandbox is up"
+  ansible.builtin.debug:
+    msg: "🚀 {{ fire_drill_vm_name }} booted on {{ fire_drill_network_name }} at {{ fire_drill_vm_ip_actual }}; WinRM open. Verifying…"

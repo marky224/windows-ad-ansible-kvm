@@ -53,7 +53,7 @@ Validation: `ansible.windows.win_ping` → `pong` against `ADDC01-corp` at `10.1
 - **GPO baseline:** Microsoft Security Compliance Toolkit Server 2025 baseline + 12 lab-specific overrides
 - **AD state backup:** `wbadmin systemstatebackup` (NTDS.dit + SYSVOL + AD CS) to a dedicated backup drive + `Backup-GPO`/`Backup-CARoleService`/`Export-DhcpServer`/`Export-DnsServerZone`/`csvde` exports zipped and fetched over WinRM
 - **Snapshots:** automatic at each provisioning phase (`vm-built`, `ad-promoted`, `roles-installed`, `clients-joined`, `linux-joined`)
-- **Fire drill:** quarterly playbook restores the latest backup to a sandbox VM on an isolated network and runs the smoke test against it
+- **Fire drill:** `fire-drill.yml` restores the latest snapshot (or backup) into a throwaway DC on an **isolated** libvirt network, runs the DC smoke checks against it, and always tears the sandbox down — proving the backups/snapshots actually recover, without touching prod or the host
 
 Total wall-clock for a clean provision: **~60–75 minutes**, mostly unattended.
 

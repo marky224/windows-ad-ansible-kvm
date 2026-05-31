@@ -1,0 +1,41 @@
+---
+# HOST-SAFETY GUARD (ADR-047 + [[feedback-never-touch-control-host]]). Runs on the
+# control host, never a guest; only ever creates/destroys a *-firedrill sandbox +
+# the corp-firedrill network + files under {{ fire_drill_workdir }}. `assert`
+# neither connects nor escalates, so a mis-target aborts before any virsh/qemu-img/cp.
+
+- name: "ops_firedrill | SAFETY GUARD — control host only"
+  ansible.builtin.assert:
+    that:
+      - "inventory_hostname in groups.get('kvm_host', [])"
+      - "ansible_connection == 'local'"
+    fail_msg: "❌ ops_firedrill must run on kvm_host (local connection), never a guest."
+    success_msg: "✅ GUARD pass: running on the control host."
+  become: false
+
+- name: "ops_firedrill | SAFETY GUARD — sandbox is *-firedrill, source is a declared *-corp"
+  ansible.builtin.assert:
+    that:
+      - "fire_drill_vm_name is match('^[A-Za-z0-9-]+-firedrill$')"        # never a *-corp prod VM
+      - "fire_drill_network_name is match('^[A-Za-z0-9-]+-firedrill$')"
+      - "fire_drill_source_vm is match('^[A-Za-z0-9-]+-corp$')"
+      - "fire_drill_source_vm in groups.get('all', [])"                  # a declared inventory host
+      - "fire_drill_source in ['snapshot', 'backup']"
+    fail_msg: |
+      ❌ REFUSING. Sandbox VM ({{ fire_drill_vm_name }}) + network
+      ({{ fire_drill_network_name }}) must be *-firedrill; source VM
+      ({{ fire_drill_source_vm }}) must be a declared *-corp host;
+      fire_drill_source ({{ fire_drill_source }}) must be snapshot|backup.
+    success_msg: "✅ GUARD pass: {{ fire_drill_source }} drill of {{ fire_drill_source_vm }} → {{ fire_drill_vm_name }}."
+  become: false
+
+- name: "ops_firedrill | SAFETY GUARD — isolated net is disjoint from corp-lab"
+  ansible.builtin.assert:
+    that:
+      - "fire_drill_network_name != corp_subnet.libvirt_network_name"
+      - "fire_drill_bridge != corp_subnet.libvirt_bridge"
+      - "fire_drill_vm_ip.split('.')[0:3] != corp_subnet.dc_ip.split('.')[0:3]"
+      - "fire_drill_net_gateway.split('.')[0:3] != corp_subnet.gateway.split('.')[0:3]"
+    fail_msg: "❌ REFUSING: fire-drill network/IP overlaps production corp-lab — ADR-047 requires a separate subnet."
+    success_msg: "✅ GUARD pass: {{ fire_drill_network_name }} ({{ fire_drill_net_gateway }}/{{ fire_drill_bridge }}) is disjoint from corp-lab."
+  become: false

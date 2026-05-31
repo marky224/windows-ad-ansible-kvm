@@ -1,0 +1,10 @@
+---
+# ops_firedrill SETUP flow: guard → isolated network → restore clone → define+boot
+# → register the sandbox for the verify play. TEARDOWN lives in tasks/teardown.yml
+# and is invoked on the rescue/always paths by fire-drill.yml (so it always runs,
+# even if setup fails). See ADR-047.
+
+- ansible.builtin.import_tasks: guard.yml
+- ansible.builtin.import_tasks: network.yml
+- ansible.builtin.import_tasks: restore.yml
+- ansible.builtin.import_tasks: define-vm.yml
