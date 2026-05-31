@@ -128,13 +128,19 @@
           $cert = Get-ChildItem Cert:\LocalMachine\My |
                   Where-Object { $_.Issuer -match 'CORP-ADDC01-CA' -and $_.HasPrivateKey } |
                   Select-Object -First 1
+          # Workstation Authentication certs leave the Subject DN empty (identity
+          # is carried in the SAN), so fall back to the SAN DNS name(s) for a
+          # meaningful label — otherwise a PASSING run prints 'machine cert []'.
+          $certName = if (-not $cert) { '' }
+                      elseif ($cert.Subject) { $cert.Subject }
+                      else { 'SAN=' + (@($cert.DnsNameList | ForEach-Object { $_.Unicode }) -join ',') }
           $Ansible.Changed = $false
           $Ansible.Result = @{
             PartOfDomain = [bool]$cs.PartOfDomain
             Domain       = $cs.Domain
             DnsServers   = @($dns)
             HasMachineCert = [bool]$cert
-            CertSubject  = if ($cert) { $cert.Subject } else { '' }
+            CertSubject  = $certName
           }
       register: r_client
       changed_when: false
