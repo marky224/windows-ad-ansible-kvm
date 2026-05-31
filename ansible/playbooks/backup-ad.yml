@@ -1,0 +1,40 @@
+---
+# Back up AD state from ADDC01: system-state (NTDS.dit + SYSVOL + registry +
+# AD CS) via wbadmin to the dedicated backup drive, plus small config exports
+# (GPO/CA/DHCP/DNS/AD objects) fetched over WinRM. See ADR-046 (amends ADR-017).
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ HOST SAFETY — scoped to the `dc` group ONLY, over WinRM. The control host │
+# │ is ansible_connection=local and is NOT in `dc`. The ops_backup role's     │
+# │ libvirt-side tasks are delegate_to: localhost + unprivileged (qemu-img/   │
+# │ virsh only); the role's mount sentinel refuses to write unless the        │
+# │ dedicated backup drive is mounted. Ansible never edits host /etc.         │
+# │                                                                            │
+# │ PREREQ: mount the dedicated backup drive once, by hand (PREREQUISITES.md  │
+# │ 'Dedicated backup drive'). Preview before running:                        │
+# │   ansible-playbook playbooks/backup-ad.yml --list-hosts                    │
+# │   ansible-playbook playbooks/backup-ad.yml --check                         │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Run: ansible-playbook playbooks/backup-ad.yml
+
+- name: "Back up AD state (ADDC01)"
+  hosts: dc
+  gather_facts: false
+  # wbadmin systemstatebackup runs synchronously and can take several minutes;
+  # widen the WinRM timeouts so the single long operation survives. (operation
+  # must be < read.)
+  vars:
+    ansible_winrm_read_timeout_sec: 1200
+    ansible_winrm_operation_timeout_sec: 1100
+  pre_tasks:
+    - name: "backup-ad | belt-and-suspenders host-safety assert"
+      ansible.builtin.assert:
+        that:
+          - "inventory_hostname in groups.get('dc', [])"
+          - "ansible_connection != 'local'"
+          - "inventory_hostname not in groups.get('kvm_host', [])"
+        fail_msg: "REFUSING: backup-ad must target the dc group over WinRM only — never the control host."
+      become: false
+  roles:
+    - ops_backup

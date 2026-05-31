@@ -1,0 +1,325 @@
+---
+# Back up AD state from the DC. Runs inside a play targeting `hosts: dc`.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ HOST SAFETY (see feedback-never-touch-control-host + ADR-046)             │
+# │  - The play targets the DC (a guest), over WinRM, never the control host. │
+# │  - The libvirt-side tasks (qemu-img/virsh) are delegate_to: localhost,    │
+# │    become: false — unprivileged VM-lifecycle only, mirroring ad_wsus      │
+# │    (ADR-039). They write ONLY the backup qcow2 under backups_dir.         │
+# │  - The dedicated backup DRIVE is mounted ONCE by the operator, by hand    │
+# │    (PREREQUISITES.md). Ansible never edits host /etc / fstab / smb.conf.  │
+# │  - The mount sentinel below refuses to run if backups_dir isn't a real    │
+# │    mountpoint, so an unmounted drive can't dump backups onto the NVMe.    │
+# └──────────────────────────────────────────────────────────────────────────┘
+
+# ============================================================
+# Phase 0: run stamp + mount sentinel
+# ============================================================
+
+- name: "ops_backup | set the UTC backup stamp (once per run)"
+  ansible.builtin.set_fact:
+    ops_backup_stamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+  run_once: true
+
+- name: "ops_backup | check backups_dir is a mounted device (delegated, read-only)"
+  ansible.builtin.command:
+    cmd: "mountpoint -q {{ backups_dir }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: false
+  register: r_mp
+  when: ops_backup_require_mountpoint | bool
+
+- name: "ops_backup | SAFETY — assert the dedicated backup drive is mounted"
+  ansible.builtin.assert:
+    that: "r_mp.rc == 0"
+    fail_msg: >-
+      ❌ {{ backups_dir }} is not a mounted filesystem. Backups must NOT land on
+      the OS/NVMe disk. Mount the dedicated backup drive first (see PREREQUISITES.md
+      'Dedicated backup drive'), or set ops_backup_require_mountpoint=false to override.
+    success_msg: "✅ {{ backups_dir }} is a mounted device — safe to write backups."
+  when: ops_backup_require_mountpoint | bool
+
+# ============================================================
+# Phase 1: backup volume — libvirt-side (delegated to localhost, unprivileged)
+# ============================================================
+
+- name: "ops_backup | ensure backup qcow2 exists on the dedicated drive"
+  ansible.builtin.command:
+    cmd: "qemu-img create -f qcow2 {{ ops_backup_disk_path }} {{ ops_backup_disk_size_gb }}G"
+    creates: "{{ ops_backup_disk_path }}"
+  delegate_to: localhost
+  become: false
+
+- name: "ops_backup | attach backup disk to {{ ops_backup_libvirt_domain }} (live, persistent)"
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      domain="{{ ops_backup_libvirt_domain }}"
+      diskpath="{{ ops_backup_disk_path }}"
+      target="{{ ops_backup_disk_target }}"
+      # Idempotency: if the path is already in the persistent domain XML, skip.
+      if virsh -c qemu:///system dumpxml --inactive "$domain" 2>/dev/null \
+          | xmllint --xpath "boolean(//disk/source[@file='$diskpath'])" - 2>/dev/null \
+          | grep -q true; then
+          echo "skip: $diskpath already attached"
+          exit 0
+      fi
+      virsh -c qemu:///system attach-disk "$domain" "$diskpath" "$target" \
+          --targetbus scsi --driver qemu --subdriver qcow2 --cache none --persistent
+      echo "attached: $diskpath at $target"
+  register: r_attach
+  changed_when: "'attached:' in r_attach.stdout"
+  delegate_to: localhost
+  become: false
+
+# ============================================================
+# Phase 2: Windows-side disk init (idempotent)
+# ============================================================
+
+- name: "ops_backup | rescan storage subsystem (pick up the attached disk)"
+  ansible.windows.win_powershell:
+    script: |
+      Update-HostStorageCache -ErrorAction Stop
+      $Ansible.Changed = $false
+      $Ansible.Result  = @{ Action = 'storage-cache-rescanned' }
+  changed_when: false
+
+- name: "ops_backup | initialize + format the backup volume {{ ops_backup_drive_letter }}: (idempotent)"
+  ansible.windows.win_powershell:
+    parameters:
+      DriveLetter: "{{ ops_backup_drive_letter }}"
+      VolumeLabel: "{{ ops_backup_volume_label }}"
+      ExpectedSizeGB: "{{ ops_backup_disk_size_gb | int }}"
+    script: |
+      param([string]$DriveLetter, [string]$VolumeLabel, [int]$ExpectedSizeGB)
+
+      # Idempotency: a correctly-labeled NTFS volume already at $DriveLetter = done.
+      $existing = Get-Volume -DriveLetter $DriveLetter -ErrorAction SilentlyContinue
+      if ($existing -and $existing.FileSystemLabel -eq $VolumeLabel -and $existing.FileSystem -eq 'NTFS') {
+          $Ansible.Changed = $false
+          $Ansible.Result  = @{ Action = 'already-prepared'; DriveLetter = $DriveLetter; Label = $existing.FileSystemLabel }
+          return
+      }
+
+      # Free the desired letter if a residual CD-ROM holds it (post-WSUS, ADR-039).
+      $hold = Get-CimInstance -ClassName Win32_Volume -Filter "DriveType = 5 AND DriveLetter = '$($DriveLetter):'"
+      if ($hold) { & mountvol.exe "$($DriveLetter):\" /D 2>&1 | Out-Null }
+
+      # Find the newly attached RAW disk by size (~5% tolerance: qcow2 virtual
+      # vs reported physical size). OS disk is GPT, so RAW discriminates it out.
+      $tol = 0.05
+      $min = [int64]($ExpectedSizeGB * 1GB * (1 - $tol))
+      $max = [int64]($ExpectedSizeGB * 1GB * (1 + $tol))
+      $cands = Get-Disk | Where-Object {
+          $_.PartitionStyle -eq 'RAW' -and $_.Size -ge $min -and $_.Size -le $max
+      }
+      if (-not $cands) {
+          # Fallback: a non-OS disk with no partitions yet, of the right size.
+          $cands = Get-Disk | Where-Object {
+              $_.Number -ne 0 -and
+              ((Get-Partition -DiskNumber $_.Number -ErrorAction SilentlyContinue) -eq $null) -and
+              $_.Size -ge $min -and $_.Size -le $max
+          }
+      }
+      if (-not $cands) { throw "No candidate backup disk (~${ExpectedSizeGB}GB RAW) found. Check 'Get-Disk'." }
+      if (@($cands).Count -gt 1) {
+          throw "Multiple candidate disks match the backup criteria — refusing to guess: $((@($cands) | ForEach-Object { $_.Number }) -join ',')"
+      }
+      $disk = @($cands)[0]
+
+      if ($disk.OperationalStatus -eq 'Offline') {
+          Set-Disk -Number $disk.Number -IsOffline $false -ErrorAction Stop
+          Set-Disk -Number $disk.Number -IsReadOnly $false -ErrorAction Stop
+      }
+      if ($disk.PartitionStyle -eq 'RAW') {
+          Initialize-Disk -Number $disk.Number -PartitionStyle GPT -ErrorAction Stop | Out-Null
+      }
+      New-Partition -DiskNumber $disk.Number -DriveLetter $DriveLetter -UseMaximumSize -ErrorAction Stop | Out-Null
+      Format-Volume -DriveLetter $DriveLetter -FileSystem NTFS -NewFileSystemLabel $VolumeLabel -Confirm:$false -ErrorAction Stop | Out-Null
+
+      $after = Get-Volume -DriveLetter $DriveLetter -ErrorAction Stop
+      if ($after.FileSystem -ne 'NTFS') { throw "Format-Volume succeeded but $DriveLetter is not NTFS (got '$($after.FileSystem)')." }
+      $Ansible.Changed = $true
+      $Ansible.Result  = @{ Action = 'initialized'; DiskNumber = $disk.Number; DriveLetter = $DriveLetter; SizeGB = [math]::Round($after.Size / 1GB, 1) }
+  register: r_disk_init
+
+# ============================================================
+# Phase 3: Windows Server Backup feature
+# ============================================================
+
+- name: "ops_backup | ensure Windows-Server-Backup feature is installed"
+  ansible.windows.win_feature:
+    name: Windows-Server-Backup
+    state: present
+  register: r_wsb_feature
+
+# ============================================================
+# Phase 4: system-state backup (NTDS.dit + SYSVOL + registry + AD CS) via wbadmin
+# ============================================================
+
+- name: "ops_backup | run system-state backup to {{ ops_backup_drive_letter }}: (wbadmin, may take minutes)"
+  ansible.windows.win_powershell:
+    parameters:
+      Target: "{{ ops_backup_drive_letter }}"
+    script: |
+      param([string]$Target)
+      # wbadmin's -backupTarget wants a drive spec like 'E:'. Build it as a
+      # string to avoid PowerShell mis-parsing the embedded colon.
+      $bt  = "-backupTarget:{0}:" -f $Target
+      $out = & wbadmin start systemstatebackup $bt -quiet 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+          $Ansible.Failed = $true
+          throw "wbadmin systemstatebackup failed (exit $LASTEXITCODE):`n$out"
+      }
+      $Ansible.Changed = $true
+      $Ansible.Result  = @{ ExitCode = $LASTEXITCODE; Tail = (($out -split "`r?`n" | Where-Object { $_ }) | Select-Object -Last 5) -join ' | ' }
+  register: r_systemstate
+
+- name: "ops_backup | prune old system-state versions (keep {{ ops_backup_keep_systemstate }})"
+  ansible.windows.win_powershell:
+    parameters:
+      Keep: "{{ ops_backup_keep_systemstate | int }}"
+    script: |
+      param([int]$Keep)
+      # Non-zero exit just means "nothing old enough to delete" — not an error.
+      $kv  = "-keepVersions:{0}" -f $Keep
+      $out = & wbadmin delete systemstatebackup $kv -quiet 2>&1 | Out-String
+      $Ansible.Changed = $false
+      $Ansible.Result  = @{ Tail = (($out -split "`r?`n" | Where-Object { $_ }) | Select-Object -Last 3) -join ' | ' }
+  changed_when: false
+  failed_when: false
+  register: r_prune_ss
+
+# ============================================================
+# Phase 5: small config exports → staged on DC → zipped → fetched → DC cleaned
+# ============================================================
+
+- name: "ops_backup | stage config exports on the DC (GPO/CA/DHCP/DNS/AD objects)"
+  ansible.windows.win_powershell:
+    parameters:
+      Stamp: "{{ ops_backup_stamp }}"
+      ExportRoot: "{{ ops_backup_dc_export_root }}"
+    script: |
+      param([string]$Stamp, [string]$ExportRoot)
+      $dir = Join-Path $ExportRoot $Stamp
+      New-Item -ItemType Directory -Force -Path $dir, (Join-Path $dir 'GPO'), (Join-Path $dir 'DNS') | Out-Null
+      $results = [ordered]@{}
+
+      # GPOs — restorable backup (Backup-GPO writes one subdir per GPO).
+      Import-Module GroupPolicy -ErrorAction Stop
+      Backup-GPO -All -Path (Join-Path $dir 'GPO') -ErrorAction Stop | Out-Null
+      $results.GPO = @(Get-ChildItem (Join-Path $dir 'GPO') -Directory).Count
+
+      # (The CA database is exported by the NEXT task, which runs as SYSTEM —
+      # Backup-CARoleService needs SeBackupPrivilege, which a WinRM session does
+      # not enable even for admins. Proven via a user-vs-SYSTEM bake-off; ADR-046.)
+
+      # DHCP scopes/reservations/options/leases.
+      try { Export-DhcpServer -ComputerName $env:COMPUTERNAME -File (Join-Path $dir 'dhcp.xml') -Leases -Force -ErrorAction Stop; $results.DHCP = 'ok' }
+      catch { $results.DHCP = "skip: $($_.Exception.Message)" }
+
+      # DNS zones (human-readable; AD-integrated zones are ALSO in system-state).
+      # Export-DnsServerZone writes into %windir%\System32\dns\ — move them in.
+      try {
+          $zones = Get-DnsServerZone | Where-Object { -not $_.IsAutoCreated -and $_.ZoneName -ne 'TrustAnchors' }
+          foreach ($z in $zones) { Export-DnsServerZone -Name $z.ZoneName -FileName ("backup_{0}.dns" -f $z.ZoneName) -ErrorAction Stop | Out-Null }
+          Get-ChildItem "$env:windir\System32\dns\backup_*.dns" -ErrorAction SilentlyContinue | Move-Item -Destination (Join-Path $dir 'DNS') -Force
+          $results.DNS = @($zones).Count
+      } catch { $results.DNS = "skip: $($_.Exception.Message)" }
+
+      # AD objects — human-readable inventory (csvde is built into DCs).
+      try { & csvde -f (Join-Path $dir 'ad-objects.csv') 2>&1 | Out-Null; $results.CSVDE = (Test-Path (Join-Path $dir 'ad-objects.csv')) }
+      catch { $results.CSVDE = "skip: $($_.Exception.Message)" }
+
+      $Ansible.Changed = $true
+      $Ansible.Result  = $results
+  register: r_exports
+
+- name: "ops_backup | export the CA database (runs as SYSTEM — needs SeBackupPrivilege)"
+  ansible.windows.win_powershell:
+    parameters:
+      Stamp: "{{ ops_backup_stamp }}"
+      ExportRoot: "{{ ops_backup_dc_export_root }}"
+    script: |
+      param([string]$Stamp, [string]$ExportRoot)
+      # Backup-CARoleService requires SeBackupPrivilege, which a WinRM session
+      # does NOT enable even for a Domain Admin (fails E_ACCESSDENIED). SYSTEM
+      # holds the privilege, so we run this one export elevated via become/runas.
+      # -DatabaseOnly avoids a PFX export password (no new vault secret); the CA
+      # private key is ALSO captured by the system-state backup. See ADR-046.
+      $ca = Join-Path (Join-Path $ExportRoot $Stamp) 'CA'
+      New-Item -ItemType Directory -Force -Path $ca | Out-Null
+      Backup-CARoleService -Path $ca -DatabaseOnly -Force -ErrorAction Stop
+      $files = @(Get-ChildItem $ca -Recurse -File | ForEach-Object { $_.Name })
+      if (-not $files) { throw "Backup-CARoleService produced no files in $ca" }
+      $Ansible.Changed = $true
+      $Ansible.Result  = @{ CA = 'db'; Files = $files }
+  become: true
+  become_method: runas
+  become_user: SYSTEM
+  register: r_ca_export
+
+- name: "ops_backup | compress the export set on the DC"
+  ansible.windows.win_powershell:
+    parameters:
+      Stamp: "{{ ops_backup_stamp }}"
+      ExportRoot: "{{ ops_backup_dc_export_root }}"
+    script: |
+      param([string]$Stamp, [string]$ExportRoot)
+      $dir = Join-Path $ExportRoot $Stamp
+      $zip = "$dir.zip"
+      if (Test-Path $zip) { Remove-Item $zip -Force }
+      Compress-Archive -Path (Join-Path $dir '*') -DestinationPath $zip -ErrorAction Stop
+      $Ansible.Changed = $true
+      $Ansible.Result  = @{ Zip = $zip; SizeKB = [math]::Round((Get-Item $zip).Length / 1KB, 1) }
+  register: r_zip
+
+- name: "ops_backup | fetch the export zip to the host backup drive"
+  ansible.builtin.fetch:
+    src: "{{ ops_backup_dc_export_root }}\\{{ ops_backup_stamp }}.zip"
+    dest: "{{ ops_backup_fetch_dir }}/{{ ops_backup_stamp }}.zip"
+    flat: true
+
+- name: "ops_backup | remove the DC-side export staging (keep C: clean)"
+  ansible.windows.win_powershell:
+    parameters:
+      Stamp: "{{ ops_backup_stamp }}"
+      ExportRoot: "{{ ops_backup_dc_export_root }}"
+    script: |
+      param([string]$Stamp, [string]$ExportRoot)
+      Remove-Item (Join-Path $ExportRoot $Stamp) -Recurse -Force -ErrorAction SilentlyContinue
+      Remove-Item (Join-Path $ExportRoot "$Stamp.zip") -Force -ErrorAction SilentlyContinue
+      $Ansible.Changed = $false
+  changed_when: false
+
+# ============================================================
+# Phase 6: prune old export zips on the host (keep N)
+# ============================================================
+
+- name: "ops_backup | prune host export zips to the last {{ ops_backup_keep_exports }}"
+  ansible.builtin.shell:
+    cmd: |
+      cd "{{ ops_backup_fetch_dir }}" || exit 1
+      # newest-first, skip the N newest, delete the rest. Scoped to *.zip;
+      # xargs -r is a no-op on empty input. (No $? after the pipe — see
+      # feedback-bash-pipeline-exitcode.)
+      ls -1t *.zip 2>/dev/null | tail -n +{{ (ops_backup_keep_exports | int) + 1 }} | xargs -r rm -f --
+      echo "retention: kept up to {{ ops_backup_keep_exports }} export zips"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+
+# ============================================================
+# Phase 7: report
+# ============================================================
+
+- name: "ops_backup | backup summary"
+  ansible.builtin.debug:
+    msg:
+      - "System-state : {{ r_systemstate.result.Tail | default('(see wbadmin output)') }}"
+      - "Exports      : {{ r_exports.result | default({}) }}"
+      - "CA database  : {{ r_ca_export.result | default({}) }}"
+      - "Export zip   : {{ ops_backup_fetch_dir }}/{{ ops_backup_stamp }}.zip ({{ r_zip.result.SizeKB | default('?') }} KB)"

@@ -1,0 +1,37 @@
+---
+# ops_backup defaults. See tasks/main.yml + ADR-046 (amends ADR-017).
+#
+# HOST SAFETY: the libvirt-side tasks (qemu-img/virsh) run delegate_to:
+# localhost, UNPRIVILEGED, and only ever touch the backup qcow2 under
+# backups_dir. The dedicated backup DRIVE itself is mounted by the operator
+# ONCE, by hand (PREREQUISITES.md) — Ansible never edits host /etc.
+
+ops_backup_libvirt_domain: "ADDC01-corp"
+
+# --- Backup volume (system-state target) ---
+# A qcow2 on the DEDICATED backup drive (operator-mounted at backups_dir,
+# ADR-046), attached to the DC as an extra SCSI disk and formatted NTFS at E:.
+# wbadmin can only target a drive letter / volume GUID / UNC — not a host path
+# — so the system-state lands here. The WSUS content disk already took sde
+# (ADR-039) and the install/virtio/seed CD-ROMs took sdb-sdd; next free target
+# letter is sdf (the `target dev` pool is shared across buses — see ADR-039).
+ops_backup_disk_path: "{{ backups_dir }}/{{ ops_backup_libvirt_domain }}-backup.qcow2"
+ops_backup_disk_size_gb: 200          # thin qcow2; holds ~7 system-state versions
+ops_backup_disk_target: "sdf"
+ops_backup_drive_letter: "E"
+ops_backup_volume_label: "DCBackup"
+
+# --- Retention (keep-7; production GFS is a later add-on, see ADR-046) ---
+ops_backup_keep_systemstate: 7        # wbadmin -keepVersions on the backup volume
+ops_backup_keep_exports: 7            # timestamped export zips under backups_dir
+
+# --- Paths ---
+ops_backup_dc_export_root: 'C:\Backups'    # DC-side staging (zipped, fetched, then removed)
+ops_backup_fetch_dir: "{{ backups_dir }}"  # control-node destination for the export zips
+
+# --- Safety ---
+# Refuse to write unless backups_dir is a real mountpoint, so an unmounted
+# backup drive can never silently dump backups onto the NVMe OS disk. Override
+# only deliberately (e.g. a deployment that intentionally uses a non-dedicated
+# path).
+ops_backup_require_mountpoint: true

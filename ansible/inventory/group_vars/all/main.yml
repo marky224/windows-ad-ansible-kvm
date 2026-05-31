@@ -47,7 +47,12 @@ libvirt_pools:
 vm_lab_root: "{{ lookup('env', 'HOME') }}/vm-lab"
 iso_dir: "{{ vm_lab_root }}/iso"
 seed_iso_dir: "{{ vm_lab_root }}/seed-iso"
-backups_dir: "{{ vm_lab_root }}/backups"
+# AD backups live on a DEDICATED physical drive, not the NVMe that hosts the VMs
+# (ADR-046: a DC and its backup belong on different disks). The operator mounts
+# that drive here ONCE, by hand (PREREQUISITES.md → 'Dedicated backup drive') —
+# Ansible never mounts/formats it. ops_backup refuses to write unless this is a
+# real mountpoint (ops_backup_require_mountpoint).
+backups_dir: "/mnt/dc-backups"
 
 # --- Install media (ADR-018: virtio-win pinned to 0.1.271; never use 0.1.285) ---
 # Per ADR-035, Server 2025 has two ISOs: the upstream-pristine RTM media
