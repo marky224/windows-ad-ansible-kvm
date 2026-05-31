@@ -51,7 +51,7 @@ Validation: `ansible.windows.win_ping` → `pong` against `ADDC01-corp` at `10.1
 - **Forest:** `corp.markandrewmarquez.com` (NetBIOS: `CORP`)
 - **Subnet:** `10.10.0.0/24` — DC owns DHCP (single scope `.50-.199`, exclusion `.50-.99` carves out the reservation block, dynamic pool `.100-.199`, MAC-tied reservations punch through the exclusion)
 - **GPO baseline:** Microsoft Security Compliance Toolkit Server 2025 baseline + 12 lab-specific overrides
-- **AD state backup:** nightly `wbadmin systemstatebackup` to a host-side Samba share + `Backup-GPO`/`Backup-CARoleService`/`Export-DhcpServer` exports via WinRM `fetch`
+- **AD state backup:** `wbadmin systemstatebackup` (NTDS.dit + SYSVOL + AD CS) to a dedicated backup drive + `Backup-GPO`/`Backup-CARoleService`/`Export-DhcpServer`/`Export-DnsServerZone`/`csvde` exports zipped and fetched over WinRM
 - **Snapshots:** automatic at each provisioning phase (`vm-built`, `ad-promoted`, `roles-installed`, `clients-joined`, `linux-joined`)
 - **Fire drill:** quarterly playbook restores the latest backup to a sandbox VM on an isolated network and runs the smoke test against it
 
@@ -182,7 +182,7 @@ ansible-playbook playbooks/site.yml
 | `ad_wsus` | WSUS install on dedicated `D:\WSUS` (200 GB qcow2) + 4 products + 4 classifications + Default Automatic Approval Rule + fire-and-forget sync | ✅ |
 | `domain_join_windows` | Win 11 client domain join (`microsoft.ad.membership`) into `OU=Workstations`; WinRM-only host-safety guard | ✅ |
 | `domain_join_linux` | Ubuntu domain join via `realmd` + `sssd` (Kerberos `canonicalize` for Server 2025 KDC); dual host-safety guards (SSH-only + anti-self) | ✅ |
-| `ops_backup` | AD state backup orchestration (SMB to host + WinRM `fetch`) | ⏳ |
+| `ops_backup` | AD state backup: `wbadmin` system-state → dedicated backup disk + config exports (GPO/CA/DHCP/DNS/csvde) zipped + WinRM `fetch`; guest-side, mount-sentinel guard (ADR-046) | ✅ |
 
 ## Playbooks
 
