@@ -10,6 +10,7 @@
 - name: "Provision ADDC01-corp (the domain controller VM)"
   hosts: kvm_host
   gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast: abort the whole run on any failure (ADR-050)
   vars:
     vm_name: ADDC01-corp
     vm_mac: "52:54:00:00:00:10"                            # matches static IP last octet for cleanliness

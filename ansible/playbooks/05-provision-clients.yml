@@ -20,6 +20,7 @@
 - name: "Provision Win 11 client VMs (CLIENT01-corp, CLIENT02-corp)"
   hosts: kvm_host
   gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast: abort the whole run on any failure (ADR-050)
   vars:
     vm_install_iso: "{{ iso_paths.windows_11_enterprise }}"
     vm_install_iso_sha256: "{{ iso_checksums.windows_11_enterprise | default('') }}"

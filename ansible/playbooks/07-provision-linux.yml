@@ -11,6 +11,7 @@
 - name: "Provision the Ubuntu 24.04 client VM (UBUNTU01-corp)"
   hosts: kvm_host
   gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast: abort the whole run on any failure (ADR-050)
   vars:
     ubuntu_vm: UBUNTU01-corp
   tasks:

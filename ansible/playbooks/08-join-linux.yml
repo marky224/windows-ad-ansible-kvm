@@ -16,6 +16,7 @@
 - name: "Join UBUNTU01-corp to the domain (realmd/sssd)"
   hosts: linux_clients
   gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast: abort the whole run on any failure (ADR-050)
   pre_tasks:
     - name: "08-join-linux | belt-and-suspenders host-safety assert"
       ansible.builtin.assert:

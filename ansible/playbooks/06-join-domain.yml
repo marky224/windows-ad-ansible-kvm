@@ -18,5 +18,6 @@
 - name: "Join Win 11 clients to the domain (place in OU=Workstations)"
   hosts: clients
   gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast: one client failing aborts the run (ADR-050)
   roles:
     - domain_join_windows

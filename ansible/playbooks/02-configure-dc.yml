@@ -31,6 +31,7 @@
 - name: "Play 1 — Promote ADDC01-corp to forest root of corp.markandrewmarquez.com"
   hosts: dc
   gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast: abort the whole run on any failure (ADR-050)
   vars:
     # ADR-031: pre-promotion the only working identity is local Administrator.
     # Override group_vars/dc.yml's steady-state named-admin UPN for this play.
@@ -42,6 +43,7 @@
 - name: "Play 2 — Create named domain admin (connect as built-in domain Administrator)"
   hosts: dc
   gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast: abort the whole run on any failure (ADR-050)
   vars:
     # ADR-031: post-promotion, pre-named-admin. Connect as RID 500 via UPN form.
     # Password is the SAME value as Play 1 — dcpromo preserves it.
@@ -55,6 +57,7 @@
 - name: "Play 3 — Apply Appendix D RID 500 hardening (connect as named admin)"
   hosts: dc
   gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast: abort the whole run on any failure (ADR-050)
   # No vars override: use steady-state group_vars/dc.yml identity (madmin-da UPN).
   # Connecting as madmin-da IS the verification that ad_admins worked correctly.
   # If named-admin auth is broken, this play fails BEFORE running the hardening,

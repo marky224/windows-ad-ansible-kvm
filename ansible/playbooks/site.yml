@@ -28,16 +28,16 @@
 # named admin madmin-da, ADR-031/033). Flattening or dynamic include would drop
 # those per-play overrides and could brick admin access to the DC.
 #
-# FAIL-FAST: by default a play ends once all its target hosts have failed, which
-# stops the run. The dependency-critical path here -- 00 net, 01/02 DC, 03
-# services, 04 advanced, the 05/07 host-side builds, and 08 (single linux host)
-# -- is all effectively single-host, so a failure aborts the run before any
-# dependent phase. The 2-host client join (06) is the one spot where one host
-# could fail while the other proceeds; the 99 smoke gate then fails the build.
-# If you want strict abort-on-first-failure everywhere, add
-# `any_errors_fatal: true` to the imported plays (it cannot be set from an
-# import_playbook line). Left off here so each numbered playbook stays runnable
-# stand-alone, unchanged.
+# FAIL-FAST: every imported play in 00->08 sets `any_errors_fatal: true`
+# (ADR-050), so ANY failure aborts the entire site.yml run immediately --
+# including ACROSS host groups. This matters because Ansible's default only
+# drops the failed host from later plays: a DC-config failure (group `dc`) would
+# otherwise leave the `kvm_host` client-build plays (05/07) running and build
+# clients against a broken DC. `any_errors_fatal` is a play-level keyword that
+# CANNOT be set from an import_playbook line, which is why it lives in the
+# numbered playbooks rather than here. 99-smoke-test deliberately does NOT set it
+# -- it's the final phase (nothing runs after it) and a verification suite should
+# report ALL failures across the fleet, not abort on the first.
 #
 # === USAGE ==================================================================
 #   # full build + verify (idempotent -- safe to re-run; converges existing VMs):

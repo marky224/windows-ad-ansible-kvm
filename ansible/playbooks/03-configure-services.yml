@@ -28,6 +28,7 @@
 - name: "Configure DC-resident services (DNS, DHCP, NTP) on {{ groups['dc'][0] }}"
   hosts: dc
   gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast: abort the whole run on any failure (ADR-050)
   roles:
     - ad_dns
     - ad_dhcp
