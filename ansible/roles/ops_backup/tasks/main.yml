@@ -258,7 +258,7 @@
       $Ansible.Changed = $true
       $Ansible.Result  = @{ CA = 'db'; Files = $files }
   become: true
-  become_method: runas
+  become_method: ansible.builtin.runas
   become_user: SYSTEM
   register: r_ca_export
 
