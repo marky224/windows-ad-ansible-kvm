@@ -148,7 +148,7 @@ ansible-playbook playbooks/08-join-linux.yml              # ✅ Milestone 6
 ansible-playbook playbooks/99-smoke-test.yml              # ✅ Milestone 6
 ```
 
-Or all in one (once Milestone 3+ ships):
+Or build **and verify** the whole fleet in one command (runs `00 → 08`, then `99-smoke-test`; `--tags`/`--limit` scope partial runs):
 ```bash
 ansible-playbook playbooks/site.yml
 ```
@@ -189,7 +189,7 @@ ansible-playbook playbooks/site.yml
 
 ## Playbooks
 
-`00-libvirt-network.yml`, `slipstream-iso.yml`, `01-provision-dc.yml`, `02-configure-dc.yml`, `03-configure-services.yml`, `04-configure-services-advanced.yml` (M5), `05-provision-clients.yml`, `06-join-domain.yml`, `07-provision-linux.yml`, `08-join-linux.yml`, `99-smoke-test.yml`, plus operational utilities: `snapshot.yml`, `rollback.yml`, `list-snapshots.yml`, `backup-ad.yml`, `fire-drill.yml`, `teardown.yml`.
+`00-libvirt-network.yml`, `slipstream-iso.yml`, `01-provision-dc.yml`, `02-configure-dc.yml`, `03-configure-services.yml`, `04-configure-services-advanced.yml` (M5), `05-provision-clients.yml`, `06-join-domain.yml`, `07-provision-linux.yml`, `08-join-linux.yml`, `99-smoke-test.yml`, plus operational utilities: `snapshot.yml`, `rollback.yml`, `list-snapshots.yml`, `backup-ad.yml`, `fire-drill.yml`, `teardown.yml`, and the `site.yml` orchestrator that runs `00 → 99` end-to-end in one command.
 
 ---
 

@@ -33,6 +33,8 @@ ansible-vault edit inventory/group_vars/all/vault.yml   # replace the PLACEHOLDE
 
 ## Run the full lab
 
+One command builds **and verifies** everything — `ansible-playbook playbooks/site.yml` static-imports `00 → 08` and ends on `99-smoke-test`, behind a fail-fast preflight. Phase tags scope partial runs (`--tags clients,linux`, `--skip-tags smoke`); see ADR-049. Or run the phases individually:
+
 ```bash
 cd ansible/
 ansible-playbook playbooks/00-libvirt-network.yml

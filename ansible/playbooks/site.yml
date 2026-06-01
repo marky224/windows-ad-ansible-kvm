@@ -1,0 +1,210 @@
+---
+# site.yml — full-lab orchestrator (Milestone 7; ADR pending).
+#
+# The conventional Ansible entry point: `ansible-playbook playbooks/site.yml`
+# stands up the entire corp lab by importing the numbered playbooks 00 -> 08 in
+# order and ending on 99-smoke-test as the verification gate. This mirrors the
+# canonical "master site.yml imports tier playbooks" layout from the Ansible
+# docs. site.yml ONLY ever converges/builds — it carries no destructive logic
+# (see CLEAN REBUILD below).
+#
+# +-- HOST SAFETY (project rule #1) ------------------------------------------+
+# | This is the one playbook that drives EVERYTHING, so it restates the rule  |
+# | up front: the libvirt host is the user's daily-driver PC.                 |
+# |   * Host-side plays (00/01/05/07 + this file's preflight) run on          |
+# |     kvm_host (localhost) UNPRIVILEGED -- virsh/qemu-img/cp + files under  |
+# |     ~/vm-lab only. No become, no mounts, no host-OS edits.                |
+# |   * Guest-config plays (02/03/04/06/08/99) scope to guest groups          |
+# |     (dc / clients / linux_clients) over WinRM/SSH -- NEVER localhost/all. |
+# | site.yml adds NO host-OS changes of its own; it only sequences plays that |
+# | are each already host-safe, and re-asserts the scoping in preflight.      |
+# +--------------------------------------------------------------------------+
+#
+# WHY import_playbook (static), not include_playbook (dynamic) and not a merged
+# mega-play: import_playbook is parse-time -- Ansible runs the imported plays as
+# if defined inline here, so every play keeps its own hosts: and play-level
+# vars:. That is REQUIRED for 02-configure-dc.yml, whose three plays each connect
+# as a different identity (local Administrator -> built-in domain admin UPN ->
+# named admin madmin-da, ADR-031/033). Flattening or dynamic include would drop
+# those per-play overrides and could brick admin access to the DC.
+#
+# FAIL-FAST: by default a play ends once all its target hosts have failed, which
+# stops the run. The dependency-critical path here -- 00 net, 01/02 DC, 03
+# services, 04 advanced, the 05/07 host-side builds, and 08 (single linux host)
+# -- is all effectively single-host, so a failure aborts the run before any
+# dependent phase. The 2-host client join (06) is the one spot where one host
+# could fail while the other proceeds; the 99 smoke gate then fails the build.
+# If you want strict abort-on-first-failure everywhere, add
+# `any_errors_fatal: true` to the imported plays (it cannot be set from an
+# import_playbook line). Left off here so each numbered playbook stays runnable
+# stand-alone, unchanged.
+#
+# === USAGE ==================================================================
+#   # full build + verify (idempotent -- safe to re-run; converges existing VMs):
+#   ansible-playbook playbooks/site.yml
+#
+#   # build/limit by phase tag: network | dc | services | advanced |
+#   #                           clients | linux | smoke
+#   ansible-playbook playbooks/site.yml --tags clients,linux
+#   ansible-playbook playbooks/site.yml --skip-tags smoke
+#   ansible-playbook playbooks/site.yml --tags clients --limit CLIENT02-corp
+#
+#   # preview structure without running anything (site.yml is not --check-clean:
+#   # the VM-provisioning steps can't dry-run, so use these instead):
+#   ansible-playbook playbooks/site.yml --list-tags
+#   ansible-playbook playbooks/site.yml --list-tasks
+#
+# Snapshots are intentionally NOT part of the build (separation of concerns: the
+# build converges state; snapshots protect EXISTING state). Capture them
+# deliberately with playbooks/snapshot.yml, e.g. after a clean full build:
+#   ansible-playbook playbooks/snapshot.yml -e vm_name=ADDC01-corp -e snapshot_label=site-complete
+#
+# === CLEAN REBUILD (down -> up) =============================================
+# site.yml never destroys. For a from-scratch rebuild, tear down first (gated),
+# then build:
+#   ansible-playbook playbooks/teardown.yml -e confirm=DESTROY
+#   ansible-playbook playbooks/site.yml
+# ===========================================================================
+
+# ===========================================================================
+# PREFLIGHT (invariants) -- ALWAYS runs (even with --tags). Read-only, host-side.
+# Re-asserts host safety + checks the cheap things whose absence dooms a build,
+# so we fail in seconds instead of part-way through ~90 minutes (the recognised
+# "assert prerequisites up front" pattern).
+# ===========================================================================
+- name: "site.yml | preflight (invariants) -- host safety, inventory, vault"
+  hosts: kvm_host
+  gather_facts: false
+  tags: always
+  tasks:
+    - name: "preflight | HOST-SAFETY assert -- host-side plays run on the control host only"
+      ansible.builtin.assert:
+        that:
+          - "inventory_hostname in groups.get('kvm_host', [])"
+          - "(ansible_connection | default('local')) == 'local'"
+          - "inventory_hostname not in (groups.get('dc', []) + groups.get('clients', []) + groups.get('linux_clients', []))"
+        fail_msg: "REFUSING: site.yml host-side plays must run on kvm_host (localhost) only -- never a guest."
+        success_msg: "Host safety OK: control host (localhost), not a guest."
+        quiet: true
+      become: false
+
+    - name: "preflight | required inventory groups present + populated"
+      ansible.builtin.assert:
+        that:
+          - "(groups.get('dc') | default([])) | length > 0"
+          - "(groups.get('clients') | default([])) | length > 0"
+          - "(groups.get('linux_clients') | default([])) | length > 0"
+        fail_msg: "Inventory missing/empty for one of: dc / clients / linux_clients."
+        quiet: true
+
+    - name: "preflight | vault is readable (secrets decrypt)"
+      ansible.builtin.assert:
+        that:
+          - "vault_dc_admin_password is defined"
+          - "(vault_dc_admin_password | default('')) | length > 0"
+        fail_msg: >-
+          Cannot read vaulted secrets. Is ~/.ansible-vault-pass-corp-lab present
+          and correct, and group_vars/all/vault.yml populated?
+          (see ansible/README.md first-time setup)
+        quiet: true
+      no_log: true
+
+# ===========================================================================
+# PREFLIGHT (build prereqs) -- only when a phase that consumes Windows install
+# media is in scope (dc builds the DC; clients build Win 11). Skipped for a
+# verify-only run (--tags smoke) or a linux-only run.
+# ===========================================================================
+- name: "site.yml | preflight (build prereqs) -- Windows install ISOs exist"
+  hosts: kvm_host
+  gather_facts: false
+  tags:
+    - dc
+    - clients
+  tasks:
+    - name: "preflight | stat the Windows install ISOs"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: _site_iso_stat
+      loop:
+        - "{{ iso_paths.windows_server_2025 | default('') }}"
+        - "{{ iso_paths.windows_11_enterprise | default('') }}"
+      loop_control:
+        label: "{{ item }}"
+      when: (item | length) > 0
+
+    - name: "preflight | assert each declared ISO is present"
+      ansible.builtin.assert:
+        that:
+          - "(item.stat.exists | default(false))"
+        fail_msg: >-
+          Install ISO not found: {{ item.item }}.
+          Build it (playbooks/slipstream-iso.yml for Server 2025) or fix
+          iso_paths in group_vars/all/main.yml before a full build.
+        quiet: true
+      loop: "{{ _site_iso_stat.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('?') }}"
+      when: not (item.skipped | default(false))
+
+# ===========================================================================
+# PHASE 1 -- corp-lab libvirt network (host-side)
+# ===========================================================================
+- import_playbook: 00-libvirt-network.yml
+  tags:
+    - network
+
+# ===========================================================================
+# PHASE 2 -- Domain controller: build the VM, then promote forest + create the
+# named admin + harden RID 500 (02 carries the 3-identity bootstrap; see header)
+# ===========================================================================
+- import_playbook: 01-provision-dc.yml
+  tags:
+    - dc
+
+- import_playbook: 02-configure-dc.yml
+  tags:
+    - dc
+
+# ===========================================================================
+# PHASE 3 -- DC-resident services: DNS -> DHCP -> NTP
+# ===========================================================================
+- import_playbook: 03-configure-services.yml
+  tags:
+    - services
+
+# ===========================================================================
+# PHASE 4 -- Advanced DC services: AD CS -> GPO -> WSUS
+# ===========================================================================
+- import_playbook: 04-configure-services-advanced.yml
+  tags:
+    - advanced
+
+# ===========================================================================
+# PHASE 5 -- Windows clients: build the VMs, then domain-join (OU=Workstations)
+# ===========================================================================
+- import_playbook: 05-provision-clients.yml
+  tags:
+    - clients
+
+- import_playbook: 06-join-domain.yml
+  tags:
+    - clients
+
+# ===========================================================================
+# PHASE 6 -- Linux client: build UBUNTU01, then realmd/sssd domain-join
+# ===========================================================================
+- import_playbook: 07-provision-linux.yml
+  tags:
+    - linux
+
+- import_playbook: 08-join-linux.yml
+  tags:
+    - linux
+
+# ===========================================================================
+# FINAL GATE -- end-to-end smoke test (READ-ONLY). A green run here means the
+# lab is VERIFIED end-to-end, not merely that the plays executed.
+# ===========================================================================
+- import_playbook: 99-smoke-test.yml
+  tags:
+    - smoke

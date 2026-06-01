@@ -21,6 +21,6 @@ Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution o
 | `backup-ad.yml` | AD state backup to the dedicated drive (`ops_backup`, ADR-046) |
 | `fire-drill.yml` | Restore a snapshot/backup into an isolated sandbox, smoke-test, always tear down (`ops_firedrill`, ADR-047) |
 | `teardown.yml` | Destroy `*-corp` VMs + their live disks; preview unless `-e confirm=DESTROY`; preserves `/mnt/dc-backups` + `.<label>` snapshots (`ops_teardown`, ADR-048) |
-| `site.yml` | Orchestrator: `00 → 99` end-to-end (planned — the last M7 deliverable) |
+| `site.yml` | Orchestrator: static-imports `00 → 99` end-to-end; fail-fast preflight + phase tags (`network`/`dc`/`services`/`advanced`/`clients`/`linux`/`smoke`) + `99-smoke-test` as the final gate (ADR-049) |
 
 Shared task files live in `tasks/` — e.g. `smoke-dc.yml`, the "healthy DC" checks reused by both `99-smoke-test.yml` and `fire-drill.yml`.
