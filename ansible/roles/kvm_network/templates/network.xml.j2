@@ -1,12 +1,15 @@
 <network>
-  <name>{{ corp_subnet.libvirt_network_name }}</name>
-  <forward mode='nat'>
+  <name>{{ net.name }}</name>
+{% if (net.forward | default('nat')) != 'isolated' %}
+  <forward mode='{{ net.forward | default('nat') }}'>
     <nat>
       <port start='1024' end='65535'/>
     </nat>
   </forward>
-  <bridge name='{{ corp_subnet.libvirt_bridge }}' stp='on' delay='0'/>
-  <mac address='52:54:00:f0:00:01'/>
-  <ip address='{{ corp_subnet.gateway }}' netmask='{{ corp_subnet.netmask }}'/>
-  {# DHCP intentionally omitted — DC owns DHCP role per ADR-007. #}
+{% endif %}
+  <bridge name='{{ net.bridge }}' stp='on' delay='0'/>
+  <mac address='{{ net.mac }}'/>
+  <ip address='{{ net.host_ip }}' netmask='{{ net.netmask }}'/>
+  {# DHCP intentionally omitted — DC owns DHCP (ADR-007); Branch uses VyOS dhcp-relay. #}
+{#- isolated networks (no <forward>) carry no NAT: VyOS routes between subnets, ADR-052 -#}
 </network>

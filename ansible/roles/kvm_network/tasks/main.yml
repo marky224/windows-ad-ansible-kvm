@@ -1,16 +1,34 @@
 ---
-- name: "kvm_network | define {{ corp_subnet.libvirt_network_name }}"
+# Define + start each lab libvirt network from kvm_networks (group_vars/all/main.yml).
+# corp-lab = NAT (the host is its gateway); corp-branch = isolated (ADR-052: VyOS
+# is that subnet's gateway, the host holds only a passive mgmt IP and libvirt blocks
+# it from routing between subnets). Re-running is idempotent: corp-lab renders the
+# exact same XML it had pre-Phase-6, so the live network is never disturbed.
+
+- name: "kvm_network | define {{ net.name }} ({{ net.forward }})"
   community.libvirt.virt_net:
     command: define
-    name: "{{ corp_subnet.libvirt_network_name }}"
+    name: "{{ net.name }}"
     xml: "{{ lookup('template', 'network.xml.j2') }}"
+  loop: "{{ kvm_networks }}"
+  loop_control:
+    loop_var: net
+    label: "{{ net.name }}"
 
-- name: "kvm_network | autostart {{ corp_subnet.libvirt_network_name }}"
+- name: "kvm_network | autostart {{ net.name }}"
   community.libvirt.virt_net:
     autostart: true
-    name: "{{ corp_subnet.libvirt_network_name }}"
+    name: "{{ net.name }}"
+  loop: "{{ kvm_networks }}"
+  loop_control:
+    loop_var: net
+    label: "{{ net.name }}"
 
-- name: "kvm_network | start {{ corp_subnet.libvirt_network_name }}"
+- name: "kvm_network | start {{ net.name }}"
   community.libvirt.virt_net:
     state: active
-    name: "{{ corp_subnet.libvirt_network_name }}"
+    name: "{{ net.name }}"
+  loop: "{{ kvm_networks }}"
+  loop_control:
+    loop_var: net
+    label: "{{ net.name }}"

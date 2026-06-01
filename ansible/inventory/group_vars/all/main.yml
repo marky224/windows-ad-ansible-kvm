@@ -36,6 +36,47 @@ corp_subnet:
   libvirt_bridge: virbr-corp
   mac_oui: "52:54:00"  # libvirt-allocated range
 
+# --- Phase 6 multi-site: Branch subnet (ADR-052, see _private/docs/PHASE6-MULTISITE.md) ---
+# ISOLATED libvirt network (no NAT/internet). Note the HQ/Branch asymmetry:
+#   HQ     : the host IS the gateway+NAT (gateway 10.10.0.1).
+#   Branch : VyOS is the gateway (10.20.0.1); the host holds only a passive
+#            management bridge IP (10.20.0.2) so Ansible can reach ADDC02 over
+#            WinRM WITHOUT a host route. libvirt's isolated-net rules block the
+#            host from forwarding between subnets, so VyOS is the only inter-site
+#            path. This is the one host-network touch, user-approved 2026-06-01.
+branch_subnet:
+  cidr: 10.20.0.0/24
+  netmask: 255.255.255.0
+  libvirt_host_ip: 10.20.0.2     # host's passive mgmt-only bridge IP
+  gateway: 10.20.0.1             # VyOS branch leg = ADDC02's default gateway
+  dc_ip: 10.20.0.10              # ADDC02
+  libvirt_network_name: corp-branch
+  libvirt_bridge: virbr-branch
+
+# VyOS inter-site router (ADR-052). Managed via the vyos.vyos collection over SSH.
+vyos:
+  hostname: VYOS01
+  hq_ip: 10.10.0.2
+  branch_ip: 10.20.0.1
+  wan_latency_ms: 40             # netem one-way, simulates the inter-site link
+
+# Networks the kvm_network role provisions. Each entry renders network.xml.j2.
+# corp-lab keeps forward=nat (byte-identical to its pre-Phase-6 definition);
+# corp-branch is isolated (no <forward> element).
+kvm_networks:
+  - name: "{{ corp_subnet.libvirt_network_name }}"
+    bridge: "{{ corp_subnet.libvirt_bridge }}"
+    host_ip: "{{ corp_subnet.gateway }}"
+    netmask: "{{ corp_subnet.netmask }}"
+    mac: "52:54:00:f0:00:01"
+    forward: nat
+  - name: "{{ branch_subnet.libvirt_network_name }}"
+    bridge: "{{ branch_subnet.libvirt_bridge }}"
+    host_ip: "{{ branch_subnet.libvirt_host_ip }}"
+    netmask: "{{ branch_subnet.netmask }}"
+    mac: "52:54:00:f0:00:02"
+    forward: isolated
+
 # --- libvirt storage pools (ADR-024) ---
 libvirt_pools:
   disks: corp-disks    # backed by {{ vm_lab_root }}/disks
