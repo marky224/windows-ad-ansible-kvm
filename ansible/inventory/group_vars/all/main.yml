@@ -107,6 +107,9 @@ iso_paths:
   windows_11_enterprise: "{{ iso_dir }}/Windows11Enterprise.iso"
   ubuntu_24_04: "{{ iso_dir }}/noble-server-cloudimg-amd64.img"
   virtio_win: "{{ iso_dir }}/virtio-win-0.1.271.iso"
+  # VyOS rolling ISO for the Phase 6 inter-site router (ADR-052). Fetch via
+  # _private/scripts/vyos-fetch.sh. Pinned to the dated nightly tag for reproducibility.
+  vyos: "{{ iso_dir }}/vyos-2026.05.30-0046-rolling-generic-amd64.iso"
 
 # SHA256 hashes for known-good install media. Provisioning roles assert against
 # these before baking ISO contents into shared stages. Add an entry whenever
@@ -121,6 +124,10 @@ iso_checksums:
   # Subsequent slipstream runs short-circuit on this hash; 01-provision-dc.yml
   # asserts against it before building from the patched media.
   windows_server_2025: 84a05501ba5c018162bb9a0ea9e89bc09175f17abf12f368987bc2f91b613786
+  # VyOS rolling 2026.05.30-0046 generic-amd64 ISO (696 MB), fetched + recorded
+  # 2026-06-01 via _private/scripts/vyos-fetch.sh. minisign skipped (not installed
+  # on the host); integrity pinned by SHA256.
+  vyos: 4df499bafd862e6f7ebd17fbd4a4691bbcc093ba885b35abb1bca5a37206321b
 
 # --- WIM edition indices (captured 2026-05-26 from each ISO's sources/install.wim) ---
 wim_edition:

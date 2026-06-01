@@ -31,3 +31,8 @@ collections:
   # General-purpose modules (archive, ini_file, password generation, etc.).
   - name: community.general
     version: "8.3.0"
+
+  # VyOS network automation for the Phase 6 inter-site router (ADR-052).
+  # network_cli over SSH; vyos_config + vyos_static_routes (DHCP relay via set-commands).
+  - name: vyos.vyos
+    version: "6.0.0"
