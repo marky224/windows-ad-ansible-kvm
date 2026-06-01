@@ -1,0 +1,150 @@
+---
+# AD Sites & Services topology for the HQ + Branch multi-site design (ADR-052).
+# Runs on ADDC01 BEFORE the Branch replica (ADDC02) is promoted, so ADDC02 lands
+# in Branch-Site automatically via the subnet->site mapping.
+#
+# Site/subnet/link names are templated as PS string LITERALS (not passed via
+# win_powershell `parameters:`) on purpose: the names contain dashes (HQ-Site,
+# Branch-Site, HQ-Branch) and the win_powershell arg binder truncates dash-bearing
+# values (see memory feedback-win-powershell-args-dash-truncation).
+#
+# EXISTENCE CHECKS USE -Filter, NOT -Identity: the AD cmdlets raise a TERMINATING
+# ADIdentityNotFoundException on `-Identity <missing>`, which -ErrorAction
+# SilentlyContinue does NOT suppress. -Filter returns an empty result on no-match
+# (no exception), which is the correct idempotent-detect pattern. Each task reads
+# current state before writing (ADR-037); the final task verifies the result.
+
+- name: "ad_sites | rename {{ ad_sites_default_site_name }} -> {{ ad_sites_hq_name }} (idempotent)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $hqName  = '{{ ad_sites_hq_name }}'
+      $defName = '{{ ad_sites_default_site_name }}'
+      $changed = $false
+
+      $hq = Get-ADReplicationSite -Filter "Name -eq '$hqName'"
+      if (-not $hq) {
+          $def = Get-ADReplicationSite -Filter "Name -eq '$defName'"
+          if (-not $def) {
+              throw "Neither '$hqName' nor '$defName' exists - unexpected site topology; aborting."
+          }
+          Rename-ADObject -Identity $def.DistinguishedName -NewName $hqName
+          $changed = $true
+      }
+
+      # Post-write verify
+      $hq = Get-ADReplicationSite -Filter "Name -eq '$hqName'"
+      if (-not $hq) { throw "Post-rename verify failed: '$hqName' not found." }
+      $Ansible.Changed = $changed
+      $Ansible.Result  = @{ Site = $hq.Name }
+  register: r_sites_hq
+
+- name: "ad_sites | ensure site {{ ad_sites_branch_name }} exists"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $branch  = '{{ ad_sites_branch_name }}'
+      $changed = $false
+
+      $b = Get-ADReplicationSite -Filter "Name -eq '$branch'"
+      if (-not $b) {
+          New-ADReplicationSite -Name $branch
+          $changed = $true
+      }
+      $b = Get-ADReplicationSite -Filter "Name -eq '$branch'"
+      if (-not $b) { throw "Post-create verify failed: site '$branch' not found." }
+      $Ansible.Changed = $changed
+      $Ansible.Result  = @{ Site = $b.Name }
+  register: r_sites_branch
+
+- name: "ad_sites | ensure subnet objects mapped to their sites"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $changed = @()
+      $map = @(
+          @{ Cidr = '{{ ad_sites_hq_subnet }}';     Site = '{{ ad_sites_hq_name }}' },
+          @{ Cidr = '{{ ad_sites_branch_subnet }}'; Site = '{{ ad_sites_branch_name }}' }
+      )
+      foreach ($m in $map) {
+          $s = Get-ADReplicationSubnet -Filter "Name -eq '$($m.Cidr)'"
+          if (-not $s) {
+              New-ADReplicationSubnet -Name $m.Cidr -Site $m.Site
+              $changed += "created:$($m.Cidr)->$($m.Site)"
+          } else {
+              $curSite = if ($s.Site) { ($s.Site -split ',')[0] -replace '^CN=','' } else { '' }
+              if ($curSite -ne $m.Site) {
+                  Set-ADReplicationSubnet -Identity $s.DistinguishedName -Site $m.Site
+                  $changed += "remapped:$($m.Cidr)->$($m.Site)"
+              }
+          }
+      }
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result  = @{ Changed = $changed }
+  register: r_sites_subnets
+
+- name: "ad_sites | ensure inter-site link {{ ad_sites_link_name }} (cost {{ ad_sites_link_cost }}, {{ ad_sites_link_freq_minutes }}m)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $linkName = '{{ ad_sites_link_name }}'
+      $hq       = '{{ ad_sites_hq_name }}'
+      $branch   = '{{ ad_sites_branch_name }}'
+      $cost     = {{ ad_sites_link_cost }}
+      $freq     = {{ ad_sites_link_freq_minutes }}
+      $changed  = @()
+
+      $link = Get-ADReplicationSiteLink -Filter "Name -eq '$linkName'"
+      if (-not $link) {
+          New-ADReplicationSiteLink -Name $linkName -SitesIncluded $hq,$branch `
+              -Cost $cost -ReplicationFrequencyInMinutes $freq
+          $changed += "created:$linkName"
+      } else {
+          if ($link.Cost -ne $cost -or $link.ReplicationFrequencyInMinutes -ne $freq) {
+              Set-ADReplicationSiteLink -Identity $link.DistinguishedName -Cost $cost `
+                  -ReplicationFrequencyInMinutes $freq
+              $changed += "set-cost-freq"
+          }
+          $included = @($link.SitesIncluded | ForEach-Object { ($_ -split ',')[0] -replace '^CN=','' })
+          foreach ($s in @($hq, $branch)) {
+              if ($included -notcontains $s) {
+                  Set-ADReplicationSiteLink -Identity $link.DistinguishedName -SitesIncluded @{Add = $s}
+                  $changed += "add-site:$s"
+              }
+          }
+      }
+      $link = Get-ADReplicationSiteLink -Filter "Name -eq '$linkName'"
+      if (-not $link) { throw "Post-create verify failed: site link '$linkName' not found." }
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result  = @{
+          Link    = $link.Name
+          Cost    = $link.Cost
+          FreqMin = $link.ReplicationFrequencyInMinutes
+          Sites   = @($link.SitesIncluded | ForEach-Object { ($_ -split ',')[0] -replace '^CN=','' })
+      }
+  register: r_sites_link
+
+- name: "ad_sites | verify topology (read-only)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $linkName = '{{ ad_sites_link_name }}'
+      $sites   = @(Get-ADReplicationSite   -Filter * | Select-Object -ExpandProperty Name)
+      $subnets = @(Get-ADReplicationSubnet -Filter * | ForEach-Object {
+                    $sn = if ($_.Site) { ($_.Site -split ',')[0] -replace '^CN=','' } else { '(unassigned)' }
+                    "$($_.Name)->$sn" })
+      $link    = Get-ADReplicationSiteLink -Filter "Name -eq '$linkName'"
+      $dc      = Get-ADDomainController -Identity $env:COMPUTERNAME
+      $Ansible.Changed = $false
+      $Ansible.Result  = @{
+          Sites       = $sites
+          Subnets     = $subnets
+          Link        = if ($link) { "$($link.Name) cost=$($link.Cost) freq=$($link.ReplicationFrequencyInMinutes)m sites=$((@($link.SitesIncluded | ForEach-Object { ($_ -split ',')[0] -replace '^CN=','' })) -join '+')" } else { '(missing)' }
+          ADDC01_Site = $dc.Site
+      }
+  register: r_sites_verify
+  changed_when: false
+
+- name: "ad_sites | show topology"
+  ansible.builtin.debug:
+    var: r_sites_verify.result

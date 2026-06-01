@@ -1,0 +1,24 @@
+---
+# ad_sites role — AD Sites & Services topology for the HQ + Branch multi-site
+# design (ADR-052). No native Ansible module exists for AD replication sites, so
+# this is inline win_powershell over the ActiveDirectory module, run on ADDC01.
+
+# Site names. HQ is the RENAMED Default-First-Site-Name (keeps ADDC01's existing
+# membership — no server-object move). Branch is new; ADDC02 (10.20.0.10) lands
+# there automatically at promotion via the subnet->site mapping below.
+ad_sites_default_site_name: "Default-First-Site-Name"
+ad_sites_hq_name: "HQ-Site"
+ad_sites_branch_name: "Branch-Site"
+
+# Subnet objects (CIDR -> site), sourced from the network design in
+# group_vars/all/main.yml so there's a single source of truth for the subnets.
+ad_sites_hq_subnet: "{{ corp_subnet.cidr }}"          # 10.10.0.0/24 -> HQ-Site
+ad_sites_branch_subnet: "{{ branch_subnet.cidr }}"    # 10.20.0.0/24 -> Branch-Site
+
+# Inter-site link. Change-notification is deliberately OFF so the link's cost +
+# replication frequency are meaningful and inter-site behaviour is demonstrable
+# (vs. near-instant intra-site). 15 min is faster than the 180-min default —
+# lab-appropriate, and shows the knob.
+ad_sites_link_name: "HQ-Branch"
+ad_sites_link_cost: 100
+ad_sites_link_freq_minutes: 15
