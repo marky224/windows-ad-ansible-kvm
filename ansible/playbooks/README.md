@@ -1,6 +1,6 @@
 # Playbooks
 
-Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution order for a full build (`99-` is verification). The `00→08` chain plus `99` builds the lab end-to-end; the rest are operational utilities.
+Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution order for a full build (`99-` is verification). The `00→08` chain plus `99` builds the base lab end-to-end; `09+` are **Phase 6** (multi-site) build steps; the rest are operational utilities.
 
 | File | Purpose |
 |---|---|
@@ -14,6 +14,7 @@ Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution o
 | `06-join-domain.yml` | Domain-join the Windows clients (`domain_join_windows`) |
 | `07-provision-linux.yml` | Build UBUNTU01 from cloud-img + cloud-init |
 | `08-join-linux.yml` | realmd / sssd / adcli on UBUNTU01 (`domain_join_linux`) |
+| `09-configure-sites.yml` | **Phase 6** (ADR-052): AD Sites & Services on ADDC01 — `Default-First-Site-Name`→`HQ-Site`, `Branch-Site`, subnet objects, `HQ-Branch` link (`ad_sites`); precedes the Branch replica |
 | `99-smoke-test.yml` | End-to-end verification: DNS, AD, DHCP, CA, NTP, login (shared DC checks in `tasks/smoke-dc.yml`) |
 | `snapshot.yml` | Take a disk-level snapshot of one or more VMs (`ops_snapshot`) |
 | `rollback.yml` | Restore a VM from a named snapshot (`ops_snapshot`) |
