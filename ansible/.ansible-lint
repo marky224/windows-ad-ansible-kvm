@@ -1,0 +1,20 @@
+# ansible-lint configuration.
+#
+# Profile = 'min': the only rules that would make Ansible itself fail (syntax-check,
+# load/parser/internal errors). This repo passes 'min' today with zero findings, so the
+# gate is a safety net against genuine breakage in future commits -- conceptually the
+# same role gitleaks plays for secrets, not a style cop.
+#
+# We deliberately do NOT enforce the style/convention profiles (basic and above). Rules
+# like var-naming[no-role-prefix] and name[casing] exist for Galaxy-collection publishing
+# and conflict with this repo's documented house conventions ("role | lowercase | desc"
+# task names; vm_/ad_/r_ variable prefixes). The code is validated on real hardware; a
+# style linter would fight those conventions for no functional gain. Jumping an existing
+# codebase to the production profile is an explicit anti-pattern per ansible-lint's own
+# docs. Full rationale + the rejected-spike evidence live in _private ADR-051.
+#
+# Profiles: https://docs.ansible.com/projects/lint/profiles/
+profile: min
+
+exclude_paths:
+  - files/   # rendered seed fixtures, GPO baseline backups, SCT baseline -- not Ansible content
