@@ -1,0 +1,49 @@
+---
+# net_router_vyos defaults — build VYOS01, the Phase 6 inter-site router VM.
+# (ADR-052 + 2026-06-02 amendment; _private/docs/PHASE6-MULTISITE.md, SM2.)
+#
+# Required from caller (playbook): vm_name (e.g. VYOS01).
+#
+# HOST SAFETY: every task here runs UNPRIVILEGED on kvm_host — qemu-img,
+# virt-install, virsh only, plus files under ~/vm-lab. No become, no mounts, no
+# host-OS edits. The VyOS guest itself is configured separately over SSH
+# (12-configure-vyos.yml via the vyos.vyos collection); THIS role only does VM
+# lifecycle on the host.
+#
+# WHY THIS DELIBERATELY DIFFERS FROM kvm_linux_vm (researched 2026-06-02):
+#   - SeaBIOS + i440fx (machine 'pc'), NOT UEFI/q35. VyOS only vendor-tests BIOS,
+#     and rolling images can't Secure Boot (unsigned shim). i440fx's flat PCI bus
+#     makes the two-NIC enumeration order deterministic (eth0=HQ, eth1=Branch) —
+#     which matters a great deal for a router. (hw-id MAC-binding in the config
+#     play is the belt-and-suspenders so the mapping is anchored to MAC, not slot.)
+#   - Boots the ISO to INSTALL (no --import). There is no free VyOS qcow2 (rolling
+#     ships ISO-only; the prebuilt qcow2 is subscriber-gated), and cloud-init can
+#     CONFIGURE VyOS but cannot INSTALL it to disk. So `install image` is a
+#     one-time interactive step (driven via SPICE send-key — see README), after
+#     which we snapshot a golden base. No cloud-init seed is used.
+#   - Disk-FIRST boot (ADR-053). The blank disk (boot.order=1) is non-bootable, so
+#     SeaBIOS falls through to the ISO (boot.order=2) -> live VyOS installer. Once
+#     `install image` writes GRUB to the disk, every later boot takes the disk; the
+#     ISO is never re-booted, so there's no CD eject and no boot race.
+
+# --- Source media + sizing ---
+vyos_install_iso: "{{ iso_paths.vyos }}"
+vyos_install_iso_sha256: "{{ iso_checksums.vyos | default('') }}"
+vyos_memory_mb: 2048
+vyos_vcpus: 2
+vyos_disk_gb: 10
+vyos_machine_type: pc            # i440fx (flat PCI -> deterministic NIC order). NOT q35.
+vyos_os_variant: debian12        # VyOS rolling is Debian-bookworm-based; libosinfo id (verified present)
+
+# --- Networking: two legs. ORDER MATTERS — HQ network is listed FIRST so it
+#     enumerates as eth0, Branch SECOND as eth1 (i440fx ascending PCI slot =
+#     kernel probe order). The static MACs below MUST match the hw-id pins set in
+#     12-configure-vyos.yml, or VyOS fails config-load on reboot (forum-confirmed). ---
+vyos_hq_network: "{{ corp_subnet.libvirt_network_name }}"        # corp-lab (NAT)      -> eth0 10.10.0.2
+vyos_branch_network: "{{ branch_subnet.libvirt_network_name }}"  # corp-branch (isolated) -> eth1 10.20.0.1
+vyos_hq_mac: "{{ vyos.hq_mac }}"           # 52:54:00:00:00:02 (00 = HQ 10.10, 02 = .2 host octet)
+vyos_branch_mac: "{{ vyos.branch_mac }}"   # 52:54:00:20:00:01 (20 = Branch 10.20, 01 = .1 host octet)
+
+# --- Internal paths ---
+vyos_disk_pool: "{{ libvirt_pools.disks }}"
+vyos_disk_path: "{{ vm_lab_root }}/disks/{{ vm_name }}.qcow2"

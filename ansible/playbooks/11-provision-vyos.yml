@@ -1,0 +1,21 @@
+---
+# Build VYOS01 — the Phase 6 inter-site router VM — from the free VyOS rolling ISO on
+# the KVM host (SM2, ADR-052 + 2026-06-02 amendment; _private/docs/PHASE6-MULTISITE.md).
+#
+# Host-side VM lifecycle ONLY (net_router_vyos role): qemu-img / virt-install / virsh +
+# files under ~/vm-lab. It defines + boots the VM to the live VyOS ISO; the operator then
+# drives the one-time interactive `install image` and the minimal console bootstrap (see
+# roles/net_router_vyos/README.md), after which 12-configure-vyos.yml takes over via SSH.
+#
+# HOST SAFETY: runs only against kvm_host (localhost) for VM lifecycle, UNPRIVILEGED.
+# Explicit VM name VYOS01. It does NOTHING to the host OS.
+#
+# Run: ansible-playbook playbooks/11-provision-vyos.yml
+
+- name: "Provision VYOS01 (Phase 6 inter-site router VM — boots live ISO for install)"
+  hosts: kvm_host
+  gather_facts: false
+  vars:
+    vm_name: "{{ vyos.hostname }}"   # VYOS01 — the libvirt domain name
+  roles:
+    - net_router_vyos

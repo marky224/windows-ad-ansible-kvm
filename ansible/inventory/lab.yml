@@ -42,3 +42,12 @@ all:
       hosts:
         UBUNTU01-corp:
           ansible_host: 10.10.0.60
+    # Phase 6 (ADR-052): the inter-site router VYOS01. Its OWN top-level group — kept
+    # OUT of `windows` (WinRM) and `linux_clients` (which gets domain_join_linux + the
+    # host-safety guards), so no guest-config/join machinery ever touches it. Managed
+    # over SSH via the vyos.vyos network_cli connection (vars in group_vars/routers.yml).
+    # Reached on its HQ leg (10.10.0.2), on-link from the control host's virbr-corp.
+    routers:
+      hosts:
+        VYOS01:
+          ansible_host: 10.10.0.2

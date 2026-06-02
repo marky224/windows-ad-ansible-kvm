@@ -1,0 +1,199 @@
+---
+# Configure the Phase 6 inter-site link (SM2, ADR-052 / _private/docs/PHASE6-MULTISITE.md).
+# Runs AFTER 11-provision-vyos.yml + the one-time console install/bootstrap have made
+# VYOS01 reachable over SSH at its HQ leg (10.10.0.2).
+#
+# Two plays, both guest-config over the network (no localhost is ever a config target):
+#   1. routers (VYOS01, vyos.vyos over SSH) — hw-id pins, eth0/eth1 addresses, default
+#      route, control-node SSH key, netem WAN latency, then `save` (vyos_config commits
+#      but does NOT persist — it must be saved or the config evaporates on reboot).
+#   2. dc (ADDC01, WinRM) — the persistent 10.20.0.0/24 -> 10.10.0.2 route. REQUIRED:
+#      ADDC01's default gateway is the host NAT (10.10.0.1), which cannot cross into the
+#      isolated Branch net, so without this route ADDC01's replies to Branch are black-holed
+#      and the SM2 round-trip verify fails. ADDC02 needs no equivalent — VyOS (10.20.0.1)
+#      already IS its default gateway.
+#
+# NO dhcp-relay here — deferred to SM7 (VyOS T5679 WONTFIX breaks same-interface
+# listen+upstream relay; SM7 uses Windows DHCP failover instead). See the role README.
+#
+# Idempotent: re-running is changed=0 once converged.
+#
+# Run (show scope first, per host-safety):
+#   ansible-playbook playbooks/12-configure-vyos.yml --list-hosts
+#   ansible-playbook playbooks/12-configure-vyos.yml --check
+#   ansible-playbook playbooks/12-configure-vyos.yml
+
+- name: "Configure VYOS01 — inter-site routing, interfaces + WAN emulation (Phase 6 SM2)"
+  hosts: routers
+  gather_facts: false
+  vars:
+    # WAN latency emulation. netem `delay` is a silent no-op without a bandwidth ceiling
+    # (confirmed: VyOS docs + role README + live probe), so both are always set. Disable
+    # with -e vyos_netem_enabled=false to verify clean (sub-ms) routing before layering
+    # the simulated link on top.
+    vyos_netem_enabled: true
+    vyos_netem_bandwidth: "1gbit"     # high ceiling: shape delay only, don't throttle throughput
+    vyos_netem_policy: "WAN-SIM"
+    # SSH key-only auth (disable password auth). OFF by default — this control node has no
+    # SSH key, so enabling key-only without a working key would lock Ansible out of VyOS
+    # (console stays break-glass). Flip true ONLY after a control-node key is installed +
+    # key auth is verified. See ADR-054.
+    vyos_ssh_key_only: false
+  tasks:
+    - name: "vyos | confirm reachable + capture version (evidence)"
+      vyos.vyos.vyos_command:
+        commands:
+          - show version
+      register: r_vyos_version
+
+    - name: "vyos | hostname + hw-id pins + leg addresses + default route"
+      vyos.vyos.vyos_config:
+        lines:
+          - "set system host-name {{ vyos.hostname }}"
+          # hw-id binds eth0/eth1 to their MACs so the HQ/Branch mapping survives reboot
+          # regardless of PCI probe order (forum-confirmed config-load failure otherwise).
+          - "set interfaces ethernet eth0 hw-id {{ vyos.hq_mac }}"
+          - "set interfaces ethernet eth0 address {{ vyos.hq_ip }}/{{ corp_subnet.cidr.split('/')[1] }}"
+          - "set interfaces ethernet eth1 hw-id {{ vyos.branch_mac }}"
+          - "set interfaces ethernet eth1 address {{ vyos.branch_ip }}/{{ branch_subnet.cidr.split('/')[1] }}"
+          # HQ-side egress (e.g. VyOS's own updates) via the host NAT gateway. Inter-site
+          # routing itself needs no static route — both subnets are directly connected.
+          - "set protocols static route 0.0.0.0/0 next-hop {{ corp_subnet.gateway }}"
+
+    # --- control-node SSH key (best-effort; password auth from vault remains the fallback) ---
+    - name: "vyos | locate a control-node SSH public key"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+        - "{{ lookup('env', 'HOME') }}/.ssh/id_rsa.pub"
+      delegate_to: localhost
+      run_once: true
+      register: r_ctrl_pubkeys
+
+    - name: "vyos | select first available control-node pubkey"
+      ansible.builtin.set_fact:
+        _vyos_pubkey_path: >-
+          {{ (r_ctrl_pubkeys.results | selectattr('stat.exists') | map(attribute='stat.path')
+              | list | first) | default('', true) }}
+      run_once: true
+
+    - name: "vyos | install control-node SSH public key for the vyos user (key auth)"
+      vyos.vyos.vyos_config:
+        lines:
+          - "set system login user vyos authentication public-keys {{ _id }} key {{ _data }}"
+          - "set system login user vyos authentication public-keys {{ _id }} type {{ _type }}"
+      vars:
+        _pub: "{{ lookup('file', _vyos_pubkey_path) }}"
+        _type: "{{ _pub.split(' ')[0] }}"
+        _data: "{{ _pub.split(' ')[1] }}"
+        _id: "{{ (_pub.split(' ') | length > 2) | ternary(_pub.split(' ')[2], 'ansible-control') }}"
+      when: _vyos_pubkey_path | length > 0
+
+    # --- SSH hardening. dynamic-protection = sshguard brute-force lockout; listen-address
+    #     pins sshd to the HQ management leg only (the Branch leg never offers SSH). An
+    #     sshd restart on commit does NOT drop the already-established network_cli session
+    #     (the forked session process survives the master restart), so this is safe to apply
+    #     mid-play. disable-password-authentication is the key-only end-state, GATED behind
+    #     vyos_ssh_key_only (off until a control-node key exists + is verified). See ADR-054. ---
+    - name: "vyos | harden SSH (brute-force dynamic-protection + pin listen to the HQ leg)"
+      vyos.vyos.vyos_config:
+        lines:
+          - "set service ssh dynamic-protection"
+          - "set service ssh listen-address {{ vyos.hq_ip }}"
+
+    - name: "vyos | SSH key-only auth (disable password auth) — opt-in; needs a verified key"
+      vyos.vyos.vyos_config:
+        lines:
+          - "set service ssh disable-password-authentication"
+      when: vyos_ssh_key_only | bool
+
+    # --- WAN latency emulation (netem). Bound to the BRANCH-facing egress (eth1) ONLY:
+    #     every HQ<->Branch round-trip crosses eth1-egress exactly once, so this yields
+    #     ~{{ vyos.wan_latency_ms }}ms inter-site RTT while leaving the HQ leg (eth0 =
+    #     Ansible/SSH management + ADDC01) completely UNSHAPED. Delay-only, NO packet-loss:
+    #     DFSR/SYSVOL + AD RPC replication tolerate latency but degrade badly under loss, and
+    #     the lab must replicate reliably in SM5+. `bandwidth` is a deliberately-high ceiling
+    #     (netem's TBF REQUIRES one for `delay` to take effect) so we shape latency, not
+    #     throughput — never starving the initial SYSVOL/DFSR sync. SYNTAX verified live on
+    #     this 2026.05.30 rolling build: the leaf is `delay <int-ms>`, NOT the docs'
+    #     `delay <ms-with-unit>`/`network-delay` (both rejected). See ADR-054. ---
+    - name: "vyos | WAN latency emulation on the Branch egress (~{{ vyos.wan_latency_ms }}ms inter-site RTT, netem)"
+      vyos.vyos.vyos_config:
+        lines:
+          - "set qos policy network-emulator {{ vyos_netem_policy }} bandwidth {{ vyos_netem_bandwidth }}"
+          - "set qos policy network-emulator {{ vyos_netem_policy }} delay {{ vyos.wan_latency_ms }}"
+          - "set qos interface eth1 egress {{ vyos_netem_policy }}"
+      when: vyos_netem_enabled | bool
+
+    - name: "vyos | persist running config to boot config (save — vyos_config does NOT persist)"
+      vyos.vyos.vyos_config:
+        save: true
+
+    - name: "vyos | show interfaces + routing table (evidence)"
+      vyos.vyos.vyos_command:
+        commands:
+          - show interfaces
+          - show ip route
+      register: r_vyos_state
+
+    - name: "vyos | ping ADDC01 (HQ leg) and ADDC02 (Branch leg) from VYOS01"
+      vyos.vyos.vyos_command:
+        commands:
+          - "ping {{ corp_subnet.dc_ip }} count 3"
+          - "ping {{ branch_subnet.dc_ip }} count 3"
+      register: r_vyos_ping
+      # ADDC02 may be powered off at SM2 time; don't fail the config run on an unreachable leg.
+      failed_when: false
+
+    - name: "vyos | inter-site reachability summary (from the router)"
+      ansible.builtin.debug:
+        msg: "{{ r_vyos_ping.stdout | default(['(ping not run)']) }}"
+
+- name: "Wire the HQ->Branch route on ADDC01 (reach 10.20.0.0/24 via the VyOS HQ leg)"
+  hosts: dc
+  gather_facts: false
+  tasks:
+    # `route -p add` writes the persistent (registry) route AND installs it into the live
+    # table in one shot — the reliable way to get BOTH on Windows. (New-NetRoute -PolicyStore
+    # PersistentStore is rejected on Server 2025 unless you pass -InterfaceAlias instead of
+    # -InterfaceIndex; route.exe sidesteps that.) Idempotent + self-reconciling: a no-op when
+    # both stores already hold the route, otherwise it clears any partial/stale entry and
+    # re-adds cleanly. Post-write verify reads the live table. See ADR-054.
+    - name: "addc01 | persistent + active route {{ branch_subnet.cidr }} -> {{ vyos.hq_ip }} (VYOS01 HQ leg)"
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $dest = '{{ branch_subnet.cidr }}'
+          $net  = $dest.Split('/')[0]
+          $mask = '{{ branch_subnet.netmask }}'
+          $nh   = '{{ vyos.hq_ip }}'
+          $active  = Get-NetRoute -DestinationPrefix $dest -PolicyStore ActiveStore     -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq $nh }
+          $persist = Get-NetRoute -DestinationPrefix $dest -PolicyStore PersistentStore -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq $nh }
+          if ($active -and $persist) {
+            $Ansible.Changed = $false
+          } else {
+            & route.exe DELETE $net MASK $mask 2>&1 | Out-Null         # clear any partial/stale entry (no-op if none)
+            $out = & route.exe -p ADD $net MASK $mask $nh METRIC 1
+            if ($LASTEXITCODE -ne 0) { throw "route -p add failed (rc=$LASTEXITCODE): $out" }
+            $Ansible.Changed = $true
+          }
+          # post-write verify against the LIVE table — fail loudly if the route isn't present
+          $live = Get-NetRoute -DestinationPrefix $dest -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq $nh }
+          if (-not $live) { throw "route $dest via $nh not present in the active table after write" }
+          $Ansible.Result = ($live | Select-Object -First 1 DestinationPrefix, NextHop, RouteMetric)
+
+    - name: "addc01 | reachability check ADDC01 -> ADDC02 through VYOS01 (informational)"
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $ok = Test-Connection -ComputerName '{{ branch_subnet.dc_ip }}' -Count 2 -Quiet
+          $Ansible.Result = @{ target = '{{ branch_subnet.dc_ip }}'; reachable = [bool]$ok }
+          $Ansible.Changed = $false
+      register: r_addc01_to_addc02
+
+    - name: "addc01 | inter-site reachability summary"
+      ansible.builtin.debug:
+        msg: >-
+          ADDC01 -> ADDC02 ({{ branch_subnet.dc_ip }}) through VYOS01:
+          {{ 'REACHABLE' if (r_addc01_to_addc02.result.reachable | default(false)) else 'not reachable (ADDC02 may be powered off — start it for the full SM2 round-trip verify)' }}

@@ -58,7 +58,14 @@ vyos:
   hostname: VYOS01
   hq_ip: 10.10.0.2
   branch_ip: 10.20.0.1
-  wan_latency_ms: 40             # netem one-way, simulates the inter-site link
+  # NIC MACs — anchor the eth0=HQ / eth1=Branch mapping (net_router_vyos lists the HQ
+  # network FIRST so it enumerates as eth0). The hw-id pins in 12-configure-vyos.yml
+  # bind these MACs to eth0/eth1 so the mapping survives reboots regardless of PCI slot
+  # order. Scheme = 52:54:00:<subnet-octet>:00:<host-octet>; collision-checked vs all 5
+  # existing NICs (ADDC01 ..00:00:10, ADDC02 ..20:00:10, clients ..11:11:xx / ..22:22:xx).
+  hq_mac: "52:54:00:00:00:02"      # corp-lab leg    -> eth0 = 10.10.0.2 (00 = HQ 10.10, 02 = .2)
+  branch_mac: "52:54:00:20:00:01"  # corp-branch leg -> eth1 = 10.20.0.1 (20 = Branch 10.20, 01 = .1)
+  wan_latency_ms: 40             # netem delay on the Branch (eth1) egress -> ~40ms inter-site RTT (each HQ<->Branch round-trip crosses it once); see 12-configure-vyos.yml + ADR-054
 
 # Networks the kvm_network role provisions. Each entry renders network.xml.j2.
 # corp-lab keeps forward=nat (byte-identical to its pre-Phase-6 definition);

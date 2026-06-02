@@ -1,0 +1,23 @@
+---
+# Connection profile for VyOS network devices — the Phase 6 inter-site router VYOS01
+# (ADR-052). Managed via the vyos.vyos collection over SSH using the
+# ansible.netcommon.network_cli connection; the modules run on the CONTROL node, so
+# there is no Python interpreter on the target.
+#
+# HOST SAFETY: VYOS01 is a guest reached over SSH on its HQ leg (10.10.0.2). It is in
+# its own `routers` group, never `localhost`/`kvm_host` — managing it touches nothing
+# on the control host.
+ansible_connection: ansible.netcommon.network_cli
+ansible_network_os: vyos.vyos.vyos
+ansible_user: vyos
+
+# Bootstrap auth = the password set during `install image` (vault). 12-configure-vyos.yml
+# additionally installs the control-node SSH public key (key auth); the password stays
+# as the from-scratch-rebuild path that exists before the key is in place.
+ansible_password: "{{ vault_vyos_password }}"
+
+# First connect: trust + record VyOS's SSH host key without an interactive prompt, while
+# still detecting a CHANGED key on later connects. host_key_checking=false keeps a
+# from-scratch rebuild (new host key on the same IP) from blocking on a known_hosts clash.
+ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"
+ansible_host_key_checking: false

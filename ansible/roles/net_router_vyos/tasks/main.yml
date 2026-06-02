@@ -1,0 +1,111 @@
+---
+# Build VYOS01 — the Phase 6 inter-site router VM — from the free VyOS rolling
+# ISO. This role does ONLY VM lifecycle on the kvm_host; the running router is
+# configured over SSH by 12-configure-vyos.yml (vyos.vyos collection).
+#
+# The `install image` step is INTERACTIVE (VyOS has no unattended ISO install and
+# no free cloud-init qcow2) — this role defines + boots the VM to the live ISO;
+# the operator then drives ~10 console prompts via _private/scripts/typestr.py
+# (see roles/net_router_vyos/README.md). Disk-first boot (ADR-053) means re-runs
+# after install boot straight to the installed system, so this role stays
+# idempotent ("domain already exists" is a skip).
+#
+# HOST SAFETY: runs only on kvm_host, UNPRIVILEGED. qemu-img / virt-install /
+# virsh + files under ~/vm-lab only. No become, no mounts, no host-OS edits.
+
+- name: "net_router_vyos | SAFETY GUARD — runs only on the kvm_host, never a guest"
+  ansible.builtin.assert:
+    that:
+      - "inventory_hostname in groups.get('kvm_host', [])"
+      - "ansible_connection == 'local'"
+      - "vm_name is defined"
+    fail_msg: "net_router_vyos must run on kvm_host (local connection) with vm_name set."
+  become: false
+
+- name: "net_router_vyos | stat the VyOS rolling ISO (+ sha256)"
+  ansible.builtin.stat:
+    path: "{{ vyos_install_iso }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  register: r_vyos_iso
+
+- name: "net_router_vyos | fail if the VyOS ISO is missing"
+  ansible.builtin.fail:
+    msg: >-
+      VyOS rolling ISO missing at {{ vyos_install_iso }}. Stage it with
+      _private/scripts/vyos-fetch.sh (downloads + checksums into {{ iso_dir }}).
+  when: not r_vyos_iso.stat.exists
+
+- name: "net_router_vyos | verify VyOS ISO SHA256 (defense-in-depth)"
+  ansible.builtin.assert:
+    that: "r_vyos_iso.stat.checksum == vyos_install_iso_sha256"
+    fail_msg: >-
+      VyOS ISO SHA256 mismatch at {{ vyos_install_iso }}:
+      got {{ r_vyos_iso.stat.checksum }}, expected {{ vyos_install_iso_sha256 }}.
+      Re-fetch via _private/scripts/vyos-fetch.sh.
+    success_msg: "VyOS ISO SHA256 matches the pinned value."
+  when: vyos_install_iso_sha256 | length > 0
+
+- name: "net_router_vyos | ensure disks dir exists"
+  ansible.builtin.file:
+    path: "{{ vm_lab_root }}/disks"
+    state: directory
+    mode: "0755"
+
+- name: "net_router_vyos | create BLANK qcow2 install target ({{ vyos_disk_gb }}G)"
+  ansible.builtin.command:
+    cmd: qemu-img create -f qcow2 {{ vyos_disk_path }} {{ vyos_disk_gb }}G
+    creates: "{{ vyos_disk_path }}"
+
+- name: "net_router_vyos | refresh {{ vyos_disk_pool }} pool"
+  community.libvirt.virt_pool:
+    name: "{{ vyos_disk_pool }}"
+    command: refresh
+
+- name: "net_router_vyos | list existing libvirt domains (idempotency check)"
+  ansible.builtin.command:
+    cmd: virsh -c qemu:///system list --all --name
+  register: existing_domains
+  changed_when: false
+  check_mode: false
+
+# Disk-FIRST boot (ADR-053): the blank disk (boot.order=1) has no boot sector, so
+# SeaBIOS falls through to the ISO (boot.order=2) -> live VyOS installer. After
+# `install image` writes GRUB to the disk, every later boot takes the disk; the
+# CD entry is never reached, so the install never re-fires. `--install
+# no_install=yes` defines + boots WITHOUT an automated install (manual install).
+# `--machine pc` (i440fx) + no `--boot uefi` => SeaBIOS, flat PCI, deterministic
+# eth0=HQ / eth1=Branch (HQ NIC listed first).
+- name: "net_router_vyos | define + start {{ vm_name }} (boots VyOS live ISO for install)"
+  ansible.builtin.command:
+    cmd: >-
+      virt-install --connect qemu:///system
+      --name {{ vm_name }}
+      --osinfo {{ vyos_os_variant }}
+      --memory {{ vyos_memory_mb }}
+      --vcpus {{ vyos_vcpus }}
+      --machine {{ vyos_machine_type }}
+      --cpu host-passthrough
+      --disk path={{ vyos_disk_path }},bus=virtio,format=qcow2,boot.order=1
+      --disk path={{ vyos_install_iso }},device=cdrom,bus=sata,boot.order=2
+      --network network={{ vyos_hq_network }},model=virtio,mac={{ vyos_hq_mac }}
+      --network network={{ vyos_branch_network }},model=virtio,mac={{ vyos_branch_mac }}
+      --graphics spice,listen=127.0.0.1
+      --video qxl
+      --noautoconsole
+      --wait 0
+      --install no_install=yes
+  when: vm_name not in existing_domains.stdout_lines
+
+- name: "net_router_vyos | ensure libvirt domain {{ vm_name }} is running"
+  community.libvirt.virt:
+    name: "{{ vm_name }}"
+    state: running
+
+- name: "net_router_vyos | NEXT STEP (interactive, one-time)"
+  ansible.builtin.debug:
+    msg:
+      - "{{ vm_name }} is booting the VyOS live ISO."
+      - "Drive `install image` via SPICE (see roles/net_router_vyos/README.md), then"
+      - "apply the minimal console bootstrap, then run 12-configure-vyos.yml."
+  when: vm_name not in existing_domains.stdout_lines
