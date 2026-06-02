@@ -2,7 +2,8 @@
 # Static inventory for the corp AD lab.
 # Groups:
 #   - windows (parent): WinRM connection vars in group_vars/windows.yml
-#     - dc: the domain controller (gets ad_* roles)
+#     - dc: the primary domain controller (gets ad_* roles; holds all FSMO)
+#     - dc_replica: Phase 6 Branch-Site replica DC (ADDC02); pre-promo identity = local admin
 #     - clients: domain-joined Win 11 workstations
 #   - linux_clients: domain-joined Ubuntu hosts (SSH)
 # IPs match _private/docs/NETWORK.md (DC owns DHCP, clients have MAC-tied reservations).
@@ -22,6 +23,15 @@ all:
           hosts:
             ADDC01-corp:
               ansible_host: 10.10.0.10
+        # Phase 6 (ADR-052): the Branch-Site replica DC. Sits under `windows` so it
+        # inherits WinRM connection vars, but NOT under `dc` (that group carries the
+        # primary/FSMO/named-admin identity). Pre-promotion it uses windows.yml's
+        # local Administrator; a dc_replica.yml will switch it to the domain identity
+        # after SM5 promotion. Reached over the host's passive virbr-branch leg.
+        dc_replica:
+          hosts:
+            ADDC02-corp:
+              ansible_host: 10.20.0.10
         clients:
           hosts:
             CLIENT01-corp:

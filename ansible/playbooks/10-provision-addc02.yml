@@ -1,0 +1,58 @@
+---
+# Build ADDC02-corp: Windows Server 2025 Std + Desktop Experience — the Branch-Site
+# replica DC VM — on the ISOLATED corp-branch network with a static 10.20.0.10.
+# This is the PRE-PROMOTION build only (Phase 6 SM4, ADR-052 / PHASE6-MULTISITE.md).
+#
+# Why this is router-independent: the install runs fully offline (Autounattend
+# skips OOBE; bootstrap.ps1 forces the NIC profile to Private so the WinRM firewall
+# rule survives the unreachable gateway), and the control host reaches WinRM on
+# 10.20.0.10 ON-LINK via its passive virbr-branch leg (10.20.0.2). PROMOTION (SM5)
+# is what needs VyOS up — ADDC02 must reach ADDC01 (10.10.0.10) to replicate.
+#
+# DNS is pre-pointed at ADDC01 and the default gateway at the VyOS branch leg so
+# the box is promo-ready the instant the inter-site link exists. Neither is
+# reachable yet; that is expected and harmless for the build (no DNS needed to
+# install + bootstrap WinRM).
+#
+# Reuses the battle-tested kvm_windows_vm role with Branch overrides:
+#   - vm_network = corp-branch (isolated); vm_static_ip = 10.20.0.10
+#   - vm_dns_servers = [10.10.0.10] (ADDC01) — pre-promo resolver
+#   - 8 GB / 4 vCPU (replica budget; primary ADDC01 runs 12 GB / 6 vCPU because it
+#     also carries DHCP/DNS/AD CS/WSUS)
+#   - vTPM 2.0 enabled (swtpm socket-perm fixed in ADR-040; parity + future BitLocker)
+#
+# HOST SAFETY: runs only against kvm_host (localhost) for VM lifecycle — qemu-img
+# /virt-install/virsh/xorriso + files under ~/vm-lab, explicit VM name ADDC02-corp.
+# It does NOTHING to the host OS.
+#
+# Run: ansible-playbook playbooks/10-provision-addc02.yml
+
+- name: "Provision ADDC02-corp (Branch-Site replica DC VM — pre-promotion)"
+  hosts: kvm_host
+  gather_facts: false
+  vars:
+    vm_name: ADDC02-corp
+    vm_mac: "52:54:00:20:00:10"                            # 20 = branch (10.20), 10 = host octet
+    vm_install_iso: "{{ iso_paths.windows_server_2025 }}"   # ADR-035 patched ISO; shared stage already built
+    vm_install_iso_sha256: "{{ iso_checksums.windows_server_2025 | default('') }}"
+    vm_wim_image_name: "Windows Server 2025 SERVERSTANDARD"
+    vm_network: "{{ branch_subnet.libvirt_network_name }}"  # corp-branch (ISOLATED — no NAT/internet)
+    vm_static_ip: "{{ branch_subnet.dc_ip }}"               # 10.20.0.10
+    vm_default_gateway: "{{ branch_subnet.gateway }}"       # 10.20.0.1 (VyOS branch leg — pre-set, down until SM2)
+    vm_netmask_prefix: 24
+    # Pre-promotion DNS: point at ADDC01 so promotion (SM5) finds the forest the
+    # moment VyOS routes. Unreachable until then — fine; the build needs no DNS.
+    vm_dns_servers:
+      - "{{ corp_subnet.dc_ip }}"                           # 10.10.0.10 (ADDC01)
+    # vTPM 2.0 — swtpm socket-permission issue fixed in ADR-040 (dynamic_ownership=1).
+    vm_enable_tpm: true
+    vm_secure_boot: true
+    # Replica sizing — lighter than the primary (no DHCP/DNS/AD CS/WSUS load).
+    vm_memory_mb: 8192
+    vm_vcpus: 4
+    # Disk-first boot (no eject) means the role's WinRM wait now spans the WHOLE
+    # unattended install + Windows Setup's natural reboots + bootstrap, not just a
+    # post-eject window. 40 min gives comfortable margin over the ~16-20 min reality.
+    vm_winrm_timeout: 2400
+  roles:
+    - kvm_windows_vm
