@@ -16,16 +16,49 @@ function Log($msg) {
 try {
     Log "Bootstrap start (Computer=$env:COMPUTERNAME)"
 
+    # Declarative belt-and-suspenders for isolated/gateway-less segments (Phase 6
+    # Branch): the Network List Manager policy "Unidentified Networks = Private"
+    # (well-known signature GUID below) makes Windows classify any network it cannot
+    # identify as Private automatically, with no dependence on Set-NetConnectionProfile
+    # timing. Ref: MS Learn "Network List Manager policies". Pure registry write, so it
+    # cannot hit the 'Identifying...' race. Harmless on identified nets (DC/clients):
+    # their networks are identified, so the unidentified-network policy never applies.
+    Log "Set NLM policy: Unidentified Networks -> Private (deterministic for isolated nets)"
+    $nlmUnidentified = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\010103000F0000F0010000000F0000F0C967A3643C3AD745950DA7859209176EF5B87C875FA20DF21951640E807D7C24'
+    New-Item -Path $nlmUnidentified -Force | Out-Null
+    New-ItemProperty -Path $nlmUnidentified -Name 'Category' -PropertyType DWord -Value 1 -Force | Out-Null
+
     # Server 2025 24H2 regression: NLA may classify the network as Public
     # before/during this script's run, which silently disables WinRM rules
     # scoped to Domain/Private. Force the profile to Private up-front, then
     # ensure NlaSvc is auto-start (it's disabled by default on Server 2025).
     # Refs: techcommunity Server 2025 "always shows network as public" regression,
     # frankysweb, woshub, StefanScherer/packer-windows enable-winrm.ps1.
-    Log "Force network profile Private (defend vs Server 2025 NLA-classifies-Public regression)"
-    Get-NetConnectionProfile | ForEach-Object {
-        Set-NetConnectionProfile -InterfaceAlias $_.InterfaceAlias -NetworkCategory Private
-    }
+    #
+    # ISOLATED-NETWORK race (Phase 6 Branch DC, found 2026-06-01): on a network with
+    # no reachable gateway (e.g. ADDC02 on corp-branch before VyOS is up), NLA sits in
+    # 'Identifying...' for tens of seconds after boot. Set-NetConnectionProfile THROWS
+    # on an 'Identifying...' profile, and with $ErrorActionPreference='Stop' that
+    # aborted bootstrap before the HTTPS listener was ever created (5985 default
+    # listener up, 5986 never). Fix: retry while NLA settles, and treat a persistent
+    # failure as NON-FATAL -- the WinRM HTTPS firewall rule below is '-Profile Any',
+    # so reachability does not depend on the profile actually being Private.
+    Log "Force network profile Private (best-effort; retries while NLA is 'Identifying')"
+    $profileDeadline = (Get-Date).AddSeconds(120)
+    do {
+        $profilePending = $false
+        foreach ($ncp in Get-NetConnectionProfile) {
+            try {
+                Set-NetConnectionProfile -InterfaceAlias $ncp.InterfaceAlias -NetworkCategory Private -ErrorAction Stop
+                Log "  set Private on '$($ncp.InterfaceAlias)'"
+            } catch {
+                $profilePending = $true
+                Log "  '$($ncp.InterfaceAlias)' not settable yet (NLA still identifying); will retry"
+            }
+        }
+        if ($profilePending) { Start-Sleep -Seconds 5 }
+    } while ($profilePending -and (Get-Date) -lt $profileDeadline)
+    if ($profilePending) { Log "  WARNING: profile not set to Private before deadline; continuing (WinRM rule is -Profile Any)" }
     Log "Set NlaSvc StartupType Automatic"
     Set-Service -Name NlaSvc -StartupType Automatic -ErrorAction SilentlyContinue
 

@@ -212,10 +212,17 @@
 # Pre-enroll BootOrder pointing at the standard fallback EFI loader path
 # (\EFI\BOOT\BOOTX64.EFI) — which the custom-install-ISO build has swapped
 # to cdboot_noprompt.efi for unattended boot.
-- name: "kvm_windows_vm | pre-enroll BootOrder in per-VM NVRAM {{ vm_nvram_path }}"
+- name: "kvm_windows_vm | pre-enroll DISK-FIRST BootOrder in per-VM NVRAM {{ vm_nvram_path }}"
+  # Deterministic boot order (replaces the old eject race, 2026-06-02): enroll the
+  # Windows loader FIRST and the install-CD fallback SECOND, so
+  #   BootOrder = [\EFI\Microsoft\Boot\bootmgfw.efi (disk), \EFI\BOOT\BOOTX64.EFI (CD)].
+  # Boot 1 (blank disk): bootmgfw is Not Found -> OVMF falls through to the CD ->
+  # WinPE installs + bcdboot writes the disk ESP. Boot 2+: bootmgfw exists -> Windows
+  # boots; the CD entry is never reached, so WillWipeDisk never re-fires. No eject.
   ansible.builtin.shell:
     cmd: >-
       cp {{ vm_uefi_vars_template }} {{ vm_nvram_path }} &&
+      virt-fw-vars --inplace {{ vm_nvram_path }} --append-boot-filepath '\EFI\Microsoft\Boot\bootmgfw.efi' &&
       virt-fw-vars --inplace {{ vm_nvram_path }} --append-boot-filepath '\EFI\BOOT\BOOTX64.EFI'
     creates: "{{ vm_nvram_path }}"
 
@@ -243,8 +250,8 @@
       --boot uefi{{ ',firmware.feature0.enabled=no,firmware.feature0.name=secure-boot' if not vm_secure_boot else '' }},nvram={{ vm_nvram_path }}
       {% if vm_enable_tpm | bool %}--tpm model=tpm-crb,backend.type=emulator,backend.version={{ vm_tpm_version }}{% else %}--tpm none{% endif %}
       --controller scsi,model=virtio-scsi
-      --disk path={{ vm_disk_path }},bus=scsi,format=qcow2
-      --disk path={{ vm_custom_install_iso_path }},device=cdrom,bus=sata,boot.order=1
+      --disk path={{ vm_disk_path }},bus=scsi,format=qcow2,boot.order=1
+      --disk path={{ vm_custom_install_iso_path }},device=cdrom,bus=sata,boot.order=2
       --disk path={{ vm_virtio_win_iso }},device=cdrom,bus=sata
       --disk path={{ vm_seed_iso_path }},device=cdrom,bus=sata
       --network network={{ vm_network }},model=virtio{% if vm_mac is defined %},mac={{ vm_mac }}{% endif %}

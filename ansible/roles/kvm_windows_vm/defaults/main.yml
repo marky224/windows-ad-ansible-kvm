@@ -89,15 +89,21 @@ vm_wait_for_winrm: true
 vm_winrm_port: 5986
 vm_winrm_timeout: 1800                    # 30 minutes — Server 2025 unattended install + reboots
 
-# --- Install CD eject (post-WinPE-pass) — ADR-043 ---
-# Without this, OVMF keeps booting the install CD (boot.order=1) on every Setup
-# reboot → WillWipeDisk re-wipes ESP → endless install loop. After WinPE applies
-# install.wim + bcdboot writes the disk's Windows Boot Manager, disk writes STALL
-# just before the reboot; we detect that stall (OS-agnostic) and eject +
-# cold-restart so the firmware boots the disk. Replaces the old SPICE
-# screen-blank detector, which never fired on Win 11's solid-blue screen
-# (→ CD-boot-loop; hung two clients overnight 2026-05-30).
-vm_eject_install_cd_after_winpe: true
+# --- Install CD eject (post-WinPE-pass) — ADR-043, SUPERSEDED 2026-06-02 ---
+# DEFAULT IS NOW false. The old eject+cold-restart broke the CD-boot-loop by
+# detecting a disk-write-stall, then hard-destroying + cold-starting the VM. That
+# was a RACE: the hard destroy could interrupt bcdboot before it finished writing
+# the disk's \EFI\Microsoft\Boot\bootmgfw.efi, leaving an UNBOOTABLE disk ("No
+# bootable option" at OVMF). Hit on the Phase 6 ADDC02 build 2026-06-02 and proven
+# by offline ESP inspection (empty /EFI — no bootmgfw, no BCD).
+#
+# Replaced by a DETERMINISTIC disk-first boot order (see the NVRAM pre-enroll task
+# + virt-install boot.order): BootOrder = [bootmgfw.efi (disk), BOOTX64.EFI (CD)].
+# A blank disk falls through to the CD installer (OVMF iterates BootOrder on
+# failure — verified on-screen); once WinPE+bcdboot write the disk ESP, every later
+# boot takes the disk and the CD is never re-booted, so WillWipeDisk never re-fires.
+# No eject, no cold-restart, no timing race. Set true only to restore the old path.
+vm_eject_install_cd_after_winpe: false
 vm_install_cd_target_dev: sdb             # SATA port 1 — first CD after the virtio-scsi disk
 vm_eject_poll_secs: 3                     # disk-size poll interval
 vm_eject_stall_samples: 4                 # consecutive no-growth polls (4 × 3s = 12s) = WinPE done
