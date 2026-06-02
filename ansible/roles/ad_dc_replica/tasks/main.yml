@@ -1,0 +1,135 @@
+---
+# Promote a fresh Windows Server VM into an ADDITIONAL (replica) DC of the EXISTING
+# corp.markandrewmarquez.com forest — the Branch-Site DC, ADDC02. Phase 6 SM5.
+#
+# Expected caller state: ADDC02-corp built by kvm_windows_vm (SM4), a pre-promo
+# WORKGROUP box; WinRM HTTPS reachable on 10.20.0.10 over the host's passive
+# virbr-branch leg; DNS client -> ADDC01 (10.10.0.10); default gateway -> VyOS
+# (10.20.0.1) so it reaches ADDC01's LDAP/RPC across the inter-site link.
+#
+# IDENTITY (ADR-033 / ADR-055): the calling play (13-promote-addc02.yml, Play 1)
+# overrides ansible_user to the LOCAL 'Administrator' + ansible_password to
+# vault_dc_admin_password — the ONLY identity that works on the pre-promo box.
+# The DOMAIN credential that authorizes the promotion is passed to the module
+# (domain_admin_user = madmin-da). Post-promotion neither local Administrator
+# (local SAM removed) nor domain RID 500 (SMARTCARD_REQUIRED, replicated from
+# ADDC01) can WinRM in, so verification runs as madmin-da in a SEPARATE play.
+#
+# ADRs implemented: ADR-052 (multi-site topology), ADR-055 (replica promotion shape).
+#
+# ── KEY DIFFERENCES vs the ad_dc (first-DC) role ───────────────────────────────
+#   * microsoft.ad.domain_controller (state=domain_controller), NOT .domain.
+#   * reboot: false + a manual fire-and-forget reboot in the playbook (the module's
+#     reboot:true would reconnect as the now-invalid local Administrator).
+#   * NO first-DC init-sync bypass. ad_dc sets NTDS "Repl Perform Initial
+#     Synchronizations"=0 so the FIRST DC (no partner) doesn't wait forever. A
+#     REPLICA *must* wait to inbound-sync from ADDC01 — carrying that key would let
+#     ADDC02 advertise before it holds the data (lingering-object / USN risk). This
+#     omission is the single most important correctness point of the role.
+#   * Verification (repadmin/replication/DFSR/dcdiag) lives in verify.yml, run by
+#     Play 2 as madmin-da AFTER the reboot — see that file.
+
+- name: "ad_dc_replica | sanity-check Windows ComputerName is {{ ad_dc_replica_expected_hostname }}"
+  ansible.windows.win_command: hostname
+  register: r_hostname
+  changed_when: false
+  failed_when: (r_hostname.stdout | trim) != ad_dc_replica_expected_hostname
+
+- name: "ad_dc_replica | install AD-Domain-Services Windows feature (with management tools)"
+  ansible.windows.win_feature:
+    name: AD-Domain-Services
+    include_management_tools: true   # RSAT-AD-PowerShell + repadmin/dcdiag for verify.yml
+    state: present
+  register: r_addsfeature
+
+# Defense-in-depth for the Server 2025 NLA-Public regression (CARRIED from ad_dc).
+# On unpatched Server 2025 the post-promotion reboot can reclassify the NIC as
+# Public, breaking Netlogon's secure DNS dynamic updates. These three durable keys
+# tell NLA to trust the network is domain-attached. Harmless on a healthy patched DC.
+- name: "ad_dc_replica | pre-stage NLA-Public regression durability fix (Server 2025 defense-in-depth)"
+  ansible.windows.win_powershell:
+    script: |
+      $keys = @(
+          @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters';   Name = 'AlwaysExpectDomainController'; Value = 1 },
+          @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name = 'NegativeCachePeriod';          Value = 0 },
+          @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters'; Name = 'MaxNegativeCacheTtl';          Value = 0 }
+      )
+      $set = @()
+      foreach ($k in $keys) {
+          if (-not (Test-Path $k.Path)) { New-Item -Path $k.Path -Force | Out-Null }
+          $current = (Get-ItemProperty -Path $k.Path -Name $k.Name -ErrorAction SilentlyContinue).($k.Name)
+          if ($current -ne $k.Value) {
+              Set-ItemProperty -Path $k.Path -Name $k.Name -Value $k.Value -Type DWord
+              $set += "$($k.Name)=$($k.Value)"
+          }
+      }
+      $Ansible.Changed = ($set.Count -gt 0)
+      $Ansible.Result = @{ AppliedOrAlreadyCorrect = $true; Changed = $set }
+  register: r_nla_durable
+
+# Codifies the firewall rule that was applied ad-hoc during SM2 verification so
+# ADDC02 answers ICMP echo (aids SM5/SM8 + the SM9 DR drill ping checks). Durable;
+# applied pre-promo, survives the promotion reboot. Idempotent.
+- name: "ad_dc_replica | ensure inbound ICMPv4 echo firewall rule (lab ping reachability)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $name = 'Lab-Allow-ICMPv4-Echo-In'
+      $rule = Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
+      if (-not $rule) {
+          New-NetFirewallRule -Name $name -DisplayName 'Lab - Allow ICMPv4 Echo Request (In)' `
+              -Protocol ICMPv4 -IcmpType 8 -Direction Inbound -Action Allow -Profile Any | Out-Null
+          $Ansible.Changed = $true
+      } else {
+          $Ansible.Changed = $false
+      }
+      $Ansible.Result = @{ Rule = $name; Existed = [bool]$rule }
+  register: r_icmp_rule
+
+# A DC MUST register its locator records (SRVs + the <dsa-guid>._msdcs CNAME) in DNS.
+# kvm_windows_vm's Autounattend deliberately ships NICs with
+# EnableAdapterDomainNameRegistration=false + DisableDynamicUpdate=true (so a VM does
+# not spam dynamic updates at an unreachable DNS during the offline/isolated install).
+# ADDC01 got registration re-enabled along its first-DC DNS-install path; a REPLICA
+# does not. Without this, post-promo Netlogon registration fails with event 5782
+# "No DNS servers configured for local system" and NONE of ADDC02's locator records
+# register -> dcdiag Connectivity fails AND ADDC01 cannot resolve ADDC02's _msdcs
+# CNAME to bind it for OUTBOUND replication. Re-enable BEFORE promotion so Netlogon
+# registers cleanly on first boot as a DC. (SM5 root-cause finding, ADR-055.)
+- name: "ad_dc_replica | ensure NIC registers its addresses in DNS (required for DC locator records)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $enabled = @()
+      foreach ($nic in (Get-DnsClient | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|isatap|Teredo|Pseudo' })) {
+          if (-not $nic.RegisterThisConnectionsAddress) {
+              Set-DnsClient -InterfaceAlias $nic.InterfaceAlias -RegisterThisConnectionsAddress $true -UseSuffixWhenRegistering $true
+              $enabled += $nic.InterfaceAlias
+          }
+      }
+      $Ansible.Changed = ($enabled.Count -gt 0)
+      $Ansible.Result  = @{ EnabledRegistrationOn = $enabled; AlreadyCorrect = ($enabled.Count -eq 0) }
+  register: r_dnsreg
+
+# THE PROMOTION. reboot:false -> the module configures the DC and returns
+# reboot_required=true WITHOUT rebooting; the playbook triggers the reboot itself
+# (fire-and-forget, as local admin, while that identity is still valid). Connects
+# locally as the play's local Administrator but uses the DOMAIN admin (madmin-da)
+# credential to authenticate the join + initial replication from ADDC01.
+- name: "ad_dc_replica | promote ADDC02 to a replica DC of {{ forest.fqdn }} ({{ ad_dc_replica_site_name }})"
+  microsoft.ad.domain_controller:
+    state: domain_controller
+    dns_domain_name: "{{ forest.fqdn }}"
+    domain_admin_user: "{{ named_admin.upn }}"
+    domain_admin_password: "{{ vault_named_admin_password }}"
+    safe_mode_password: "{{ safe_mode_password }}"
+    site_name: "{{ ad_dc_replica_site_name }}"
+    install_dns: "{{ ad_dc_replica_install_dns }}"
+    read_only: "{{ ad_dc_replica_read_only }}"
+    replication_source_dc: "{{ ad_dc_replica_source_dc_fqdn }}"
+    reboot: false   # NOT true — Play 2 owns the reconnect as madmin-da (see role/playbook header)
+  register: r_promote
+
+- name: "ad_dc_replica | show promotion result (reboot_required drives the playbook's reboot)"
+  ansible.builtin.debug:
+    msg: "changed={{ r_promote.changed }} reboot_required={{ r_promote.reboot_required | default('n/a') }}"

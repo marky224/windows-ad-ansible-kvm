@@ -1,0 +1,32 @@
+---
+# dc_replica group (ADDC02) — Phase 6 Branch-Site replica DC (ADR-052 / ADR-055).
+#
+# STEADY-STATE IDENTITY (post-promotion): connect as the named domain admin
+# (madmin-da), exactly like group_vars/dc.yml. After SM5 promotion this is ADDC02's
+# ONLY usable WinRM identity:
+#   - the pre-promo LOCAL Administrator no longer exists (local SAM removed at promo);
+#   - the domain RID 500 is SMARTCARD_REQUIRED (ADR-033, replicated from ADDC01),
+#     so it can't password-auth over WinRM.
+#
+# BOOTSTRAP IDENTITY (pre-promotion): Play 1 of 13-promote-addc02.yml OVERRIDES
+# these to the LOCAL Administrator + vault_dc_admin_password (the only identity that
+# works on the pre-promo workgroup box). See that playbook's header.
+ansible_user: "{{ named_admin.upn }}"
+ansible_password: "{{ vault_named_admin_password }}"
+
+# Replica DC role markers — consumed by ad_* roles. Contrast group_vars/dc.yml:
+# ADDC02 holds NO FSMO roles, is a GC + DNS, and (for now) no DHCP. FSMO all stay
+# on ADDC01 (ADR-052 decision 6); reciprocal hot-standby DHCP + Branch scope is SM7.
+dc_role:
+  primary: false
+  hold_fsmo_roles: false
+  install_dhcp: false        # SM7: reciprocal hot-standby failover + Branch scope
+  install_dns: true          # GC + DNS at Branch (WAN-resilient name resolution)
+  install_ad_cs: false       # single CA on ADDC01
+  install_wsus: false        # single WSUS on ADDC01
+  is_pdc_time_source: false  # ADDC02 syncs time from the PDC (ADDC01) down the domain hierarchy
+
+# DSRM (Directory Services Restore Mode) password — required by
+# microsoft.ad.domain_controller. Kept distinct from vault_dc_admin_password per
+# ADR-031 (same rationale as group_vars/dc.yml).
+safe_mode_password: "{{ vault_safe_mode_password }}"

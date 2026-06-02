@@ -1,0 +1,93 @@
+---
+# Phase 6 SM5 (ADR-052 / ADR-055): promote ADDC02-corp into a WRITABLE Branch-Site
+# replica DC + Global Catalog of corp.markandrewmarquez.com.
+#
+# ── THE IDENTITY SWITCH (why this playbook is shaped the way it is) ──────────────
+# ADDC01's RID 500 is hardened SMARTCARD_REQUIRED (ADR-033); that flag replicates,
+# so the moment ADDC02 becomes a DC the domain Administrator can no longer
+# password-auth over WinRM. Pre-promotion ADDC02 is a WORKGROUP box where ONLY the
+# LOCAL Administrator works and madmin-da cannot yet connect. Therefore:
+#   • Play 1 promotes AS LOCAL Administrator (the only pre-promo identity) and
+#     triggers the promotion reboot ITSELF (fire-and-forget). We CANNOT let
+#     microsoft.ad.domain_controller reboot:true do it, because the module would
+#     reconnect as the local Administrator AFTER the box is a DC — where that
+#     account no longer exists (local SAM removed at promotion).
+#   • Play 2 reconnects AS madmin-da (steady-state group_vars/dc_replica.yml) and
+#     verifies. Same local→named-admin handoff as 02-configure-dc.yml, but spanning
+#     the promotion reboot.
+#
+# ── ONE-SHOT (not idempotent across the switch) ─────────────────────────────────
+# After a successful promotion Play 1 can no longer connect (local Administrator is
+# gone). To RE-VERIFY a built replica, run Play 2 + Play 3's verification (or
+# 99-smoke-test once SM8 extends it). To REDO, roll back ADDC02 to its pre-promo
+# snapshot. Same one-shot nature as 02-configure-dc.yml.
+#
+# ── VERIFICATION SPANS TWO HOSTS (WinRM NTLM double-hop, ADR-055) ───────────────
+# Play 2 verifies everything LOCAL to ADDC02 (identity, INBOUND replication, SYSVOL,
+# services, krbtgt, _msdcs/Connectivity). Play 3 verifies OUTBOUND replication
+# (ADDC01<-ADDC02) LOCALLY ON ADDC01. The split is mandatory: ADDC02's madmin-da NTLM
+# WinRM session cannot make a second authenticated hop to ADDC01, so any repadmin /
+# Get-ADReplication* targeting the REMOTE DC from ADDC02 fails (Win32 110 / Access
+# denied). Each DC's state is therefore verified ON that DC. (Replication itself is
+# unaffected — the DRA uses the DC machine-account Kerberos, not this session.)
+#
+# ── PREFLIGHT (SM5, re-verified green 2026-06-02) ───────────────────────────────
+# FFL/DFL Windows2025*; HQ-Site + Branch-Site + 10.20.0.0/24→Branch-Site (SM3);
+# ADDC02 resolves corp via 10.10.0.10 and reaches ADDC01 LDAP/389 + RPC/135 through
+# VyOS; clock skew ≪ 5 min. (microsoft.ad.domain_controller also fails fast if
+# ADDC01 is unreachable at promo time.)
+#
+# ── HOST SAFETY ─────────────────────────────────────────────────────────────────
+# Targets ONLY the dc_replica group (ADDC02-corp) over WinRM. Never localhost.
+# REQUIRED pre-run check (must list ONLY ADDC02-corp):
+#   ansible-playbook -i inventory/lab.yml playbooks/13-promote-addc02.yml --list-hosts
+#
+# Run: ansible-playbook -i inventory/lab.yml playbooks/13-promote-addc02.yml
+
+- name: "Play 1 — Promote ADDC02-corp to Branch-Site replica (connect as LOCAL Administrator)"
+  hosts: dc_replica
+  gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast discipline (ADR-050): abort on any failure
+  vars:
+    # ADR-033/ADR-055: pre-promotion the only working identity is local Administrator.
+    # Override group_vars/dc_replica.yml's steady-state named-admin UPN for this play.
+    ansible_user: Administrator
+    ansible_password: "{{ vault_dc_admin_password }}"
+  roles:
+    - ad_dc_replica
+  post_tasks:
+    - name: "Trigger the promotion reboot (fire-and-forget, as local admin — still valid pre-reboot)"
+      ansible.windows.win_shell: Restart-Computer -Force
+      async: 1
+      poll: 0
+      ignore_errors: true   # the WinRM connection drops as the box goes down — expected, not a failure
+      when: r_promote.reboot_required | default(true) | bool
+      # win_reboot / module reboot:true are WRONG here — both reconnect as the
+      # now-invalid local Administrator. Fire-and-forget hands the reconnect to Play 2.
+
+- name: "Play 2 — Verify replica health (connect as named admin madmin-da)"
+  hosts: dc_replica
+  gather_facts: false
+  any_errors_fatal: true
+  # No vars override: use the steady-state group_vars/dc_replica.yml identity
+  # (madmin-da UPN). Connecting as madmin-da IS the proof the replica + the
+  # replicated named-admin identity work end-to-end.
+  tasks:
+    - name: "Run ADDC02-local verification block (reconnect + INBOUND replication + SYSVOL + krbtgt + Connectivity + dcdiag)"
+      ansible.builtin.include_role:
+        name: ad_dc_replica
+        tasks_from: verify.yml
+
+- name: "Play 3 — Verify OUTBOUND replication from ADDC01's view (LOCAL on ADDC01, double-hop-safe)"
+  hosts: dc
+  gather_facts: false
+  any_errors_fatal: true
+  # Runs on ADDC01 as madmin-da (group_vars/dc.yml). "Does ADDC01 pull from ADDC02"
+  # is ADDC01-side state — verified LOCALLY on ADDC01, never cross-bound from ADDC02's
+  # WinRM-NTLM session (double-hop -> Access denied; see the header). Satisfies the
+  # MS KB 825036/275278 both-directions rule that gates SM6 DNS cross-pointing.
+  tasks:
+    - name: "Run outbound replication verification (ADDC01 <- ADDC02)"
+      ansible.builtin.include_role:
+        name: ad_dc_replica
+        tasks_from: verify_outbound.yml

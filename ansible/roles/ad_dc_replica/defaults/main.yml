@@ -1,0 +1,52 @@
+---
+# ad_dc_replica role defaults — Phase 6 SM5 (ADR-052 / ADR-055).
+# Override at playbook level or in host_vars if needed.
+
+# Expected Windows ComputerName (set by ADDC02's Autounattend specialize pass in SM4 —
+# sanity-checked here, NOT changed). This is the Windows name (ADDC02), not the
+# libvirt domain name (ADDC02-corp).
+ad_dc_replica_expected_hostname: ADDC02
+
+# microsoft.ad.domain_controller knobs (see ansible-doc microsoft.ad.domain_controller).
+ad_dc_replica_install_dns: true                 # GC + DNS at Branch so name resolution survives a WAN cut
+ad_dc_replica_read_only: false                  # writable full DC, NOT an RODC (ADR-052 decision 6)
+# Site is set EXPLICITLY (deterministic) rather than relying on the subnet->site
+# auto-map. The 10.20.0.0/24 -> Branch-Site mapping (SM3) would auto-place ADDC02
+# correctly anyway; naming the site removes all ambiguity. Stable topology name,
+# matches ad_sites_branch_name.
+ad_dc_replica_site_name: "Branch-Site"
+# The only writable DC in the forest is ADDC01 -> pin it as the explicit replication
+# source (microsoft.ad >= 1.8.0). Resolvable via ADDC02's DNS client (-> 10.10.0.10)
+# and reachable LDAP/RPC through VyOS (preflight-verified).
+ad_dc_replica_source_dc_fqdn: "ADDC01.{{ forest.fqdn }}"
+
+# --- Post-promotion reconnect / verification windows (Play 2, as the named admin) ---
+# The promotion reboot is fire-and-forget in the playbook (NOT module reboot:true);
+# Play 2 reconnects as madmin-da and must absorb the reboot + the documented
+# WinRM-opens-before-Netlogon-is-ready window (memory feedback-dc-winrm-opens-before-netlogon-ready).
+ad_dc_replica_reconnect_delay: 60               # let the promo reboot get going before probing
+ad_dc_replica_reconnect_timeout: 1200           # 20 min — reboot + Netlogon un-pause as madmin-da
+ad_dc_replica_addsready_minutes: 10             # poll Get-ADDomainController as the named admin
+ad_dc_replica_addsready_interval: 15
+
+# Inbound replication clean-state window (over the 40 ms delay-only inter-site link).
+ad_dc_replica_repl_minutes: 15
+ad_dc_replica_repl_interval: 30
+
+# DFSR SYSVOL initial-sync window. Gate on DFSR-Replication event 4604 (SYSVOL
+# initialized) + SYSVOL/NETLOGON shares advertised BEFORE trusting Branch GPO.
+# Delay-only/high-bandwidth WAN sim -> initial sync is quick, but give margin.
+ad_dc_replica_sysvol_minutes: 20
+ad_dc_replica_sysvol_interval: 30
+
+# OUTBOUND replication window (ADDC01 inbound-from-ADDC02). MS KB 825036/275278
+# require verifying BOTH inbound AND outbound replication before a DC may point its
+# DNS client at itself (SM6) — otherwise a DNS "island". Forced on demand
+# (repadmin /replicate /force) to bypass the 15-min inter-site link schedule, then polled.
+ad_dc_replica_outbound_repl_minutes: 10
+
+# _msdcs GUID-CNAME registration + dcdiag Connectivity active-nudge window. A fresh
+# replica's <dsa-guid>._msdcs.<forest> CNAME lags registration; nltest /dsregdns is
+# the MS-recommended fix (re-register DC locator records) — nudge, then confirm.
+ad_dc_replica_dns_settle_minutes: 10
+ad_dc_replica_dns_settle_interval: 30

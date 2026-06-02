@@ -1,0 +1,83 @@
+---
+# ad_dc_replica OUTBOUND replication verification — Phase 6 SM5 (ADR-055).
+#
+# Runs ON ADDC01 (the dc group), LOCALLY, as madmin-da. "Does ADDC01 successfully
+# inbound-replicate FROM ADDC02" is ADDC01-SIDE state, so it MUST be checked on
+# ADDC01 — NOT cross-bound from ADDC02's WinRM-NTLM session, which needs a second
+# authenticated hop to ADDC01 and fails under the double-hop (the SM5 finding:
+# repadmin/Get-ADReplication* targeting a REMOTE DC return Win32 110 / "not
+# authenticated" / DsBindWithCred Access denied). Replication itself is fine — the
+# DRA uses the DC machine account's Kerberos, not the interactive WinRM session.
+#
+# MS KB 825036/275278: BOTH inbound (ADDC02-local, verify.yml) AND outbound (here)
+# must be verified before SM6 lets ADDC02 point its DNS client at itself (island
+# avoidance). This file closes the outbound half of that gate.
+#
+# Included via: include_role { name: ad_dc_replica, tasks_from: verify_outbound.yml }
+
+- name: "ad_dc_replica/verify_outbound | force + verify ADDC01 inbound-replicates FROM {{ ad_dc_replica_expected_hostname }} (LOCAL on ADDC01)"
+  ansible.windows.win_powershell:
+    script: |
+      $self     = $env:COMPUTERNAME                          # ADDC01 (this play runs here)
+      $partner  = '{{ ad_dc_replica_expected_hostname }}'    # ADDC02
+      $domainNC = (Get-ADDomain).DistinguishedName
+      # LOCAL bind on ADDC01 (the dest); force it to pull the domain NC FROM ADDC02
+      # (skip the 15-min inter-site schedule). No double-hop: dest bind is local; the
+      # actual pull uses the DRA/machine-account Kerberos.
+      & repadmin /replicate $self $partner "$domainNC" /force 2>&1 | Out-Null
+      $deadline = (Get-Date).AddMinutes({{ ad_dc_replica_outbound_repl_minutes }})
+      while ((Get-Date) -lt $deadline) {
+          $meta = @(Get-ADReplicationPartnerMetadata -Target $self -Scope Server -PartnerType Inbound -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Partner -match "CN=NTDS Settings,CN=$partner," })
+          if ($meta.Count -gt 0) {
+              $bad       = @($meta | Where-Object { $_.LastReplicationResult -ne 0 })
+              $noSuccess = @($meta | Where-Object { -not $_.LastReplicationSuccess -or $_.LastReplicationSuccess.Year -lt 2000 })
+              if ($bad.Count -eq 0 -and $noSuccess.Count -eq 0) {
+                  $Ansible.Result = @{
+                      Direction   = "$partner -> $self (ADDC01 pulls from ADDC02)"
+                      Partitions  = @($meta | Select-Object -ExpandProperty Partition -Unique)
+                      LinkCount   = $meta.Count
+                      LastSuccess = @($meta | ForEach-Object { $_.LastReplicationSuccess.ToString('s') } | Select-Object -Unique)
+                  }
+                  $Ansible.Changed = $false
+                  return
+              }
+          }
+          & repadmin /replicate $self $partner "$domainNC" /force 2>&1 | Out-Null
+          Start-Sleep -Seconds {{ ad_dc_replica_repl_interval }}
+      }
+      throw "ADDC01 did not confirm clean inbound replication from $partner within {{ ad_dc_replica_outbound_repl_minutes }} min. Inspect 'repadmin /showrepl' on ADDC01."
+  register: r_outbound
+  changed_when: false
+
+- name: "ad_dc_replica/verify_outbound | show OUTBOUND (ADDC01 <- ADDC02) result"
+  ansible.builtin.debug:
+    var: r_outbound.result
+
+- name: "ad_dc_replica/verify_outbound | assert ADDC01 has a clean inbound link from ADDC02 (outbound confirmed)"
+  ansible.builtin.assert:
+    that:
+      - r_outbound.result.LinkCount | int > 0
+    fail_msg: "Outbound replication (ADDC02 -> ADDC01) not confirmed: {{ r_outbound.result }}"
+    success_msg: "Outbound confirmed — ADDC01 cleanly pulls {{ r_outbound.result.LinkCount }} partition(s) from ADDC02. Both directions verified (KB 825036 island rule satisfied; SM6 DNS cross-pointing may proceed)."
+
+- name: "ad_dc_replica/verify_outbound | repadmin /showrepl evidence (LOCAL on ADDC01)"
+  ansible.windows.win_command: repadmin /showrepl
+  register: r_outbound_showrepl
+  changed_when: false
+  failed_when: false
+
+- name: "ad_dc_replica/verify_outbound | show repadmin /showrepl (ADDC01 inbound neighbors)"
+  ansible.builtin.debug:
+    msg: "{{ r_outbound_showrepl.stdout_lines | default([]) }}"
+
+- name: "ad_dc_replica/verify_outbound | dcdiag /q (LOCAL ADDC01 health gate, exit-code only)"
+  ansible.windows.win_command: dcdiag /q
+  register: r_outbound_dcdiag
+  changed_when: false
+  failed_when: r_outbound_dcdiag.rc != 0
+
+- name: "ad_dc_replica/verify_outbound | show ADDC01 dcdiag /q output if anything flagged"
+  ansible.builtin.debug:
+    msg: "{{ r_outbound_dcdiag.stdout_lines }}"
+  when: r_outbound_dcdiag.stdout_lines | length > 0

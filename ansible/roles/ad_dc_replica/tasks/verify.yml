@@ -1,0 +1,263 @@
+---
+# ad_dc_replica verification — ADDC02-LOCAL health (Phase 6 SM5, ADR-052/055).
+#
+# Run by 13-promote-addc02.yml Play 2 as the NAMED domain admin (madmin-da), AFTER
+# Play 1's fire-and-forget promotion reboot. Connecting as madmin-da IS itself the
+# proof that the replicated domain identity works on ADDC02. Absorbs the reboot +
+# the WinRM-opens-before-Netlogon-is-ready window, then verifies everything that is
+# LOCAL to ADDC02.
+#
+# ── WinRM NTLM DOUBLE-HOP (the SM5 finding, ADR-055) ────────────────────────────
+# This file deliberately contains ONLY checks that read ADDC02's OWN state. Anything
+# that binds to a REMOTE DC (ADDC01) from this WinRM session fails — ADDC02's
+# madmin-da NTLM network logon cannot make a second authenticated hop (repadmin
+# /showrepl ADDC01, Get-ADReplicationPartnerMetadata -Target ADDC01, dcdiag /e,
+# CheckSecurityError all return Win32 110 / "not authenticated" / DsBindWithCred
+# Access denied). OUTBOUND replication (ADDC01<-ADDC02) is ADDC01-side state, so it
+# is verified LOCALLY on ADDC01 in Play 3 (verify_outbound.yml). Replication itself
+# is unaffected — the DRA uses the DC machine account's Kerberos, not this session.
+#
+# Verification depth reflects the SM5 research pass (MS KB 825036/275278 island rule;
+# fresh-DC _msdcs CNAME registration lag; Server 2025 RC4-krbtgt secure-channel risk).
+# Re-runnable (read-mostly; only benign idempotent nltest /dsregdns re-registration).
+# Included via: include_role { name: ad_dc_replica, tasks_from: verify.yml }
+
+- name: "ad_dc_replica/verify | wait for ADDC02 to return as a DC (reboot + Netlogon window, as madmin-da)"
+  ansible.builtin.wait_for_connection:
+    delay: "{{ ad_dc_replica_reconnect_delay }}"
+    timeout: "{{ ad_dc_replica_reconnect_timeout }}"
+  # wait_for_connection runs a real module over WinRM, so it requires madmin-da auth
+  # to SUCCEED — it therefore retries through both the box-rebooting (unreachable)
+  # window AND the Netlogon-paused (auth-rejected) window until the replica is ready.
+
+- name: "ad_dc_replica/verify | poll until AD DS answers as the named admin"
+  ansible.windows.win_powershell:
+    script: |
+      $deadline = (Get-Date).AddMinutes({{ ad_dc_replica_addsready_minutes }})
+      while ((Get-Date) -lt $deadline) {
+          try {
+              $dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop
+              $Ansible.Result = @{
+                  Name   = $dc.Name
+                  Site   = $dc.Site
+                  IsGC   = [bool]$dc.IsGlobalCatalog
+                  IsRODC = [bool]$dc.IsReadOnly
+                  Domain = $dc.Domain
+                  IPv4   = $dc.IPv4Address
+              }
+              return
+          } catch { Start-Sleep -Seconds {{ ad_dc_replica_addsready_interval }} }
+      }
+      throw "Get-ADDomainController did not answer within {{ ad_dc_replica_addsready_minutes }} min after the promotion reboot."
+  register: r_replica_ready
+  changed_when: false
+
+- name: "ad_dc_replica/verify | show resolved DC identity"
+  ansible.builtin.debug:
+    var: r_replica_ready.result
+
+- name: "ad_dc_replica/verify | assert ADDC02 is a WRITABLE GC in {{ ad_dc_replica_site_name }}"
+  ansible.builtin.assert:
+    that:
+      - r_replica_ready.result.Site == ad_dc_replica_site_name
+      - r_replica_ready.result.IsGC | bool
+      - not (r_replica_ready.result.IsRODC | bool)
+    fail_msg: "ADDC02 DC role attributes wrong: {{ r_replica_ready.result }}"
+    success_msg: "ADDC02 is a writable Global Catalog in {{ ad_dc_replica_site_name }}."
+
+# --- INBOUND replication health (ADDC02 <- ADDC01), read LOCALLY on ADDC02.
+#     Structured cmdlet is the GATE; classic repadmin is human-readable EVIDENCE. ---
+- name: "ad_dc_replica/verify | verify clean INBOUND replication from ADDC01 (local, poll)"
+  ansible.windows.win_powershell:
+    script: |
+      $deadline = (Get-Date).AddMinutes({{ ad_dc_replica_repl_minutes }})
+      while ((Get-Date) -lt $deadline) {
+          $meta  = @(Get-ADReplicationPartnerMetadata -Target $env:COMPUTERNAME -Scope Server -ErrorAction SilentlyContinue)
+          $fails = @(Get-ADReplicationFailure        -Target $env:COMPUTERNAME -ErrorAction SilentlyContinue)
+          if ($meta.Count -gt 0) {
+              $bad       = @($meta | Where-Object { $_.LastReplicationResult -ne 0 })
+              $noSuccess = @($meta | Where-Object { -not $_.LastReplicationSuccess -or $_.LastReplicationSuccess.Year -lt 2000 })
+              if ($bad.Count -eq 0 -and $noSuccess.Count -eq 0) {
+                  $partners = @($meta | ForEach-Object {
+                      if ($_.Partner -match 'CN=NTDS Settings,CN=([^,]+),') { $matches[1] } else { $_.Partner }
+                  } | Select-Object -Unique)
+                  $Ansible.Result = @{
+                      Partitions     = @($meta | Select-Object -ExpandProperty Partition -Unique)
+                      PartnerServers = $partners
+                      PartnerCount   = $meta.Count
+                      Failures       = @($fails | ForEach-Object { "$($_.Partner):$($_.FailureType):$($_.FailureCount)" })
+                  }
+                  return
+              }
+          }
+          Start-Sleep -Seconds {{ ad_dc_replica_repl_interval }}
+      }
+      throw "Inbound replication did not reach a clean state within {{ ad_dc_replica_repl_minutes }} min. Run 'repadmin /showrepl' on ADDC02."
+  register: r_replica_repl
+  changed_when: false
+
+- name: "ad_dc_replica/verify | show INBOUND replication partner metadata"
+  ansible.builtin.debug:
+    var: r_replica_repl.result
+
+- name: "ad_dc_replica/verify | assert INBOUND partner includes ADDC01, no failures"
+  ansible.builtin.assert:
+    that:
+      - "'ADDC01' in r_replica_repl.result.PartnerServers"
+      - r_replica_repl.result.Failures | length == 0
+    fail_msg: "Inbound replication health unexpected: {{ r_replica_repl.result }}"
+    success_msg: "Inbound replication from {{ r_replica_repl.result.PartnerServers | join(', ') }} is clean across {{ r_replica_repl.result.PartnerCount }} partition link(s). (Outbound is verified on ADDC01 in Play 3.)"
+
+- name: "ad_dc_replica/verify | repadmin evidence (LOCAL ADDC02 — informational)"
+  ansible.windows.win_command: "{{ item }}"
+  loop:
+    - repadmin /showrepl     # local ADDC02 inbound neighbors (clean)
+    - repadmin /replsummary  # aggregate; the trailing '110 - ADDC01' line is the expected double-hop artifact, not a fault
+  register: r_repadmin
+  changed_when: false
+  failed_when: false
+
+- name: "ad_dc_replica/verify | show repadmin output"
+  ansible.builtin.debug:
+    msg: "{{ item.stdout_lines }}"
+  loop: "{{ r_repadmin.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# --- SYSVOL / DFSR: gate on DFSR event 4604 (SYSVOL initialized) + SYSVOL/NETLOGON
+#     shares advertised, BEFORE Branch can be trusted to serve GPO/scripts. The
+#     Netlogon SysvolReady DWORD is read as a corroborating signal. ---
+- name: "ad_dc_replica/verify | wait for SYSVOL DFSR initial sync (event 4604) + shares"
+  ansible.windows.win_powershell:
+    script: |
+      $deadline = (Get-Date).AddMinutes({{ ad_dc_replica_sysvol_minutes }})
+      while ((Get-Date) -lt $deadline) {
+          $evt    = Get-WinEvent -FilterHashtable @{ LogName='DFS Replication'; Id=4604 } -MaxEvents 1 -ErrorAction SilentlyContinue
+          $shares = (net share) -join "`n"
+          $ready  = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters' -Name 'SysvolReady' -ErrorAction SilentlyContinue).SysvolReady
+          if ($evt -and ($shares -match '(?m)^SYSVOL\s') -and ($shares -match '(?m)^NETLOGON\s')) {
+              $Ansible.Result = @{
+                  Event4604      = $evt.TimeCreated.ToString('s')
+                  SysvolShared   = $true
+                  NetlogonShared = $true
+                  SysvolReadyReg = $ready    # corroborating (1 = ready); not the gate
+              }
+              return
+          }
+          Start-Sleep -Seconds {{ ad_dc_replica_sysvol_interval }}
+      }
+      $recent = @(Get-WinEvent -LogName 'DFS Replication' -MaxEvents 5 -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Id)@$($_.TimeCreated.ToString('s'))" })
+      throw "SYSVOL not confirmed (DFSR 4604 + SYSVOL/NETLOGON shares) within {{ ad_dc_replica_sysvol_minutes }} min. Recent DFSR events: $($recent -join ', '). Shares:`n$(net share | Out-String)"
+  register: r_replica_sysvol
+  changed_when: false
+
+- name: "ad_dc_replica/verify | show SYSVOL/DFSR result"
+  ansible.builtin.debug:
+    var: r_replica_sysvol.result
+
+- name: "ad_dc_replica/verify | verify core AD services running (incl. DFSR for SYSVOL)"
+  ansible.windows.win_powershell:
+    script: |
+      $required = @('NTDS','DNS','Netlogon','Kdc','W32Time','DFSR')
+      $bad = @()
+      foreach ($svc in $required) {
+          $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+          if (-not $s -or $s.Status -ne 'Running') { $bad += "$svc=$($s.Status)" }
+      }
+      if ($bad.Count -gt 0) { throw "Required services not Running: $($bad -join ', ')" }
+      $Ansible.Result = @{ Services = ($required -join ', ') + ' all Running' }
+  register: r_replica_services
+  changed_when: false
+
+- name: "ad_dc_replica/verify | show service health"
+  ansible.builtin.debug:
+    var: r_replica_services.result
+
+# --- Server 2025 sign-in landmine due-diligence: the documented post-promo sign-in
+#     failure traces to an RC4-only krbtgt breaking the secure channel. Affirmatively
+#     confirm krbtgt is AES-capable (LOCAL read of replicated data — no double-hop).
+#     Our fresh-2025 forest + working bidirectional replication already prove the
+#     channel; this is the verify-with-logs evidence, not an assumption. ---
+- name: "ad_dc_replica/verify | check forest krbtgt AES posture (Server 2025 secure-channel due-diligence)"
+  ansible.windows.win_powershell:
+    script: |
+      $k = Get-ADUser -Identity krbtgt -Properties 'msDS-SupportedEncryptionTypes','pwdLastSet'
+      $etype = $k.'msDS-SupportedEncryptionTypes'
+      # Bitmask: 0x8=AES128, 0x10=AES256, 0x4=RC4, 0x1/0x2=DES. null/0 => OS default (AES on modern).
+      $aes     = (($etype -band 0x18) -ne 0)
+      $rc4Only = ($etype -eq 4)
+      $Ansible.Result = @{
+          SupportedEncTypes = if ($null -ne $etype) { $etype } else { 'default(null)' }
+          AESCapable        = ($aes -or ($null -eq $etype) -or ($etype -eq 0))
+          RC4Only           = $rc4Only
+          PwdLastSet        = if ($k.pwdLastSet) { [datetime]::FromFileTime($k.pwdLastSet).ToString('s') } else { 'n/a' }
+      }
+      $Ansible.Changed = $false
+  register: r_krbtgt
+  changed_when: false
+
+- name: "ad_dc_replica/verify | show krbtgt encryption posture"
+  ansible.builtin.debug:
+    var: r_krbtgt.result
+
+- name: "ad_dc_replica/verify | assert krbtgt is NOT RC4-only (would break the Server 2025 secure channel)"
+  ansible.builtin.assert:
+    that:
+      - not r_krbtgt.result.RC4Only
+    fail_msg: "krbtgt is RC4-only (msDS-SupportedEncryptionTypes=4) — Server 2025 secure-channel/sign-in risk. Reset krbtgt to enable AES."
+    success_msg: "krbtgt AES posture OK (AESCapable={{ r_krbtgt.result.AESCapable }}, EncTypes={{ r_krbtgt.result.SupportedEncTypes }})."
+
+# --- DNS locator registration (LOCAL): a fresh DC's <dsa-guid>._msdcs CNAME lags
+#     registration, which fails dcdiag's Connectivity test. nltest /dsregdns is the
+#     MS-recommended fix (re-register all DC locator records). Nudge, then confirm it
+#     resolves + Connectivity passes — so the broad dcdiag below runs clean. No
+#     double-hop: registration uses Netlogon/machine context; resolution + the
+#     Connectivity test bind to the LOCAL DC. ---
+- name: "ad_dc_replica/verify | nudge + confirm _msdcs CNAME registration and dcdiag Connectivity (nltest /dsregdns)"
+  ansible.windows.win_powershell:
+    script: |
+      $cfg  = (Get-ADRootDSE).configurationNamingContext
+      $pat  = ',CN={0},' -f $env:COMPUTERNAME
+      $ntds = Get-ADObject -SearchBase $cfg -LDAPFilter '(objectClass=nTDSDSA)' -Properties objectGUID |
+              Where-Object { $_.DistinguishedName -match $pat }
+      $cname = "$($ntds.objectGUID.Guid)._msdcs.{{ forest.fqdn }}"
+      & nltest /dsregdns | Out-Null
+      $deadline = (Get-Date).AddMinutes({{ ad_dc_replica_dns_settle_minutes }})
+      $resolved = $false; $connPass = $false; $attempts = 0; $diag = ''
+      while ((Get-Date) -lt $deadline) {
+          $attempts++
+          Clear-DnsClientCache
+          $r = Resolve-DnsName -Name $cname -ErrorAction SilentlyContinue
+          $resolved = [bool]$r
+          $diag = (dcdiag /test:Connectivity 2>&1) | Out-String
+          $connPass = ($diag -match 'passed test Connectivity') -and ($diag -notmatch 'failed test Connectivity')
+          if ($resolved -and $connPass) {
+              $Ansible.Result = @{ Attempts = $attempts; Cname = $cname; Resolved = $true; ConnectivityPassed = $true }
+              $Ansible.Changed = $false
+              return
+          }
+          if (($attempts % 3) -eq 0) { & nltest /dsregdns | Out-Null }   # re-nudge periodically
+          Start-Sleep -Seconds {{ ad_dc_replica_dns_settle_interval }}
+      }
+      throw "After $attempts attempts over {{ ad_dc_replica_dns_settle_minutes }} min: _msdcs CNAME ($cname) resolved=$resolved, dcdiag Connectivity passed=$connPass. Last dcdiag:`n$diag"
+  register: r_replica_connectivity
+  changed_when: false
+
+- name: "ad_dc_replica/verify | show _msdcs CNAME + Connectivity result"
+  ansible.builtin.debug:
+    var: r_replica_connectivity.result
+
+# Broad LOCAL dcdiag, run LAST after replication + SYSVOL + DNS-locator are green.
+# /q is the exit-code GATE (matches ad_dc's proven leniency for fresh-DC stdout
+# warnings). NOT /e — enterprise mode binds to ADDC01 and would hit the double-hop;
+# ADDC01's own health is gated by its LOCAL dcdiag /q in Play 3 instead.
+- name: "ad_dc_replica/verify | dcdiag /q (LOCAL ADDC02 health gate, exit-code only)"
+  ansible.windows.win_command: dcdiag /q
+  register: r_replica_dcdiag
+  changed_when: false
+  failed_when: r_replica_dcdiag.rc != 0
+
+- name: "ad_dc_replica/verify | show dcdiag /q output if anything flagged"
+  ansible.builtin.debug:
+    msg: "{{ r_replica_dcdiag.stdout_lines }}"
+  when: r_replica_dcdiag.stdout_lines | length > 0
