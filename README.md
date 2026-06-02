@@ -22,7 +22,7 @@ End-to-end automated build: from a bare Ubuntu 24.04 host, Ansible provisions a 
 | 5 — Cert services + GPO baseline + WSUS | ✅ Done | `ad_cs` (Enterprise Root CA + Web Enrollment + 5 templates), `ad_gpo` (SCT v2602 baseline + Lab Delta), `ad_wsus` (D:\WSUS + 4 products + Default Approval Rule) |
 | 6 — Client provisioning + domain join | ✅ Done | Win 11 clients built (real vTPM 2.0, 4 vCPU/8 GB) and **domain-joined** into `OU=Workstations` with **machine-cert autoenrollment** (Client-Auth cert from the Enterprise CA via the `Corp Workstation Authentication` template); Ubuntu 24.04 **domain-joined** via `realmd`/`sssd` (MAC-based DHCP reservation + Server 2025 Kerberos canonicalize fix) |
 | 7 — Ops tooling (backup / snapshot / fire-drill / teardown / `site.yml`) | ✅ Done | `ops_backup` (system-state + config exports), `ops_snapshot` trio, `ops_firedrill` (isolated restore drill), `ops_teardown`, and the `site.yml` orchestrator with `any_errors_fatal` fail-fast (ADR-046–050) |
-| Phase 6 — Multi-site (2nd DC + AD sites) | 🚧 In progress | Design locked (ADR-052). **Done:** isolated Branch network (`corp-branch`, 10.20.0.0/24) + AD Sites & Services (HQ-Site/Branch-Site, subnet objects, HQ-Branch link). **Pending:** VyOS inter-site router, ADDC02 replica + replication / FSMO-standby + DHCP failover |
+| Phase 6 — Multi-site (2nd DC + AD sites) | 🚧 In progress | Design locked (ADR-052). **Done:** isolated Branch network (`corp-branch`, 10.20.0.0/24); AD Sites & Services (HQ-Site/Branch-Site, subnet objects, HQ-Branch link); the **ADDC02** Branch-replica VM built on the isolated net; the **VyOS inter-site router** (`VYOS01`) routing HQ↔Branch with a ~40 ms netem WAN-latency simulation (verified: ADDC01→ADDC02 40 ms @ TTL=127 = one hop). **Pending:** promote ADDC02 (replication + GC + FSMO-standby), DNS cross-pointing, reciprocal DHCP failover, DR drill |
 
 ### From install ISO to a domain-joined fleet
 
@@ -182,6 +182,7 @@ ansible-playbook playbooks/site.yml
 | `ad_gpo` | Import MSFT SCT Server 2025 v2602 baseline (6 GPOs linked to canonical OUs + 2 IE11 import-only) + Lab Delta GPO (firewall logging) + `Lab - Autoenrollment` GPO (Computer + User `AEPolicy=0x7`, domain root) | ✅ |
 | `ad_wsus` | WSUS install on dedicated `D:\WSUS` (200 GB qcow2) + 4 products + 4 classifications + Default Automatic Approval Rule + fire-and-forget sync | ✅ |
 | `ad_sites` | **Phase 6** (ADR-052): AD Sites & Services on ADDC01 — rename `Default-First-Site-Name`→`HQ-Site`, create `Branch-Site`, the two subnet objects + the `HQ-Branch` site link; runs before the Branch replica | ✅ |
+| `net_router_vyos` | **Phase 6** (ADR-052/054): build `VYOS01` from the free VyOS rolling ISO; configured over `vyos.vyos` for inter-site routing (HQ↔Branch static), a ~40 ms netem WAN-latency simulation (delay-only on the Branch egress), and SSH hardening; host-side VM lifecycle only (unprivileged, no host-OS changes) | ✅ |
 | `domain_join_windows` | Win 11 client domain join (`microsoft.ad.membership`) into `OU=Workstations`; WinRM-only host-safety guard | ✅ |
 | `domain_join_linux` | Ubuntu domain join via `realmd` + `sssd` (Kerberos `canonicalize` for Server 2025 KDC); dual host-safety guards (SSH-only + anti-self) | ✅ |
 | `ops_backup` | AD state backup: `wbadmin` system-state → dedicated backup disk + config exports (GPO/CA/DHCP/DNS/csvde) zipped + WinRM `fetch`; guest-side, mount-sentinel guard (ADR-046) | ✅ |
@@ -191,7 +192,7 @@ ansible-playbook playbooks/site.yml
 
 ## Playbooks
 
-`00-libvirt-network.yml`, `slipstream-iso.yml`, `01-provision-dc.yml`, `02-configure-dc.yml`, `03-configure-services.yml`, `04-configure-services-advanced.yml` (M5), `05-provision-clients.yml`, `06-join-domain.yml`, `07-provision-linux.yml`, `08-join-linux.yml`, `09-configure-sites.yml` (Phase 6: AD sites), `99-smoke-test.yml`, plus operational utilities: `snapshot.yml`, `rollback.yml`, `list-snapshots.yml`, `backup-ad.yml`, `fire-drill.yml`, `teardown.yml`, and the `site.yml` orchestrator that runs `00 → 99` end-to-end in one command.
+`00-libvirt-network.yml`, `slipstream-iso.yml`, `01-provision-dc.yml`, `02-configure-dc.yml`, `03-configure-services.yml`, `04-configure-services-advanced.yml` (M5), `05-provision-clients.yml`, `06-join-domain.yml`, `07-provision-linux.yml`, `08-join-linux.yml`, `09-configure-sites.yml` (Phase 6: AD sites), `10-provision-addc02.yml` + `11-provision-vyos.yml` + `12-configure-vyos.yml` (Phase 6: Branch replica VM + VyOS inter-site router), `99-smoke-test.yml`, plus operational utilities: `snapshot.yml`, `rollback.yml`, `list-snapshots.yml`, `backup-ad.yml`, `fire-drill.yml`, `teardown.yml`, and the `site.yml` orchestrator that runs `00 → 99` end-to-end in one command.
 
 ---
 
