@@ -29,49 +29,12 @@
   register: r_dns_service
   changed_when: false
 
+# Upstream forwarders — extracted to forwarders.yml so the Phase 6 Branch replica (ADDC02)
+# can reuse the IDENTICAL, tested logic via `include_role: ad_dns, tasks_from: forwarders.yml`
+# (see playbooks/15-branch-dns-forwarders.yml). Behavior on ADDC01 is unchanged: the task is
+# byte-identical, just relocated, and import_tasks runs it inline (r_forwarders stays in scope).
 - name: "Configure upstream DNS forwarders ({{ ad_dns_forwarders | join(', ') }})"
-  ansible.windows.win_powershell:
-    parameters:
-      Forwarders: "{{ ad_dns_forwarders }}"
-      Timeout: "{{ ad_dns_forwarder_timeout }}"
-      UseRootHints: "{{ ad_dns_use_root_hints }}"
-    script: |
-      param(
-          [string[]]$Forwarders,
-          [int]$Timeout,
-          [bool]$UseRootHints
-      )
-      $current = (Get-DnsServerForwarder).IPAddress | ForEach-Object { $_.IPAddressToString }
-      $desired = @($Forwarders)
-      $changed = $false
-      $needsReplace = $false
-      if ($current -eq $null) { $needsReplace = $true }
-      elseif (@($current).Count -ne $desired.Count) { $needsReplace = $true }
-      else {
-          for ($i = 0; $i -lt $desired.Count; $i++) {
-              if (@($current)[$i] -ne $desired[$i]) { $needsReplace = $true; break }
-          }
-      }
-      if ($needsReplace) {
-          # Set-DnsServerForwarder replaces the entire list (idempotent rewrite).
-          Set-DnsServerForwarder -IPAddress $Forwarders -Timeout $Timeout -UseRootHint:$UseRootHints
-          $changed = $true
-      } else {
-          # Order-correct but settings may differ. Re-apply timeout/UseRootHint via cmdlet.
-          $cfg = Get-DnsServerForwarder
-          if ($cfg.Timeout -ne $Timeout -or $cfg.UseRootHint -ne $UseRootHints) {
-              Set-DnsServerForwarder -IPAddress $Forwarders -Timeout $Timeout -UseRootHint:$UseRootHints
-              $changed = $true
-          }
-      }
-      $Ansible.Changed = $changed
-      $after = Get-DnsServerForwarder
-      $Ansible.Result = @{
-          Forwarders   = @($after.IPAddress | ForEach-Object { $_.IPAddressToString })
-          Timeout      = $after.Timeout
-          UseRootHint  = $after.UseRootHint
-      }
-  register: r_forwarders
+  ansible.builtin.import_tasks: forwarders.yml
 
 - name: "Ensure AD-integrated reverse-lookup zone {{ ad_dns_reverse_zone }} exists"
   ansible.windows.win_powershell:

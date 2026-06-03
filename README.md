@@ -193,7 +193,7 @@ ansible-playbook playbooks/site.yml
 
 ## Playbooks
 
-`00-libvirt-network.yml`, `slipstream-iso.yml`, `01-provision-dc.yml`, `02-configure-dc.yml`, `03-configure-services.yml`, `04-configure-services-advanced.yml` (M5), `05-provision-clients.yml`, `06-join-domain.yml`, `07-provision-linux.yml`, `08-join-linux.yml`, `09-configure-sites.yml` (Phase 6: AD sites), `10-provision-addc02.yml` + `11-provision-vyos.yml` + `12-configure-vyos.yml` + `13-promote-addc02.yml` + `14-dns-crosspoint.yml` (Phase 6: Branch replica VM + VyOS inter-site router + ADDC02 promotion + DNS cross-pointing), `99-smoke-test.yml`, plus operational utilities: `snapshot.yml`, `rollback.yml`, `list-snapshots.yml`, `backup-ad.yml`, `fire-drill.yml`, `teardown.yml`, and the `site.yml` orchestrator that runs `00 → 99` end-to-end in one command.
+`00-libvirt-network.yml`, `slipstream-iso.yml`, `01-provision-dc.yml`, `02-configure-dc.yml`, `03-configure-services.yml`, `04-configure-services-advanced.yml` (M5), `05-provision-clients.yml`, `06-join-domain.yml`, `07-provision-linux.yml`, `08-join-linux.yml`, `09-configure-sites.yml` (Phase 6: AD sites), `10-provision-addc02.yml` + `11-provision-vyos.yml` + `12-configure-vyos.yml` + `13-promote-addc02.yml` + `14-dns-crosspoint.yml` + `15-branch-dns-forwarders.yml` (Phase 6: Branch replica VM + VyOS inter-site router + ADDC02 promotion + DNS cross-pointing + branch forwarders), `99-smoke-test.yml`, plus operational utilities: `snapshot.yml`, `rollback.yml`, `list-snapshots.yml`, `backup-ad.yml`, `fire-drill.yml`, `teardown.yml`, and the `site.yml` orchestrator that runs `00 → 99` end-to-end in one command.
 
 ---
 

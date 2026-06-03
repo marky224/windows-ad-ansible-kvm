@@ -1,0 +1,55 @@
+---
+# Upstream DNS forwarder configuration — EXTRACTED from main.yml so the Phase 6 Branch
+# replica (ADDC02) can reuse the identical, tested logic via
+# `include_role: { name: ad_dns, tasks_from: forwarders.yml }` (see
+# playbooks/15-branch-dns-forwarders.yml), WITHOUT also running ad_dns's reverse-zone /
+# scavenging tasks (scavenging must run on ONE server only — ADDC01).
+#
+# Parameterized by ad_dns_forwarders / ad_dns_forwarder_timeout / ad_dns_use_root_hints
+# (defaults/main.yml = Quad9 + root hints, for ADDC01; group_vars/dc_replica.yml overrides
+# them for ADDC02 = forward-to-hub + root-hints-off). Idempotent: rewrites the list only on
+# drift, and re-applies timeout/UseRootHint when only those differ.
+
+- name: "Configure upstream DNS forwarders ({{ ad_dns_forwarders | join(', ') }})"
+  ansible.windows.win_powershell:
+    parameters:
+      Forwarders: "{{ ad_dns_forwarders }}"
+      Timeout: "{{ ad_dns_forwarder_timeout }}"
+      UseRootHints: "{{ ad_dns_use_root_hints }}"
+    script: |
+      param(
+          [string[]]$Forwarders,
+          [int]$Timeout,
+          [bool]$UseRootHints
+      )
+      $current = (Get-DnsServerForwarder).IPAddress | ForEach-Object { $_.IPAddressToString }
+      $desired = @($Forwarders)
+      $changed = $false
+      $needsReplace = $false
+      if ($current -eq $null) { $needsReplace = $true }
+      elseif (@($current).Count -ne $desired.Count) { $needsReplace = $true }
+      else {
+          for ($i = 0; $i -lt $desired.Count; $i++) {
+              if (@($current)[$i] -ne $desired[$i]) { $needsReplace = $true; break }
+          }
+      }
+      if ($needsReplace) {
+          # Set-DnsServerForwarder replaces the entire list (idempotent rewrite).
+          Set-DnsServerForwarder -IPAddress $Forwarders -Timeout $Timeout -UseRootHint:$UseRootHints
+          $changed = $true
+      } else {
+          # Order-correct but settings may differ. Re-apply timeout/UseRootHint via cmdlet.
+          $cfg = Get-DnsServerForwarder
+          if ($cfg.Timeout -ne $Timeout -or $cfg.UseRootHint -ne $UseRootHints) {
+              Set-DnsServerForwarder -IPAddress $Forwarders -Timeout $Timeout -UseRootHint:$UseRootHints
+              $changed = $true
+          }
+      }
+      $Ansible.Changed = $changed
+      $after = Get-DnsServerForwarder
+      $Ansible.Result = @{
+          Forwarders   = @($after.IPAddress | ForEach-Object { $_.IPAddressToString })
+          Timeout      = $after.Timeout
+          UseRootHint  = $after.UseRootHint
+      }
+  register: r_forwarders

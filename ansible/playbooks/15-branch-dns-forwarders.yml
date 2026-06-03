@@ -1,0 +1,76 @@
+---
+# Phase 6 (SM6-adjacent; ADR-052 + the ADR-055(c) "codify incidental behavior" pattern):
+# declare the Branch replica (ADDC02) DNS SERVER forwarder config as explicit IaC.
+#
+# ── WHY ─────────────────────────────────────────────────────────────────────────
+# ADDC02 is in the ISOLATED Branch-Site (no NAT/internet — verified live: it cannot reach
+# 9.9.9.9). For EXTERNAL names it must forward to ADDC01 (the hub), which resolves via Quad9.
+# DC promotion already set this forwarder INCIDENTALLY (the promo-time DNS-client server,
+# 10.10.0.10, became a forwarder) — but it was never declared, exactly the class of incidental
+# behavior we codified for RegisterThisConnectionsAddress in ADR-055(c). This play declares it.
+# Root-hint fallback is set OFF (forward-only): the isolated branch can never reach the internet
+# root servers, so the fallback is dead weight that only adds timeout latency if ADDC01 is down.
+# MS guidance (DNS client/forwarding docs): clear "use root hints if no forwarders are available"
+# when the server shouldn't contact the internet directly and has a reliable forwarder. The 13
+# root hints stay LOADED (MS requires >=1) — we just don't fall back to them. Values come from
+# group_vars/dc_replica.yml (ad_dns_forwarders = ADDC01; ad_dns_use_root_hints = false).
+#
+# ── REUSE ───────────────────────────────────────────────────────────────────────
+# Reuses ad_dns's proven, idempotent Set-DnsServerForwarder logic via tasks_from: forwarders.yml
+# (NOT the full ad_dns role — that also configures reverse zone + scavenging, which belong on
+# ADDC01 only). ADDC01's forwarder config (Quad9 + root hints) is unaffected — different group.
+#
+# ── HOST SAFETY ─────────────────────────────────────────────────────────────────
+# Targets ONLY dc_replica (ADDC02-corp) over WinRM. Never localhost, never VYOS01, never ADDC01.
+# REQUIRED pre-run check (must list ONLY ADDC02-corp):
+#   ansible-playbook -i inventory/lab.yml playbooks/15-branch-dns-forwarders.yml --list-hosts
+#
+# Run: ansible-playbook -i inventory/lab.yml playbooks/15-branch-dns-forwarders.yml
+
+- name: "Configure Branch (ADDC02) DNS server forwarders — forward external to HQ, root-hints off"
+  hosts: dc_replica
+  gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast discipline (ADR-050)
+  tasks:
+    - name: "15 | set ADDC02 forwarders = {{ ad_dns_forwarders | join(', ') }}, UseRootHint={{ ad_dns_use_root_hints }} (reuse ad_dns/forwarders.yml)"
+      ansible.builtin.include_role:
+        name: ad_dns
+        tasks_from: forwarders.yml
+
+    - name: "15 | read back forwarder config (post-write verify)"
+      ansible.windows.win_powershell:
+        script: |
+          $f = Get-DnsServerForwarder
+          $Ansible.Result = @{
+              Forwarders  = @($f.IPAddress | ForEach-Object { $_.IPAddressToString })
+              UseRootHint = [bool]$f.UseRootHint
+              Timeout     = $f.Timeout
+          }
+          $Ansible.Changed = $false
+      register: r_fwd
+      changed_when: false
+
+    - name: "15 | assert forwarder = HQ + root-hint fallback OFF"
+      ansible.builtin.assert:
+        that:
+          - r_fwd.result.Forwarders == ad_dns_forwarders
+          - not (r_fwd.result.UseRootHint | bool)
+        fail_msg: "ADDC02 forwarders wrong: {{ r_fwd.result }} (expected {{ ad_dns_forwarders }}, UseRootHint False)."
+        success_msg: "ADDC02 forwards to {{ r_fwd.result.Forwarders | join(', ') }} (HQ); root-hint fallback OFF (isolated branch)."
+
+    - name: "15 | prove external resolution still works through the HQ forwarder"
+      ansible.windows.win_powershell:
+        script: |
+          # With self-first client DNS (SM6), ADDC02 asks itself; its DNS server forwards
+          # external names to ADDC01 -> Quad9. Resolving a public name proves the path end to end.
+          $r = Resolve-DnsName -Name microsoft.com -Type A -QuickTimeout -ErrorAction Stop
+          $ips = @($r | Where-Object { $_.Type -eq 'A' } | Select-Object -ExpandProperty IPAddress)
+          if ($ips.Count -lt 1) { throw "No A record returned for microsoft.com via the HQ forwarder." }
+          $Ansible.Result = @{ Resolved = 'microsoft.com'; IPs = $ips }
+          $Ansible.Changed = $false
+      register: r_ext
+      changed_when: false
+
+    - name: "15 | show external-resolution proof"
+      ansible.builtin.debug:
+        msg: "ADDC02 resolved microsoft.com -> {{ r_ext.result.IPs | join(', ') }} (via HQ forwarder; root-hints off)."

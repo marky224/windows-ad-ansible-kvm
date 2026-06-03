@@ -41,3 +41,19 @@ safe_mode_password: "{{ vault_safe_mode_password }}"
 dc_dns_servers:
   - 127.0.0.1                     # preferred: ADDC02 resolves locally (branch survives a WAN cut)
   - "{{ corp_subnet.dc_ip }}"     # alternate: ADDC01 (10.10.0.10) across the inter-site link
+
+# --- Phase 6: Branch DNS SERVER forwarders (ADDC02 has no internet path) ---
+# ADDC02 sits in the ISOLATED Branch-Site (no NAT/internet — verified live: it cannot reach
+# 9.9.9.9). It forwards all external (non-authoritative) queries to ADDC01 (the hub), which
+# resolves them via its Quad9 forwarders. DC promotion set this forwarder INCIDENTALLY (the
+# promo-time DNS-client server became a forwarder); declared here so a rebuild can't depend on
+# that luck — same discipline as ADR-055(c)'s explicit RegisterThisConnectionsAddress.
+# Root-hint fallback is OFF: the isolated branch can provably never reach the internet root
+# servers, so the fallback is dead weight (MS guidance: clear "use root hints" when a server
+# shouldn't contact the internet directly and has a reliable forwarder). The 13 root hints stay
+# loaded (MS requires >=1); we just don't fall back to them. Applied by
+# playbooks/15-branch-dns-forwarders.yml (reuses ad_dns/tasks/forwarders.yml). NOTE: do NOT run
+# the FULL ad_dns role against dc_replica — its scavenging belongs on ONE server (ADDC01).
+ad_dns_forwarders:
+  - "{{ corp_subnet.dc_ip }}"   # ADDC01 (10.10.0.10) — the only external-resolution path from the isolated branch
+ad_dns_use_root_hints: false    # forward-only; roots are unreachable from the isolated branch
