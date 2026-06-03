@@ -2,7 +2,9 @@
 
 Install and configure the DHCP Server role on the DC. Authorizes the server
 in AD, creates the corp lab scope with exclusions + MAC-tied reservations
-for the known clients.
+for the known clients. **Phase 6** extends the same role to the Branch site
+(per-group scope on ADDC02) and adds reciprocal hot-standby **DHCP failover**
+between the two DCs (ADR-056) — see the Phase 6 section below.
 
 ## Production-MSP pattern
 
@@ -71,12 +73,40 @@ Each task reads current state before writing:
 - Options: read each option's current value, compare, set only if differs.
 - Reservations: keyed by IP, add missing / update changed MAC or Name / remove extra.
 
+## Phase 6 — multi-site (Branch scope + reciprocal DHCP failover)
+
+The same role serves the Branch site and provides cross-site redundancy (ADR-056):
+
+- **Branch scope (ADDC02).** `16-branch-dhcp.yml` runs this role against `dc_replica`
+  with per-group overrides in `group_vars/dc_replica.yml` (scope `10.20.0.0/24`, options,
+  `ad_dhcp_authorize_ip`, empty reservations). ADDC01's HQ path is unchanged — the only
+  task change is var-ising the AD-authorize IP (`ad_dhcp_authorize_ip`, default
+  `corp_subnet.dc_ip`).
+- **Reciprocal hot-standby failover** (`tasks/failover.yml`, run by `17-dhcp-failover.yml`).
+  Microsoft's "Symmetric Model": each DC is **Active** for its own scope and **Standby** for
+  the partner's (`HQ-ADDC01-ADDC02` + `Branch-ADDC02-ADDC01`). Hot-standby, MCLT 1h, reserve
+  5%, manual partner-down. Per-relationship params in `group_vars/{dc,dc_replica}.yml`
+  (`dhcp_failover`); shared knobs `ad_dhcp_failover_{reserve_percent,mclt}` in `defaults`;
+  shared secret `vault_dhcp_failover_secret` (inline-vault).
+  - Runs under **`become: runas`** — `Add-DhcpServerv4Failover` contacts the partner over
+    TCP 647 (a WinRM second hop).
+  - Split for debuggability + secret hygiene: a visible pre-check → a `no_log`-narrowed
+    `Add` → a read-back + assert (`Mode==HotStandby`, `ServerRole==Active` here).
+  - `17-dhcp-failover.yml` fronts the creates with a **preflight gate** that guards DHCP
+    failover's ±1-minute time-sync requirement (`Add-` hard-fails at create beyond it).
+
+> Failover replicates **scope-level** options/reservations/leases to the partner, **not
+> server-level** options; post-create option edits need a manual
+> `Invoke-DhcpServerv4FailoverReplication` (overwrites the partner from the initiator).
+
 ## Used by playbook
 
-`03-configure-services.yml`.
+`03-configure-services.yml` (HQ scope on ADDC01). **Phase 6:** `16-branch-dhcp.yml`
+(Branch scope on ADDC02) + `17-dhcp-failover.yml` (reciprocal failover, via `tasks/failover.yml`).
 
 ## ADRs implemented
 
 - ADR-007 (network layout)
 - ADR-013 (DHCP on the DC at lab scale; production would tier off)
 - ADR-016 (Ansible-native + inline PS where no module exists)
+- ADR-056 (Phase 6: reciprocal hot-standby DHCP failover + Branch scope)
