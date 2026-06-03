@@ -283,7 +283,10 @@
           $d = $desiredByIp[$ip]
           $existing = $current | Where-Object { $_.IPAddress.IPAddressToString -eq $ip }
           $existingMac = if ($existing) { (Normalize-Mac $existing.ClientId) } else { '' }
-          $existingName = if ($existing) { $existing.Name } else { '' }
+          # Do NOT compare Name: once a client is online, DHCP overwrites the reservation Name with
+          # the client's registered FQDN (e.g. CLIENT01.corp...), so comparing it to the desired
+          # short key (CLIENT01-corp) would flap `changed` on every converge. ClientId (MAC) is the
+          # stable identity -> key idempotency on it alone (Name is set once on Add, then left to DHCP).
           if (-not $existing) {
               Add-DhcpServerv4Reservation `
                   -ScopeId $ScopeId `
@@ -293,7 +296,7 @@
                   -Description "Lab reservation for $($d.Name)" `
                   -ErrorAction Stop
               $changed += "add:$($d.Name)=$ip/$($d.Mac)"
-          } elseif ($existingMac -ne $d.Mac -or $existingName -ne $d.Name) {
+          } elseif ($existingMac -ne $d.Mac) {
               Set-DhcpServerv4Reservation `
                   -ScopeId $ScopeId `
                   -IPAddress $d.Ip `
