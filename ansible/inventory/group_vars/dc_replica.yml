@@ -78,8 +78,13 @@ ad_dhcp_exclusions:
 ad_dhcp_authorize_ip: "{{ branch_subnet.dc_ip }}"            # ADDC02 (10.20.0.10)
 ad_dhcp_scope_options:
   router: "{{ branch_subnet.gateway }}"          # VyOS branch leg (10.20.0.1) = branch clients' gateway
+  # option 006 — local-first + cross-site alternate (ADR-056): a Branch client leased by the
+  # standby (ADDC01) during an ADDC02 outage still gets a live resolver. Mirror of the HQ scope
+  # (ad_dhcp/defaults) with the order flipped; replicated to the ADDC01 standby copy by ad_dhcp's
+  # replicate.yml. Keep it to TWO (KB 2834226).
   dns_servers:
-    - "{{ branch_subnet.dc_ip }}"                # ADDC02 (local DNS at the branch)
+    - "{{ branch_subnet.dc_ip }}"                # ADDC02 (local/Branch) — preferred
+    - "{{ corp_subnet.dc_ip }}"                  # ADDC01 (HQ)           — alternate (over the WAN)
   dns_domain_name: "{{ forest.fqdn }}"
   ntp_servers:
     - "{{ branch_subnet.dc_ip }}"                # ADDC02 (syncs time from the PDC down the domain hierarchy)

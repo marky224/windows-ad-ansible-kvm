@@ -1,0 +1,130 @@
+---
+# Re-replicate this DC's ACTIVE scope to its hot-standby failover partner (Phase 6, ADR-056 amendment).
+#
+# WHY: DHCP failover replicates scope options/reservations to the partner ONLY at relationship
+# CREATE time and on an EXPLICIT Invoke-DhcpServerv4FailoverReplication. A post-create option edit
+# (e.g. the local-first option-006 DNS-resilience change) does NOT auto-reach the standby, so a NEW
+# client leased by the standby during a failover would otherwise get the OLD (single-DC) option set.
+# This step pushes the current config to the standby, idempotently.
+#
+# DIRECTION (the foot-gun): Invoke-DhcpServerv4FailoverReplication is a DESTRUCTIVE one-way overwrite
+# of the partner's copy of the scope, SOURCED FROM the server it runs on (when -ComputerName is
+# omitted, the LOCAL server is the source). It MUST run from the scope's ACTIVE owner — running it
+# from the standby would clobber good config with stale. This file is only included `when` the local
+# detect in main.yml found this DC is the Active side, so that invariant holds structurally; the
+# script re-checks defensively (ServerRole) and only acts on this DC's OWN scope (ad_dhcp_scope_id).
+#
+# ROBUSTNESS (production hardening, validated 2026-06-03): MS does not contractually document the
+# read-back timing of the (synchronous) config push, nor the exact exception when the partner link
+# is down. So: skip gracefully if the relationship isn't State=Normal (a down/interrupted link makes
+# the push fail; the next converge re-replicates once it recovers), wrap the Invoke in try/catch with
+# -ErrorAction Stop (deterministic failure, not a silent half-apply), and confirm the partner with a
+# short bounded retry rather than one instantaneous read.
+#
+# DOUBLE-HOP: the partner read (-ComputerName) and the Invoke both contact the PARTNER over WinRM =
+# a second hop -> become:runas (same pattern as failover.yml; proven SM7/ADR-055). The local Get-
+# reads need no hop. NO shared secret is involved (the relationship already carries it) -> fully
+# visible (no no_log). Idempotent: only pushes when the partner's option 006 differs from local.
+
+- name: "Re-replicate active scope {{ ad_dhcp_scope_id }} to the hot-standby partner (idempotent)"
+  become: true
+  # FQCN form: ansible-lint's task schema requires it for block-level become (ADR-051 runas->FQCN).
+  # 17-dhcp-failover.yml sets become_method play-level, where the short `runas` is accepted.
+  become_method: ansible.builtin.runas
+  become_user: "{{ ansible_user }}"
+  vars:
+    ansible_become_password: "{{ ansible_password }}"
+  block:
+    - name: "Push scope {{ ad_dhcp_scope_id }} to the standby partner only if option 006 drifted"
+      ansible.windows.win_powershell:
+        parameters:
+          ScopeId: "{{ ad_dhcp_scope_id }}"
+        script: |
+          param([string]$ScopeId)
+          $ErrorActionPreference = 'Stop'
+
+          # Resolve this scope's failover relationship + partner (LOCAL read, no hop).
+          $rel = Get-DhcpServerv4Failover -ScopeId $ScopeId -ErrorAction SilentlyContinue
+          if (-not $rel) {
+              $Ansible.Changed = $false
+              $Ansible.Result  = @{ Action = 'no-relationship'; ScopeId = $ScopeId }
+              return
+          }
+          if ($rel.ServerRole -ne 'Active') {
+              # Defensive: the include is already gated on Active; NEVER push from the standby.
+              $Ansible.Changed = $false
+              $Ansible.Result  = @{ Action = 'skip-standby'; ScopeId = $ScopeId; Role = "$($rel.ServerRole)"; Relationship = "$($rel.Name)" }
+              return
+          }
+          # Replication needs a healthy failover channel. If the link isn't Normal (e.g.
+          # Communication-Interrupted / Partner-Down) the push would fail and the partner read
+          # would hang/error -> skip gracefully (changed=false); the next converge re-replicates
+          # once the channel recovers. Hard-failing here would abort the whole run (any_errors_fatal)
+          # for a transient link blip while the LOCAL scope config is already correct.
+          if ("$($rel.State)" -ne 'Normal') {
+              $Ansible.Changed = $false
+              $Ansible.Result  = @{ Action = 'skip-link-not-normal'; ScopeId = $ScopeId; Relationship = "$($rel.Name)"; State = "$($rel.State)" }
+              return
+          }
+          $partner = "$($rel.PartnerServer)"
+
+          function Get-Opt6 {
+              param([string]$Computer, [string]$Scope)
+              if ($Computer) {
+                  $v = Get-DhcpServerv4OptionValue -ComputerName $Computer -ScopeId $Scope -OptionId 6 -ErrorAction SilentlyContinue
+              } else {
+                  $v = Get-DhcpServerv4OptionValue -ScopeId $Scope -OptionId 6 -ErrorAction SilentlyContinue
+              }
+              if (-not $v) { return @() }
+              return @($v.Value)
+          }
+
+          $local         = Get-Opt6 -Computer ''       -Scope $ScopeId   # local = ACTIVE copy (source of truth)
+          $partnerBefore = Get-Opt6 -Computer $partner -Scope $ScopeId   # partner = STANDBY copy (second hop)
+
+          if ((($local) -join ',') -eq (($partnerBefore) -join ',')) {
+              $Ansible.Changed = $false
+              $Ansible.Result  = @{ Action = 'in-sync'; ScopeId = $ScopeId; Relationship = "$($rel.Name)"; Partner = $partner; Option6 = $local }
+              return
+          }
+
+          # Drifted -> push THIS scope from the active side to the standby (overwrites the partner
+          # copy). No -ComputerName: runs locally, so the local (active) config is the source.
+          # -Force suppresses the confirm prompt. try/catch makes a partner-unreachable failure
+          # deterministic (the exact exception text is undocumented, so we do NOT string-match it).
+          try {
+              $replOut = Invoke-DhcpServerv4FailoverReplication -ScopeId $ScopeId -Force -ErrorAction Stop
+          } catch {
+              throw "Failover replication of scope $ScopeId to partner $partner FAILED: $($_.Exception.Message)"
+          }
+          $replReported = @($replOut | ForEach-Object { "$_" })
+
+          # Post-write verify. The config push is synchronous, but the partner read-back timing is
+          # not contractually documented -> confirm with a short bounded retry, not a single read
+          # (avoids a spurious whole-run abort on any sub-second settle).
+          $partnerAfter = @()
+          $match = $false
+          foreach ($attempt in 1..3) {
+              $partnerAfter = Get-Opt6 -Computer $partner -Scope $ScopeId
+              if ((($local) -join ',') -eq (($partnerAfter) -join ',')) { $match = $true; break }
+              Start-Sleep -Milliseconds 500
+          }
+          if (-not $match) {
+              throw "Scope $ScopeId replicated but partner opt-006 differs after 3 reads: local=$(($local) -join ',') partner=$(($partnerAfter) -join ',')"
+          }
+          $Ansible.Changed = $true
+          $Ansible.Result  = @{
+              Action        = 'replicated'
+              ScopeId       = $ScopeId
+              Relationship  = "$($rel.Name)"
+              Partner       = $partner
+              Option6       = $local
+              PartnerBefore = $partnerBefore
+              PartnerAfter  = $partnerAfter
+              ReplReported  = $replReported
+          }
+      register: r_dhcp_replicate
+
+    - name: "Show standby replication result for scope {{ ad_dhcp_scope_id }}"
+      ansible.builtin.debug:
+        var: r_dhcp_replicate.result

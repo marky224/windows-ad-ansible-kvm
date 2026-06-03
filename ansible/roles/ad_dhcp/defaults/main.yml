@@ -37,13 +37,20 @@ ad_dhcp_exclusions:
 
 # Scope options handed out via DHCP.
 #   003 (Router):          gateway
-#   006 (DNS Servers):     DC (Server 2025 holds DNS + AD-integrated zones)
+#   006 (DNS Servers):     both DCs, LOCAL-FIRST (ADR-056) — the local-site DC preferred,
+#                          the cross-site partner DC as the alternate, so a client leased by
+#                          the STANDBY during a failover still gets a LIVE resolver (not a dead
+#                          single local DC). Set at SCOPE level → rides failover replication.
+#                          Client-side mirror of the SM6 self-first DC resolver. Keep it to TWO
+#                          (KB 2834226: a 4th+ entry isn't queried until ~4s). Branch scope flips
+#                          the order in group_vars/dc_replica.yml.
 #   015 (DNS Domain Name): forest FQDN — sets the connection-specific DNS suffix
 #   042 (NTP Servers):     DC (PDC is the authoritative NTP source per ad_ntp)
 ad_dhcp_scope_options:
   router: "{{ corp_subnet.gateway }}"
   dns_servers:
-    - "{{ corp_subnet.dc_ip }}"
+    - "{{ corp_subnet.dc_ip }}"      # ADDC01 (local/HQ) — preferred
+    - "{{ branch_subnet.dc_ip }}"    # ADDC02 (Branch)   — alternate
   dns_domain_name: "{{ forest.fqdn }}"
   ntp_servers:
     - "{{ corp_subnet.dc_ip }}"

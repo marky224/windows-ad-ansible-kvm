@@ -354,3 +354,36 @@
 - name: "Show DHCP end state"
   ansible.builtin.debug:
     var: r_dhcp_verify.result
+
+# --- Phase 6 (ADR-056 amendment): keep the hot-standby partner's option set current ---
+# Failover replicates scope options to the partner ONLY at relationship CREATE time + on an
+# explicit Invoke-DhcpServerv4FailoverReplication. After (re)setting this scope's options above,
+# if this DC is the ACTIVE owner of the scope's failover relationship, push the config to the
+# standby so a client leased by the standby during a failover gets the SAME local-first option-006
+# list. Fresh build: no relationship yet when 03/16 first run -> no-op (17's create-time
+# replication carries the options). The detect is a LOCAL read (no hop, no become); only the push
+# (tasks/replicate.yml) elevates to become:runas for the partner second-hop.
+- name: "Detect this scope's failover relationship (local read; decides whether to replicate)"
+  ansible.windows.win_powershell:
+    parameters:
+      ScopeId: "{{ ad_dhcp_scope_id }}"
+    script: |
+      param([string]$ScopeId)
+      $rel = Get-DhcpServerv4Failover -ScopeId $ScopeId -ErrorAction SilentlyContinue
+      $Ansible.Result = @{
+          InFailover = [bool]$rel
+          IsActive   = [bool]($rel -and $rel.ServerRole -eq 'Active')
+          Name       = if ($rel) { "$($rel.Name)" } else { '' }
+          Role       = if ($rel) { "$($rel.ServerRole)" } else { '' }
+      }
+      $Ansible.Changed = $false
+  register: r_dhcp_failover_state
+  changed_when: false
+
+- name: "Show this scope's failover relationship state"
+  ansible.builtin.debug:
+    var: r_dhcp_failover_state.result
+
+- name: "Re-replicate scope options to the hot-standby partner (active side only; idempotent)"
+  ansible.builtin.include_tasks: replicate.yml
+  when: r_dhcp_failover_state.result.IsActive | bool

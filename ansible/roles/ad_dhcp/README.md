@@ -39,11 +39,14 @@ Reservations always override exclusions — documented MSFT behavior.
 3. Authorize DHCP server in AD via `Add-DhcpServerInDC`.
 4. Create / update IPv4 scope with active state.
 5. Apply exclusion ranges (idempotent diff against current).
-6. Set scope options 003 (Router), 006 (DNS), 015 (DNS Domain Name), 042 (NTP).
+6. Set scope options 003 (Router), 006 (DNS — **both DCs, local-first**; ADR-056), 015 (DNS Domain Name), 042 (NTP).
 7. Apply MAC-tied reservations from `client_dhcp_reservations` +
    `linux_client_dhcp_reservations` group_vars (composed via hostvars in
    `defaults/main.yml`).
 8. Verify end state.
+9. **Phase 6:** if this DC is the **Active** owner of the scope's failover relationship,
+   re-replicate the scope to the hot-standby partner (`tasks/replicate.yml`; idempotent —
+   see the Phase 6 section).
 
 ## Reservation data source
 
@@ -72,6 +75,8 @@ Each task reads current state before writing:
 - Exclusions: keyed by `"start|end"`, add missing + remove extra.
 - Options: read each option's current value, compare, set only if differs.
 - Reservations: keyed by IP, add missing / update changed MAC or Name / remove extra.
+- Failover replication (Phase 6): pushes to the standby only when this DC is the scope's
+  active owner AND its option 006 differs from the partner's copy; post-write verified.
 
 ## Phase 6 — multi-site (Branch scope + reciprocal DHCP failover)
 
@@ -95,9 +100,15 @@ The same role serves the Branch site and provides cross-site redundancy (ADR-056
   - `17-dhcp-failover.yml` fronts the creates with a **preflight gate** that guards DHCP
     failover's ±1-minute time-sync requirement (`Add-` hard-fails at create beyond it).
 
-> Failover replicates **scope-level** options/reservations/leases to the partner, **not
-> server-level** options; post-create option edits need a manual
-> `Invoke-DhcpServerv4FailoverReplication` (overwrites the partner from the initiator).
+- **DNS-resilience + self-healing replication** (ADR-056 amendment). Each scope's **option 006**
+  lists **both DCs, local-first** (HQ `[ADDC01, ADDC02]` in `defaults`; Branch `[ADDC02, ADDC01]`
+  in `group_vars/dc_replica.yml`) so a client leased by the standby during a failover still gets a
+  *live* resolver. Failover replicates **scope-level** options/reservations/leases (NOT server-level
+  options) only at CREATE time + on an explicit push — so `tasks/replicate.yml` runs at the end of
+  the role: when this DC is the scope's **Active** owner and its option 006 differs from the
+  partner's copy, it runs `Invoke-DhcpServerv4FailoverReplication -ScopeId <id> -Force` (a
+  destructive partner-overwrite, **from the active side only**) under `become: runas`, then re-reads
+  the partner to verify. Idempotent — no-op when in sync / no relationship / on the standby side.
 
 ## Used by playbook
 
@@ -109,4 +120,4 @@ The same role serves the Branch site and provides cross-site redundancy (ADR-056
 - ADR-007 (network layout)
 - ADR-013 (DHCP on the DC at lab scale; production would tier off)
 - ADR-016 (Ansible-native + inline PS where no module exists)
-- ADR-056 (Phase 6: reciprocal hot-standby DHCP failover + Branch scope)
+- ADR-056 + amendment (Phase 6: reciprocal hot-standby DHCP failover + Branch scope + DHCP DNS-resilience)
