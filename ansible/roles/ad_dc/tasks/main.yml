@@ -83,6 +83,30 @@
       $Ansible.Result = @{ AppliedOrAlreadyCorrect = $true; Changed = $set }
   register: r_nla_durable
 
+# Make the DC's NIC register its own host records in DNS — EXPLICITLY, not by luck.
+# kvm_windows_vm's Autounattend ships every NIC with
+# EnableAdapterDomainNameRegistration=false + DisableDynamicUpdate=true (so a VM does
+# not spam an unreachable DNS during the offline install). The first DC happened to get
+# this re-enabled along its DNS-install path, but the SM5 replica did NOT — and Netlogon
+# then failed to register its locator records (event 5782 "No DNS servers configured")
+# -> silent one-way replication (ADR-055). Set it here too so a future ADDC01 rebuild
+# can't regress on that incidental behavior. Idempotent; mirrors ad_dc_replica. MS Learn
+# "DNS client settings best practices" calls for RegisterThisConnectionsAddress=True on a DC.
+- name: "Ensure NIC registers its addresses in DNS (explicit; was incidental — ADR-055)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $enabled = @()
+      foreach ($nic in (Get-DnsClient | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|isatap|Teredo|Pseudo' })) {
+          if (-not $nic.RegisterThisConnectionsAddress) {
+              Set-DnsClient -InterfaceAlias $nic.InterfaceAlias -RegisterThisConnectionsAddress $true -UseSuffixWhenRegistering $true
+              $enabled += $nic.InterfaceAlias
+          }
+      }
+      $Ansible.Changed = ($enabled.Count -gt 0)
+      $Ansible.Result  = @{ EnabledRegistrationOn = $enabled; AlreadyCorrect = ($enabled.Count -eq 0) }
+  register: r_dnsreg
+
 - name: "Promote to first DC of {{ forest.fqdn }} (creates new forest)"
   microsoft.ad.domain:
     dns_domain_name: "{{ forest.fqdn }}"
