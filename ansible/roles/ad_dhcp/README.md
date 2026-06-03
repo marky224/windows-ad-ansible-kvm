@@ -74,7 +74,7 @@ Each task reads current state before writing:
 - Scope: compared field-by-field; `Set-` only if any differs.
 - Exclusions: keyed by `"start|end"`, add missing + remove extra.
 - Options: read each option's current value, compare, set only if differs.
-- Reservations: keyed by IP, add missing / update changed MAC or Name / remove extra.
+- Reservations: keyed by IP, add missing / update on changed **ClientId (MAC)** only / remove extra. Name is set once on `Add`, then left to DHCP — comparing it would flap `changed` forever because DHCP overwrites the reservation Name with the client's registered FQDN once the client is online.
 - Failover replication (Phase 6): pushes to the standby only when this DC is the scope's
   active owner AND its option 006 differs from the partner's copy; post-write verified.
 
