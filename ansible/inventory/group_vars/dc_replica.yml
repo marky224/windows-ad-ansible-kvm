@@ -84,3 +84,13 @@ ad_dhcp_scope_options:
   ntp_servers:
     - "{{ branch_subnet.dc_ip }}"                # ADDC02 (syncs time from the PDC down the domain hierarchy)
 ad_dhcp_reservations: {}                          # no branch clients yet
+
+# --- Phase 6 SM7 part 2: DHCP failover — ADDC02 is ACTIVE for the Branch scope ───
+# Reciprocal hot-standby ("Symmetric Model", MS-documented): ADDC02 serves the Branch scope
+# 10.20.0.0/24 and is the hot-standby partner for the HQ scope. The relationship is
+# CREATED ON ADDC02 (the active side) by playbooks/17-dhcp-failover.yml; creation
+# replicates the Branch scope to ADDC01 as standby. Companion dict in group_vars/dc.yml.
+dhcp_failover:
+  name: "Branch-ADDC02-ADDC01"
+  partner: "ADDC01.{{ forest.fqdn }}"
+  scope_id: "{{ branch_subnet.cidr.split('/')[0] }}"   # 10.20.0.0

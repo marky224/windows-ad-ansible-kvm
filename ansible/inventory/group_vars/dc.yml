@@ -45,3 +45,13 @@ safe_mode_password: "{{ vault_safe_mode_password }}"
 dc_dns_servers:
   - 127.0.0.1                     # preferred: ADDC01 resolves locally (HQ autonomy)
   - "{{ branch_subnet.dc_ip }}"   # alternate: ADDC02 (10.20.0.10) across the inter-site link
+
+# --- Phase 6 SM7 part 2: DHCP failover — ADDC01 is ACTIVE for the HQ scope ───────
+# Reciprocal hot-standby ("Symmetric Model", MS-documented): ADDC01 serves the HQ scope
+# 10.10.0.0/24 and is the hot-standby partner for the Branch scope. The relationship is
+# CREATED ON ADDC01 (the active side) by playbooks/17-dhcp-failover.yml; creation
+# replicates the HQ scope to ADDC02 as standby. Companion dict in group_vars/dc_replica.yml.
+dhcp_failover:
+  name: "HQ-ADDC01-ADDC02"
+  partner: "ADDC02.{{ forest.fqdn }}"
+  scope_id: "{{ corp_subnet.cidr.split('/')[0] }}"   # 10.10.0.0

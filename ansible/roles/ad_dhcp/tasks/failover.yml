@@ -1,0 +1,94 @@
+---
+# DHCP failover relationship (Phase 6 SM7 part 2). The LOCAL server (the one this task
+# runs on) becomes ACTIVE for dhcp_failover.scope_id; the partner becomes STANDBY. This is
+# ONE half of Microsoft's reciprocal "Symmetric Model" — included once per DC, each for its
+# own scope (group_vars/{dc,dc_replica}.yml dhcp_failover). Shared knobs in defaults/main.yml;
+# secret = vault_dhcp_failover_secret (group_vars/all, inline-vault).
+#
+# DESIGN: a VISIBLE pre-check decides whether to create and surfaces the only common conflict
+# (scope already in a different relationship) in the CLEAR; only the actual
+# Add-DhcpServerv4Failover call — which carries the shared secret in its parameters — is no_log.
+#
+# DOUBLE-HOP: MUST run under become:runas. Add-DhcpServerv4Failover contacts the PARTNER over
+# TCP 647 (a WinRM second hop); a plain NTLM session would fail Access-denied (ADR-055; proven
+# SM7). All READS here are LOCAL on this DC (no hop).
+
+- name: "Pre-check DHCP failover '{{ dhcp_failover.name }}' (visible; decides whether to create)"
+  ansible.windows.win_powershell:
+    parameters:
+      Name: "{{ dhcp_failover.name }}"
+      ScopeId: "{{ dhcp_failover.scope_id }}"
+    script: |
+      param([string]$Name, [string]$ScopeId)
+      $byName  = Get-DhcpServerv4Failover -Name $Name -ErrorAction SilentlyContinue
+      $byScope = Get-DhcpServerv4Failover -ScopeId $ScopeId -ErrorAction SilentlyContinue
+      if ($byScope -and $byScope.Name -ne $Name) {
+          throw "Scope $ScopeId is already in a DIFFERENT failover relationship '$($byScope.Name)'. Refusing to create '$Name' (one scope : one relationship)."
+      }
+      $Ansible.Result  = @{ Exists = [bool]$byName; NeedCreate = (-not $byName) }
+      $Ansible.Changed = $false
+  register: r_failover_precheck
+  changed_when: false
+
+- name: "Create hot-standby failover '{{ dhcp_failover.name }}' (LOCAL Active for {{ dhcp_failover.scope_id }}, partner Standby)"
+  ansible.windows.win_powershell:
+    parameters:
+      Name: "{{ dhcp_failover.name }}"
+      Partner: "{{ dhcp_failover.partner }}"
+      ScopeId: "{{ dhcp_failover.scope_id }}"
+      ReservePercent: "{{ ad_dhcp_failover_reserve_percent }}"
+      Mclt: "{{ ad_dhcp_failover_mclt }}"
+      SharedSecret: "{{ vault_dhcp_failover_secret }}"
+    script: |
+      param([string]$Name,[string]$Partner,[string]$ScopeId,[int]$ReservePercent,[string]$Mclt,[string]$SharedSecret)
+      # LOCAL server Active; partner Standby. Hot-standby is selected by -ServerRole/-ReservePercent.
+      # Manual partner-down (-AutoStateTransition $false) is the safe WAN default — the SM9 drill
+      # declares PARTNER DOWN by hand. Creating from the active side replicates the scope to the partner.
+      Add-DhcpServerv4Failover -Name $Name -PartnerServer $Partner -ScopeId $ScopeId `
+          -ServerRole Active -ReservePercent $ReservePercent `
+          -MaxClientLeadTime ([TimeSpan]$Mclt) -AutoStateTransition $false `
+          -SharedSecret $SharedSecret -Force -ErrorAction Stop | Out-Null
+      $Ansible.Changed = $true
+  no_log: true   # SharedSecret rides in parameters — hide the whole task from logs
+  when: r_failover_precheck.result.NeedCreate | bool
+  register: r_failover_create
+
+- name: "Read back failover '{{ dhcp_failover.name }}' (no secret is ever returned by Get-)"
+  ansible.windows.win_powershell:
+    parameters:
+      Name: "{{ dhcp_failover.name }}"
+    script: |
+      param([string]$Name)
+      $f = Get-DhcpServerv4Failover -Name $Name -ErrorAction Stop
+      $Ansible.Result = @{
+          Name           = $f.Name
+          Mode           = "$($f.Mode)"
+          State          = "$($f.State)"
+          ServerRole     = "$($f.ServerRole)"
+          Partner        = "$($f.PartnerServer)"
+          ScopeIds       = @($f.ScopeId | ForEach-Object { "$_" })
+          ReservePercent = $f.ReservePercent
+          Mclt           = "$($f.MaxClientLeadTime)"
+          AutoTransition = [bool]$f.AutoStateTransition
+      }
+      $Ansible.Changed = $false
+  register: r_failover
+  changed_when: false
+
+- name: "Show failover relationship '{{ dhcp_failover.name }}'"
+  ansible.builtin.debug:
+    var: r_failover.result
+
+- name: "Assert '{{ dhcp_failover.name }}' is HotStandby + Active here + includes {{ dhcp_failover.scope_id }}"
+  ansible.builtin.assert:
+    that:
+      - r_failover.result.Mode == 'HotStandby'
+      - r_failover.result.ServerRole == 'Active'
+      - dhcp_failover.scope_id in r_failover.result.ScopeIds
+    fail_msg: >-
+      {{ dhcp_failover.name }} wrong: mode={{ r_failover.result.Mode }} role={{ r_failover.result.ServerRole }}
+      scopes={{ r_failover.result.ScopeIds }} (expected HotStandby / Active including {{ dhcp_failover.scope_id }}).
+    success_msg: >-
+      {{ dhcp_failover.name }}: HotStandby, this server Active, partner {{ r_failover.result.Partner }};
+      scopes {{ r_failover.result.ScopeIds | join(',') }}; state {{ r_failover.result.State }};
+      reserve {{ r_failover.result.ReservePercent }}%; MCLT {{ r_failover.result.Mclt }}; auto-transition {{ r_failover.result.AutoTransition }}.

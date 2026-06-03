@@ -70,3 +70,13 @@ ad_dhcp_reservations: >-
         | default({})
       )
   }}
+
+# --- DHCP failover (Phase 6 SM7 part 2) — shared hot-standby knobs ───────────────
+# Per-relationship params (name / partner / scope_id) are per-group in
+# group_vars/{dc,dc_replica}.yml (dhcp_failover). The shared secret is
+# vault_dhcp_failover_secret (inline-vault, group_vars/all/main.yml). Consumed by
+# tasks/failover.yml under become:runas (the create contacts the PARTNER = a 2nd hop).
+# Both values are the Microsoft defaults / production recommendations (researched
+# + validated 2026-06-03): hot-standby for a routed/branch topology, manual partner-down.
+ad_dhcp_failover_reserve_percent: 5       # % of the scope the standby may lease pre-MCLT (MS default)
+ad_dhcp_failover_mclt: "01:00:00"         # Maximum Client Lead Time (MS production rec = 1h; cannot be 0)

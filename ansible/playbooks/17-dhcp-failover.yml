@@ -1,0 +1,160 @@
+---
+# Phase 6 SM7 (part 2 of 2): the RECIPROCAL hot-standby DHCP failover relationships.
+# This is Microsoft's documented "Symmetric Model" for a routed two-site forest:
+#   • HQ scope     10.10.0.0/24 -> ADDC01 Active, ADDC02 Standby  (rel HQ-ADDC01-ADDC02)
+#   • Branch scope 10.20.0.0/24 -> ADDC02 Active, ADDC01 Standby  (rel Branch-ADDC02-ADDC01)
+# A server is Active in one relationship and Standby in the other — fully supported. After
+# both creates, BOTH DCs host BOTH scopes (each active for its own, standby for the partner's).
+#
+# Hot-standby (not load-balance) is MS's recommendation for a WAN/branch topology — it avoids
+# cross-link traffic on every lease. Manual partner-down (-AutoStateTransition $false) is the
+# safe WAN default (a transient link blip must NOT auto-trigger a split-brain; the SM9 drill
+# declares PARTNER DOWN by hand). MCLT 1h + reserve 5% are the MS defaults. (Researched 2026-06-03.)
+#
+# ── DOUBLE-HOP ──────────────────────────────────────────────────────────────────
+# Add-DhcpServerv4Failover contacts the PARTNER server (TCP 647) = a WinRM second hop, so the
+# two CREATE plays run under become:runas to carry delegatable creds (proven SM7; ADR-055).
+# Every READ (preflight + verify) is LOCAL on its own DC and runs WITHOUT become.
+#
+# ── SAFETY GATE (Play 0) ────────────────────────────────────────────────────────
+# DHCP failover HARD-FAILS at create if the partners' clocks differ by >1 minute, and needs
+# partner DNS + a routable path. Play 0 re-checks clock skew / partner DNS / reachability / the
+# failover firewall rules and ABORTS before any create if not ready. (Read-only; mirrors the
+# de-risk probe.) True end-to-end TCP 647 is proven when the relationships reach State=Normal.
+#
+# ── HOST SAFETY ─────────────────────────────────────────────────────────────────
+# Targets ONLY dc + dc_replica (ADDC01-corp, ADDC02-corp) over WinRM. Never localhost/VYOS01.
+# REQUIRED pre-run check (must list ONLY ADDC01-corp + ADDC02-corp):
+#   ansible-playbook -i inventory/lab.yml playbooks/17-dhcp-failover.yml --list-hosts
+#
+# Run: ansible-playbook -i inventory/lab.yml playbooks/17-dhcp-failover.yml
+
+- name: "Play 0 — Preflight: DHCP-failover readiness gate (read-only; aborts before any create)"
+  hosts: dc:dc_replica
+  gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast discipline (ADR-050)
+  vars:
+    partner_fqdn: "{{ ('ADDC01' if inventory_hostname in groups['dc_replica'] else 'ADDC02') ~ '.' ~ forest.fqdn }}"
+    partner_ip: "{{ corp_subnet.dc_ip if inventory_hostname in groups['dc_replica'] else branch_subnet.dc_ip }}"
+  tasks:
+    - name: "17 | gather clock + partner DNS/reachability + failover FW rules (LOCAL read)"
+      ansible.windows.win_powershell:
+        parameters:
+          PartnerFqdn: "{{ partner_fqdn }}"
+          PartnerIp: "{{ partner_ip }}"
+        script: |
+          param([string]$PartnerFqdn, [string]$PartnerIp)
+          $ErrorActionPreference = 'Continue'
+          try   { $dnsA = @((Resolve-DnsName -Name $PartnerFqdn -Type A -ErrorAction Stop).IPAddress) -join ',' }
+          catch { $dnsA = "RESOLVE-FAILED: $($_.Exception.Message)" }
+          # Failover FW rules auto-ship with the DHCP role. Fast path by internal Name; fall
+          # back to a DisplayName scan only if that returns nothing.
+          $fw = @(Get-NetFirewallRule -Name 'Microsoft-Windows-DHCP-Failover-TCP-*' -ErrorAction SilentlyContinue)
+          if ($fw.Count -eq 0) { $fw = @(Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*DHCP*Failover*' }) }
+          # Reach the partner on LDAP/389 (a known DC listener); 647 has no listener pre-relationship.
+          $reach = Test-NetConnection -ComputerName $PartnerIp -Port 389 -WarningAction SilentlyContinue -InformationLevel Quiet
+          $Ansible.Result = @{
+              UtcMs            = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+              PartnerDnsA      = $dnsA
+              PartnerReachable = [bool]$reach
+              FwRuleCount      = $fw.Count
+          }
+          $Ansible.Changed = $false
+      register: r_pf
+      changed_when: false
+
+    - name: "17 | assert partner DNS resolves, partner routable, failover FW rules present"
+      ansible.builtin.assert:
+        that:
+          - "'RESOLVE-FAILED' not in r_pf.result.PartnerDnsA"
+          - r_pf.result.PartnerReachable | bool
+          - r_pf.result.FwRuleCount | int >= 1
+        fail_msg: >-
+          {{ inventory_hostname }} NOT READY — partner dns={{ r_pf.result.PartnerDnsA }}
+          reachable={{ r_pf.result.PartnerReachable }} fwRules={{ r_pf.result.FwRuleCount }}.
+        success_msg: >-
+          {{ inventory_hostname }}: partner DNS={{ r_pf.result.PartnerDnsA }}, routable=yes,
+          failover FW rules={{ r_pf.result.FwRuleCount }}.
+
+    - name: "17 | assert cross-DC clock skew is well inside the ±1-min failover gate"
+      run_once: true
+      vars:
+        delta_ms: "{{ ((hostvars[groups['dc'][0]].r_pf.result.UtcMs | int) - (hostvars[groups['dc_replica'][0]].r_pf.result.UtcMs | int)) | abs }}"
+      ansible.builtin.assert:
+        that:
+          - delta_ms | int < 30000
+        fail_msg: >-
+          ADDC01<->ADDC02 clock delta {{ delta_ms }} ms approaches/exceeds the ±1-min gate —
+          sync W32Time (Add-DhcpServerv4Failover will hard-fail) before creating failover.
+        success_msg: >-
+          ADDC01<->ADDC02 clock delta {{ delta_ms }} ms (<< 60 s gate, incl. inter-task jitter) —
+          failover create will not hard-fail on time skew.
+
+- name: "Play 1 — HQ-scope failover (ADDC01 Active, ADDC02 Standby) — created ON ADDC01"
+  hosts: dc
+  gather_facts: false
+  any_errors_fatal: true   # ADR-050
+  become: true
+  become_method: runas
+  become_user: "{{ ansible_user }}"
+  vars:
+    ansible_become_password: "{{ ansible_password }}"
+  tasks:
+    - name: "17 | create + verify the HQ failover relationship (ad_dhcp/failover.yml)"
+      ansible.builtin.include_role:
+        name: ad_dhcp
+        tasks_from: failover.yml
+
+- name: "Play 2 — Branch-scope failover (ADDC02 Active, ADDC01 Standby) — created ON ADDC02"
+  hosts: dc_replica
+  gather_facts: false
+  any_errors_fatal: true   # ADR-050
+  become: true
+  become_method: runas
+  become_user: "{{ ansible_user }}"
+  vars:
+    ansible_become_password: "{{ ansible_password }}"
+  tasks:
+    - name: "17 | create + verify the Branch failover relationship (ad_dhcp/failover.yml)"
+      ansible.builtin.include_role:
+        name: ad_dhcp
+        tasks_from: failover.yml
+
+- name: "Play 3 — Verify BOTH relationships on BOTH DCs (LOCAL reads; poll to State=Normal)"
+  hosts: dc:dc_replica
+  gather_facts: false
+  any_errors_fatal: true   # ADR-050
+  tasks:
+    - name: "17 | poll Get-DhcpServerv4Failover until >=2 relationships are all State=Normal"
+      ansible.windows.win_powershell:
+        script: |
+          # A freshly created relationship may briefly read Init/Startup/PotentialConflict
+          # before settling to Normal once the partners reconcile — so poll, don't snapshot.
+          $deadline = (Get-Date).AddMinutes(3)
+          while ((Get-Date) -lt $deadline) {
+            $rels = @(Get-DhcpServerv4Failover -ErrorAction SilentlyContinue)
+            if ($rels.Count -ge 2 -and -not ($rels | Where-Object { $_.State -ne 'Normal' })) {
+              $Ansible.Result = @{
+                Count = $rels.Count
+                Relationships = @($rels | ForEach-Object { "$($_.Name): mode=$($_.Mode) role=$($_.ServerRole) state=$($_.State) partner=$($_.PartnerServer) scopes=$($_.ScopeId -join ',')" })
+              }
+              $Ansible.Changed = $false
+              return
+            }
+            Start-Sleep -Seconds 15
+          }
+          $rels = @(Get-DhcpServerv4Failover -ErrorAction SilentlyContinue)
+          throw "After 3 min not all Normal: $(@($rels | ForEach-Object { "$($_.Name)=$($_.State)" }) -join ', ')"
+      register: r_rels
+      changed_when: false
+
+    - name: "17 | show relationships on {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        var: r_rels.result
+
+    - name: "17 | assert this DC participates in both relationships (active for one, standby for the other)"
+      ansible.builtin.assert:
+        that:
+          - r_rels.result.Count | int >= 2
+        fail_msg: "{{ inventory_hostname }} has only {{ r_rels.result.Count }} failover relationship(s); expected >=2."
+        success_msg: "{{ inventory_hostname }}: {{ r_rels.result.Relationships | join(' | ') }}"
