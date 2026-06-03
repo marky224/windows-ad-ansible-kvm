@@ -247,11 +247,75 @@
   ansible.builtin.debug:
     var: r_replica_connectivity.result
 
-# Broad LOCAL dcdiag, run LAST after replication + SYSVOL + DNS-locator are green.
-# /q is the exit-code GATE (matches ad_dc's proven leniency for fresh-DC stdout
-# warnings). NOT /e — enterprise mode binds to ADDC01 and would hit the double-hop;
-# ADDC01's own health is gated by its LOCAL dcdiag /q in Play 3 instead.
-- name: "ad_dc_replica/verify | dcdiag /q (LOCAL ADDC02 health gate, exit-code only)"
+# --- FSMO awareness + RID-pool health, read LOCALLY on ADDC02 — the authoritative,
+#     double-hop-safe replacement for dcdiag's KnowsOfRoleHolders + RidManager. Those
+#     two dcdiag tests BIND each remote role holder (ADDC01) over DS RPC, which this
+#     WinRM NTLM session cannot do (the SM5 double-hop) — so on the replica they print
+#     "ADDC01 ... not responding to DS RPC Bind" + a stdout "failed", with dcdiag STILL
+#     exiting rc=0 (verified: the /q gate never caught it). Replication itself is fine
+#     (the DRA uses the machine account). So gate on what is true, local, and meaningful
+#     instead: (1) ADDC02 KNOWS all five role holders (replicated fSMORoleOwner attrs
+#     resolve with no onward hop), and (2) ADDC02 holds a valid RID allocation pool
+#     (the RID master granted it a 500-RID block at promotion — proves it can mint
+#     principals). Connectivity ADDC02<->ADDC01 is already gated by the inbound/outbound
+#     replication checks above. (ADR-055 follow-up.)
+- name: "ad_dc_replica/verify | read FSMO holders + RID pool LOCALLY (double-hop-safe authoritative check)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $me = $env:COMPUTERNAME
+      # No -Server => these bind the LOCAL DC (ADDC02) and read replicated
+      # fSMORoleOwner data; they never hop onward to the role holder.
+      $d = Get-ADDomain
+      $f = Get-ADForest
+      $fsmo = [ordered]@{
+          SchemaMaster         = "$($f.SchemaMaster)"
+          DomainNamingMaster   = "$($f.DomainNamingMaster)"
+          PDCEmulator          = "$($d.PDCEmulator)"
+          RIDMaster            = "$($d.RIDMaster)"
+          InfrastructureMaster = "$($d.InfrastructureMaster)"
+      }
+      $missing = @($fsmo.GetEnumerator() | Where-Object { [string]::IsNullOrWhiteSpace($_.Value) } | ForEach-Object { $_.Key })
+      # rIDAllocationPool is an Int64 packing first|last RID in its low|high DWORD. A
+      # promoted DC is granted a 500-RID block at promotion, so size>0 on a healthy DC.
+      $ridSetDN = [string](Get-ADComputer $me -Properties rIDSetReferences).rIDSetReferences
+      $pool  = [int64](Get-ADObject $ridSetDN -Properties rIDAllocationPool).rIDAllocationPool
+      $first = $pool -band 0xFFFFFFFFL
+      $last  = ($pool -shr 32) -band 0xFFFFFFFFL
+      $Ansible.Result = @{
+          FSMO         = $fsmo
+          FSMOAllKnown = ($missing.Count -eq 0)
+          FSMOMissing  = $missing
+          RidSetDN     = $ridSetDN
+          RidPoolFirst = $first
+          RidPoolLast  = $last
+          RidPoolSize  = ($last - $first)
+          RidPoolOK    = (($last - $first) -gt 0)
+      }
+      $Ansible.Changed = $false
+  register: r_replica_fsmo_rid
+  changed_when: false
+
+- name: "ad_dc_replica/verify | show local FSMO/RID-pool view"
+  ansible.builtin.debug:
+    var: r_replica_fsmo_rid.result
+
+- name: "ad_dc_replica/verify | assert ADDC02 knows all 5 FSMO holders + holds a valid RID pool (LOCAL, authoritative)"
+  ansible.builtin.assert:
+    that:
+      - r_replica_fsmo_rid.result.FSMOAllKnown | bool
+      - r_replica_fsmo_rid.result.RidPoolOK | bool
+    fail_msg: "ADDC02 local FSMO/RID health FAILED — FSMOAllKnown={{ r_replica_fsmo_rid.result.FSMOAllKnown }}, missing={{ r_replica_fsmo_rid.result.FSMOMissing }}; RID pool {{ r_replica_fsmo_rid.result.RidPoolFirst }}..{{ r_replica_fsmo_rid.result.RidPoolLast }} (size {{ r_replica_fsmo_rid.result.RidPoolSize }})."
+    success_msg: "ADDC02 knows all 5 FSMO holders (RIDMaster={{ r_replica_fsmo_rid.result.FSMO.RIDMaster }}) and holds a valid RID pool ({{ r_replica_fsmo_rid.result.RidPoolFirst }}..{{ r_replica_fsmo_rid.result.RidPoolLast }}, {{ r_replica_fsmo_rid.result.RidPoolSize }} RIDs) — the double-hop-safe equivalent of dcdiag KnowsOfRoleHolders + RidManager."
+
+# Broad LOCAL dcdiag LAST, after replication + SYSVOL + DNS-locator + the local FSMO/RID
+# gate above are all green. Only /q's EXIT CODE is gated (a backstop for "dcdiag can't
+# run"); its STDOUT is informational. On the replica that stdout is EXPECTED to show
+# KnowsOfRoleHolders/RidManager "failed" (the double-hop, now covered authoritatively
+# above) and, after a reboot, a SystemLog "failed" for the benign Secure-Boot CA-2023
+# advisory (EventID 1801). NOT /e — enterprise mode binds ADDC01 and would hit the
+# double-hop; ADDC01's own health is gated by its LOCAL dcdiag /q in Play 3 instead.
+- name: "ad_dc_replica/verify | dcdiag /q (LOCAL ADDC02 rc backstop — authoritative checks are above)"
   ansible.windows.win_command: dcdiag /q
   register: r_replica_dcdiag
   changed_when: false
