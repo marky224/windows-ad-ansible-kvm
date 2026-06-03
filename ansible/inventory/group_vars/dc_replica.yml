@@ -30,3 +30,14 @@ dc_role:
 # microsoft.ad.domain_controller. Kept distinct from vault_dc_admin_password per
 # ADR-031 (same rationale as group_vars/dc.yml).
 safe_mode_password: "{{ vault_safe_mode_password }}"
+
+# --- Phase 6 SM6: DNS client cross-pointing (ADR-052 amendment, 2026-06-03) ---
+# SELF-FIRST ordering (full rationale + sources in group_vars/dc.yml). ADDC02 is the
+# ONLY DC in Branch-Site, reachable to HQ only across the ISOLATED VyOS WAN — so it
+# must prefer its OWN local DNS and keep serving the branch when the link is down,
+# with ADDC01 as the alternate. This is the whole point of a branch DC; it is the
+# exact case MS KB 825036 warns about for remote-preferred DNS. Island-safe post-SM5
+# (both _msdcs CNAMEs resolve, AD-integrated zones). Applied by 14-dns-crosspoint.yml.
+dc_dns_servers:
+  - 127.0.0.1                     # preferred: ADDC02 resolves locally (branch survives a WAN cut)
+  - "{{ corp_subnet.dc_ip }}"     # alternate: ADDC01 (10.10.0.10) across the inter-site link

@@ -1,0 +1,222 @@
+---
+# Phase 6 SM6 (ADR-052 amendment 2026-06-03): DNS client CROSS-POINTING for the
+# two-site forest. Sets each DC's DNS client search order to SELF-FIRST + the
+# cross-site partner as the alternate, then verifies no DNS island formed and that
+# replication is still clean in BOTH directions.
+#
+# ── WHY SELF-FIRST (not the originally-sketched "partner-first") ────────────────
+# Research (MS KB 825036, current 2026-02; KB 275278; Ace Fekay; remote-site
+# consensus) established that "partner-first / loopback-last" is the CO-LOCATED-LAN
+# pattern. This is a WAN-separated, one-DC-per-site topology, so each DC prefers
+# ITSELF and falls back to the partner:
+#     ADDC01 -> [127.0.0.1, 10.20.0.10]   (HQ resolves locally; ADDC02 alt)
+#     ADDC02 -> [127.0.0.1, 10.10.0.10]   (Branch resolves locally even if the VyOS
+#                                          WAN drops; ADDC01 alt)
+# The DNS-island risk (KB 275278, Win2000-era — breaks replication only BEFORE a
+# partner's _msdcs CNAME is present) is already neutralized: SM5 verified BOTH
+# replication directions + both _msdcs CNAMEs resolve, and the zones are
+# AD-integrated. KB 825036 explicitly permits self-as-preferred once replication is
+# verified. Order/values come from group_vars {dc,dc_replica}.yml (dc_dns_servers).
+# See _private/docs/DESIGN-DECISIONS.md (ADR-052 amendment).
+#
+# ── REGRESSION WATCH (the SM5 root-cause class, ADR-055) ────────────────────────
+# A NIC/DNS reconfig must NOT silently re-disable DNS registration (event 5782 ->
+# one-way replication). ansible.windows.win_dns_client only sets server addresses,
+# but Play 1 affirmatively RE-ASSERTS RegisterThisConnectionsAddress=True afterward.
+#
+# ── VERIFICATION (both directions, double-hop-safe — ADR-055) ───────────────────
+# Play 1: local DNS state + island sanity (each DC resolves the forest root, the
+#         DC-locator SRV, and EVERY DC's host record) + nltest /dsgetdc, on both DCs.
+# Play 2: OUTBOUND replication ADDC01<-ADDC02, verified LOCALLY ON ADDC01 (reuses
+#         ad_dc_replica/verify_outbound.yml).
+# Play 3: INBOUND replication ADDC02<-ADDC01, forced + verified LOCALLY ON ADDC02.
+# Each DC's replication is checked ON that DC (an NTLM WinRM session can't double-hop
+# to bind the remote DC — repadmin/Get-ADReplication* against a REMOTE DC would fail).
+#
+# ── ONE-SHOT? No — fully idempotent + re-runnable ───────────────────────────────
+# win_dns_client converges to the desired list; the verifies are read-mostly (only
+# benign nltest /dsregdns re-registration + on-demand repadmin /replicate /force).
+#
+# ── HOST SAFETY ─────────────────────────────────────────────────────────────────
+# Targets ONLY dc + dc_replica (ADDC01-corp, ADDC02-corp) over WinRM. Never
+# localhost, never VYOS01. REQUIRED pre-run check (must list ONLY those two):
+#   ansible-playbook -i inventory/lab.yml playbooks/14-dns-crosspoint.yml --list-hosts
+#
+# Run: ansible-playbook -i inventory/lab.yml playbooks/14-dns-crosspoint.yml
+
+- name: "Play 1 — Cross-point DNS client (self-first + partner alt) + local verify"
+  hosts: dc:dc_replica
+  gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast discipline (ADR-050)
+  tasks:
+    - name: "14 | discover the primary (Up, non-loopback) network adapter"
+      ansible.windows.win_powershell:
+        script: |
+          $nic = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+          if (-not $nic) { throw "No 'Up' physical adapter found to configure DNS on." }
+          $Ansible.Result = @{ InterfaceAlias = $nic.Name }
+          $Ansible.Changed = $false
+      register: r_nic
+      changed_when: false
+
+    - name: "14 | set DNS client order to {{ dc_dns_servers | join(', ') }} (self-first) on {{ r_nic.result.InterfaceAlias }}"
+      ansible.windows.win_dns_client:
+        adapter_names: "{{ r_nic.result.InterfaceAlias }}"
+        dns_servers: "{{ dc_dns_servers }}"
+
+    - name: "14 | re-assert RegisterThisConnectionsAddress=True (SM5 regression watch-item)"
+      ansible.windows.win_powershell:
+        script: |
+          $alias = '{{ r_nic.result.InterfaceAlias }}'
+          $changed = $false
+          $nic = Get-DnsClient -InterfaceAlias $alias -ErrorAction Stop
+          if (-not $nic.RegisterThisConnectionsAddress) {
+              Set-DnsClient -InterfaceAlias $alias -RegisterThisConnectionsAddress $true -UseSuffixWhenRegistering $true -ErrorAction Stop
+              $changed = $true
+          }
+          $after = Get-DnsClient -InterfaceAlias $alias -ErrorAction Stop
+          if (-not $after.RegisterThisConnectionsAddress) { throw "RegisterThisConnectionsAddress still False on $alias after Set-DnsClient." }
+          $Ansible.Result = @{ InterfaceAlias = $alias; Register = [bool]$after.RegisterThisConnectionsAddress }
+          $Ansible.Changed = $changed
+      register: r_register
+
+    - name: "14 | read back DNS server order (post-write verify)"
+      ansible.windows.win_powershell:
+        script: |
+          $alias = '{{ r_nic.result.InterfaceAlias }}'
+          $got = @((Get-DnsClientServerAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses)
+          $Ansible.Result = @{ InterfaceAlias = $alias; ServerAddresses = $got }
+          $Ansible.Changed = $false
+      register: r_dns_after
+      changed_when: false
+
+    - name: "14 | assert DNS order is exactly the desired self-first list + registration True"
+      ansible.builtin.assert:
+        that:
+          - r_dns_after.result.ServerAddresses == dc_dns_servers
+          - r_register.result.Register | bool
+        fail_msg: >-
+          {{ inventory_hostname }} DNS client wrong: got {{ r_dns_after.result.ServerAddresses }}
+          (register={{ r_register.result.Register }}), expected {{ dc_dns_servers }} + register True.
+        success_msg: >-
+          {{ inventory_hostname }} [{{ r_dns_after.result.InterfaceAlias }}] DNS =
+          {{ r_dns_after.result.ServerAddresses | join(', ') }} (self-first, partner alt);
+          RegisterThisConnectionsAddress=True.
+
+    - name: "14 | flush resolver cache + re-register DC locator records (nltest /dsregdns)"
+      ansible.windows.win_powershell:
+        script: |
+          Clear-DnsClientCache
+          & nltest /dsregdns | Out-Null
+          $Ansible.Changed = $false
+      changed_when: false
+
+    - name: "14 | island sanity — resolve forest root + DC-locator SRV + EVERY DC's host record (LOCAL)"
+      ansible.windows.win_powershell:
+        script: |
+          $forest = '{{ forest.fqdn }}'
+          $problems = @()
+          if (-not (Resolve-DnsName -Name $forest -Type SOA -ErrorAction SilentlyContinue)) {
+              $problems += "forest root SOA ($forest) did not resolve"
+          }
+          $srv = @(Resolve-DnsName -Name "_ldap._tcp.dc._msdcs.$forest" -Type SRV -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Type -eq 'SRV' })
+          if ($srv.Count -lt 1) { $problems += "_ldap._tcp.dc._msdcs.$forest SRV did not resolve" }
+          $targets = @($srv | Select-Object -ExpandProperty NameTarget -Unique)
+          $resolved = @()
+          foreach ($t in $targets) {
+              $a = @(Resolve-DnsName -Name $t -Type A -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'A' })
+              if ($a.Count -gt 0) { $resolved += "$t=$($a.IPAddress -join ',')" }
+              else { $problems += "DC host record $t (A) did not resolve" }
+          }
+          if ($problems.Count -gt 0) { throw ("DNS island sanity FAILED: " + ($problems -join '; ')) }
+          $Ansible.Result = @{ ForestRoot = $forest; DcLocatorTargets = $targets; ResolvedDCs = $resolved }
+          $Ansible.Changed = $false
+      register: r_island
+      changed_when: false
+
+    - name: "14 | show island-sanity result"
+      ansible.builtin.debug:
+        var: r_island.result
+
+    - name: "14 | assert this DC sees BOTH DCs in DNS (no island, cross-site visibility)"
+      ansible.builtin.assert:
+        that:
+          - r_island.result.DcLocatorTargets | length >= 2
+        fail_msg: "{{ inventory_hostname }} resolves only {{ r_island.result.DcLocatorTargets }} — expected >=2 DCs (possible DNS island)."
+        success_msg: "{{ inventory_hostname }} resolves all DCs: {{ r_island.result.ResolvedDCs | join('; ') }}."
+
+    - name: "14 | nltest /dsgetdc — end-to-end DC locator from this DC"
+      ansible.windows.win_command: "nltest /dsgetdc:{{ forest.fqdn }}"
+      register: r_dsgetdc
+      changed_when: false
+      failed_when: r_dsgetdc.rc != 0
+
+    - name: "14 | show nltest /dsgetdc output"
+      ansible.builtin.debug:
+        msg: "{{ r_dsgetdc.stdout_lines }}"
+
+- name: "Play 2 — Re-verify OUTBOUND replication (ADDC01 <- ADDC02) LOCALLY on ADDC01"
+  hosts: dc
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: "14 | confirm cross-pointing didn't break outbound replication (reuse verify_outbound.yml)"
+      ansible.builtin.include_role:
+        name: ad_dc_replica
+        tasks_from: verify_outbound.yml
+
+- name: "Play 3 — Re-verify INBOUND replication (ADDC02 <- ADDC01) LOCALLY on ADDC02"
+  hosts: dc_replica
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    sm6_inbound_repl_minutes: 10
+    sm6_inbound_repl_interval: 30
+  tasks:
+    - name: "14 | force + verify ADDC02 inbound-replicates FROM ADDC01 (LOCAL on ADDC02)"
+      ansible.windows.win_powershell:
+        script: |
+          $self     = $env:COMPUTERNAME                    # ADDC02 (this play runs here)
+          $partner  = 'ADDC01'
+          $domainNC = (Get-ADDomain).DistinguishedName
+          # LOCAL bind on ADDC02 (dest); force it to pull the domain NC FROM ADDC01,
+          # skipping the inter-site schedule. No double-hop: dest bind is local; the
+          # actual pull uses the DRA / machine-account Kerberos.
+          & repadmin /replicate $self $partner "$domainNC" /force 2>&1 | Out-Null
+          $deadline = (Get-Date).AddMinutes({{ sm6_inbound_repl_minutes }})
+          while ((Get-Date) -lt $deadline) {
+              $meta = @(Get-ADReplicationPartnerMetadata -Target $self -Scope Server -PartnerType Inbound -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Partner -match "CN=NTDS Settings,CN=$partner," })
+              if ($meta.Count -gt 0) {
+                  $bad       = @($meta | Where-Object { $_.LastReplicationResult -ne 0 })
+                  $noSuccess = @($meta | Where-Object { -not $_.LastReplicationSuccess -or $_.LastReplicationSuccess.Year -lt 2000 })
+                  if ($bad.Count -eq 0 -and $noSuccess.Count -eq 0) {
+                      $Ansible.Result = @{
+                          Direction   = "$partner -> $self (ADDC02 pulls from ADDC01)"
+                          Partitions  = @($meta | Select-Object -ExpandProperty Partition -Unique)
+                          LinkCount   = $meta.Count
+                          LastSuccess = @($meta | ForEach-Object { $_.LastReplicationSuccess.ToString('s') } | Select-Object -Unique)
+                      }
+                      $Ansible.Changed = $false
+                      return
+                  }
+              }
+              & repadmin /replicate $self $partner "$domainNC" /force 2>&1 | Out-Null
+              Start-Sleep -Seconds {{ sm6_inbound_repl_interval }}
+          }
+          throw "ADDC02 did not confirm clean inbound replication from $partner within {{ sm6_inbound_repl_minutes }} min. Inspect 'repadmin /showrepl' on ADDC02."
+      register: r_inbound
+      changed_when: false
+
+    - name: "14 | show INBOUND (ADDC02 <- ADDC01) result"
+      ansible.builtin.debug:
+        var: r_inbound.result
+
+    - name: "14 | assert ADDC02 has a clean inbound link from ADDC01"
+      ansible.builtin.assert:
+        that:
+          - r_inbound.result.LinkCount | int > 0
+        fail_msg: "Inbound replication (ADDC01 -> ADDC02) not confirmed after cross-pointing: {{ r_inbound.result }}"
+        success_msg: "Inbound confirmed — ADDC02 cleanly pulls {{ r_inbound.result.LinkCount }} partition(s) from ADDC01. Both directions verified post-cross-point."

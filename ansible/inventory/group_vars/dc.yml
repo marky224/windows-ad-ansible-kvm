@@ -27,3 +27,21 @@ dc_role:
 # Kept distinct from vault_dc_admin_password per ADR-031 (defense-in-depth: DSRM
 # is the only recovery path back to RID 500 after ADR-033's smartcard-required flag).
 safe_mode_password: "{{ vault_safe_mode_password }}"
+
+# --- Phase 6 SM6: DNS client cross-pointing (ADR-052 amendment, 2026-06-03) ---
+# SELF-FIRST ordering: ADDC01 prefers ITSELF (loopback) with the cross-site partner
+# (ADDC02) as the alternate. Researched + chosen over the originally-sketched
+# "partner-first" — which is the CO-LOCATED-LAN pattern — because this is a
+# WAN-separated, one-DC-per-site topology:
+#   - HQ keeps resolving locally (no 40 ms WAN hop on every uncached lookup, and no
+#     dependency on the branch link for the FSMO-holding primary). MS KB 825036 names
+#     the remote-preferred failure: "Loss of connectivity to the Preferred DNS server
+#     will result in failure to resolve DNS queries from the Domain Controller."
+#   - The DNS-island risk (KB 275278, Win2000-era) is already NEUTRALIZED: SM5 verified
+#     BOTH replication directions + both _msdcs CNAMEs resolve, and the zones are
+#     AD-integrated — so self-first is island-safe. KB 825036 explicitly permits
+#     self-as-preferred once replication is verified.
+# Applied by playbooks/14-dns-crosspoint.yml via ansible.windows.win_dns_client.
+dc_dns_servers:
+  - 127.0.0.1                     # preferred: ADDC01 resolves locally (HQ autonomy)
+  - "{{ branch_subnet.dc_ip }}"   # alternate: ADDC02 (10.20.0.10) across the inter-site link
