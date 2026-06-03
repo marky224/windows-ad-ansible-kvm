@@ -16,6 +16,9 @@
 # whose IPs sit outside any defined scope (ERROR_DHCP_SUBNET_NOT_PRESENT).
 
 ad_dhcp_scope_id: "10.10.0.0"
+# IP the DHCP server authorizes itself with in AD (the LOCAL DC's IP). Overridden
+# per-group for the Branch replica (ADDC02 = 10.20.0.10) in group_vars/dc_replica.yml (SM7).
+ad_dhcp_authorize_ip: "{{ corp_subnet.dc_ip }}"
 ad_dhcp_scope_name: "Corp Lab Scope"
 ad_dhcp_scope_description: "Single scope for corp.markandrewmarquez.com lab (.50-.199, reservations carved out via exclusion)"
 ad_dhcp_scope_start: "{{ corp_subnet.dhcp_scope_start }}"

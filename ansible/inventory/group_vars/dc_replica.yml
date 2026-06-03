@@ -20,7 +20,7 @@ ansible_password: "{{ vault_named_admin_password }}"
 dc_role:
   primary: false
   hold_fsmo_roles: false
-  install_dhcp: false        # SM7: reciprocal hot-standby failover + Branch scope
+  install_dhcp: true         # SM7: Branch scope (ADDC02 primary) + reciprocal hot-standby failover
   install_dns: true          # GC + DNS at Branch (WAN-resilient name resolution)
   install_ad_cs: false       # single CA on ADDC01
   install_wsus: false        # single WSUS on ADDC01
@@ -57,3 +57,30 @@ dc_dns_servers:
 ad_dns_forwarders:
   - "{{ corp_subnet.dc_ip }}"   # ADDC01 (10.10.0.10) — the only external-resolution path from the isolated branch
 ad_dns_use_root_hints: false    # forward-only; roots are unreachable from the isolated branch
+
+# --- Phase 6 SM7: Branch-Site DHCP scope (ADDC02 primary) ---
+# ADDC02 runs DHCP for the Branch subnet (10.20.0.0/24), serving branch clients
+# directly (on-subnet). Reuses the ad_dhcp role with these per-group overrides (the
+# role's defaults target the HQ/corp subnet for ADDC01; only the IP/scope/options
+# differ). Applied by playbooks/16-branch-dhcp.yml; the reciprocal hot-standby
+# failover relationship (ADDC02 primary for Branch, ADDC01 standby; and vice versa
+# for HQ) is playbooks/17-dhcp-failover.yml. No branch clients exist yet, so the
+# scope is client-less for now (empty reservations).
+ad_dhcp_scope_id: "{{ branch_subnet.cidr.split('/')[0] }}"   # 10.20.0.0
+ad_dhcp_scope_name: "Branch Site Scope"
+ad_dhcp_scope_description: "Branch-Site scope (10.20.0.0/24); ADDC02 primary, ADDC01 hot-standby (SM7)"
+ad_dhcp_scope_start: "{{ branch_subnet.dhcp_scope_start }}"
+ad_dhcp_scope_end: "{{ branch_subnet.dhcp_scope_end }}"
+ad_dhcp_subnet_mask: "{{ branch_subnet.netmask }}"
+ad_dhcp_exclusions:
+  - start: "{{ branch_subnet.dhcp_reservation_range_start }}"
+    end: "{{ branch_subnet.dhcp_reservation_range_end }}"
+ad_dhcp_authorize_ip: "{{ branch_subnet.dc_ip }}"            # ADDC02 (10.20.0.10)
+ad_dhcp_scope_options:
+  router: "{{ branch_subnet.gateway }}"          # VyOS branch leg (10.20.0.1) = branch clients' gateway
+  dns_servers:
+    - "{{ branch_subnet.dc_ip }}"                # ADDC02 (local DNS at the branch)
+  dns_domain_name: "{{ forest.fqdn }}"
+  ntp_servers:
+    - "{{ branch_subnet.dc_ip }}"                # ADDC02 (syncs time from the PDC down the domain hierarchy)
+ad_dhcp_reservations: {}                          # no branch clients yet

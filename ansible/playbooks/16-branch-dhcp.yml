@@ -1,0 +1,29 @@
+---
+# Phase 6 SM7 (part 1 of 2): install DHCP on the Branch replica (ADDC02) and create
+# the Branch-Site scope (10.20.0.0/24). ADDC02 serves branch clients DIRECTLY
+# (on-subnet) — no relay involved here.
+#
+# ── REUSE ───────────────────────────────────────────────────────────────────────
+# Runs the existing, validated `ad_dhcp` role against ADDC02 with the per-group
+# overrides in group_vars/dc_replica.yml (scope/options/authorize-IP point at the
+# Branch subnet; reservations empty). The role's HQ behavior on ADDC01 is unchanged
+# — only the ad_dhcp_* vars differ per group, plus one var-ised authorize IP.
+#
+# ── ALL LOCAL TO ADDC02 (no double-hop) ─────────────────────────────────────────
+# Feature install, AD authorization (ADDC02 writes to its own AD), scope/options —
+# all execute locally on ADDC02 as madmin-da. The cross-DC failover relationship
+# (which DOES need delegation) is the SEPARATE 17-dhcp-failover.yml.
+#
+# ── HOST SAFETY ─────────────────────────────────────────────────────────────────
+# Targets ONLY dc_replica (ADDC02-corp) over WinRM. Never localhost/VYOS01/ADDC01.
+# REQUIRED pre-run check (must list ONLY ADDC02-corp):
+#   ansible-playbook -i inventory/lab.yml playbooks/16-branch-dhcp.yml --list-hosts
+#
+# Run: ansible-playbook -i inventory/lab.yml playbooks/16-branch-dhcp.yml
+
+- name: "SM7 — Branch (ADDC02) DHCP server + Branch-Site scope (10.20.0.0/24)"
+  hosts: dc_replica
+  gather_facts: false
+  any_errors_fatal: true   # site.yml fail-fast discipline (ADR-050)
+  roles:
+    - ad_dhcp

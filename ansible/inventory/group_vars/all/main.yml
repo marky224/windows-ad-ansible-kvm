@@ -50,6 +50,13 @@ branch_subnet:
   libvirt_host_ip: 10.20.0.2     # host's passive mgmt-only bridge IP
   gateway: 10.20.0.1             # VyOS branch leg = ADDC02's default gateway
   dc_ip: 10.20.0.10              # ADDC02
+  # DHCP scope for the Branch-Site (SM7) — mirrors the HQ layout: .50-.199 scope,
+  # .50-.99 reserved block (exclusion). ADDC02 serves this directly (on-subnet);
+  # ADDC01 is the hot-standby partner via the reciprocal failover relationship.
+  dhcp_scope_start: 10.20.0.50
+  dhcp_scope_end: 10.20.0.199
+  dhcp_reservation_range_start: 10.20.0.50
+  dhcp_reservation_range_end: 10.20.0.99
   libvirt_network_name: corp-branch
   libvirt_bridge: virbr-branch
 
@@ -140,3 +147,16 @@ iso_checksums:
 wim_edition:
   windows_server_2025: 2     # "Windows Server 2025 SERVERSTANDARD" — Standard Eval + Desktop Experience
   windows_11_enterprise: 1   # "Windows 11 Enterprise Evaluation"
+
+# --- Phase 6 SM7: DHCP failover shared secret (inline-vault) ---
+# Authenticates the reciprocal hot-standby failover channel (TCP 647) between ADDC01
+# and ADDC02. Generated + vault-encrypted 2026-06-03; plaintext never left the shell.
+# Consumed by ad_dhcp/tasks/failover.yml (no_log). Could be consolidated into vault.yml.
+vault_dhcp_failover_secret: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          39323834633963633636653338623035306330396164353437303233333961363964323863393366
+          3235313966623366376166643337623031366535366465340a663134306664626236633130323534
+          35373566663264663166646362633332616138626461303734613262353565653231323265626630
+          3331363830663039300a343030613138313531346232336465326335303564386465666361343762
+          31626566326635306635343463316563313736613662333963363661363737336162336535383334
+          6130633235383964313462643131323635396630343665366464

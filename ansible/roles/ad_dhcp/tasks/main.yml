@@ -49,7 +49,7 @@
   ansible.windows.win_powershell:
     parameters:
       DnsName: "{{ forest.fqdn }}"
-      IPAddress: "{{ corp_subnet.dc_ip }}"
+      IPAddress: "{{ ad_dhcp_authorize_ip }}"
     script: |
       param([string]$DnsName, [string]$IPAddress)
       # Use computer FQDN, not forest FQDN, for the DhcpServer identity.
