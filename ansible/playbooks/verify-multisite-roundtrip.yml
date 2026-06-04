@@ -1,0 +1,121 @@
+---
+# Multi-site replication ROUND-TRIP proof (OPT-IN — run explicitly; NOT wired into site.yml or any
+# orchestration, and NOT part of the read-only verify-multisite.yml gate because it WRITES to AD).
+#
+# Proves the HQ-Branch site-link SCHEDULE is HONORED, not merely configured: it creates a throwaway
+# `contact` canary on ADDC01, polls for it LOCALLY on the Branch replica (ADDC02), measures arrival,
+# then ALWAYS deletes it. Expect arrival <= ~15 min (change-notification OFF + 15-min link frequency).
+# A near-instant arrival is *reported* as suspect (change-notification may have leaked on) but not
+# hard-failed — a single round-trip can land just before a scheduled pull, so the reliable "notif OFF"
+# signal stays the Options-bit assert in verify-multisite.yml. Arrival beyond the window DOES fail.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ HOST SAFETY: hosts=dc (ADDC01); the ONLY other host touched is the        │
+# │ dc_replica DC (ADDC02) via delegate_to — both are sanctioned DCs. The     │
+# │ write is a single throwaway contact object, deleted in an always-block    │
+# │ (cleanup runs even if the poll times out). Pre-run the host gate:         │
+# │   ansible-playbook playbooks/verify-multisite-roundtrip.yml --list-hosts  │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Double-hop note (ADR-055): the poll runs ON ADDC02 (delegate_to), reading ADDC02's OWN copy — a
+# local read, no second hop. It deliberately does NOT force replication (no Sync-ADObject / repadmin
+# /replicate); forcing it would defeat the point of testing the schedule.
+- name: "Prove the HQ-Branch site-link schedule is honored (replication round-trip)"
+  hosts: dc
+  gather_facts: false
+  vars:
+    # Upper bound for "schedule honored" = the HQ-Branch link frequency (15 min) + slack; and the
+    # lower bound below which a fast arrival is *reported* as suspect. Mirror of roles/ad_sites/defaults.
+    roundtrip_ok_max_seconds: 960
+    roundtrip_notify_suspect_seconds: 45
+    roundtrip_replica_host: "{{ groups['dc_replica'][0] }}"
+  tasks:
+    - name: "Round-trip | create + watch + cleanup the replication canary"
+      block:
+        - name: "Round-trip | create canary on ADDC01 (originating write)"
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Stop'
+              $domDN = (Get-ADDomain).DistinguishedName
+              $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddHHmmss')
+              $name  = "sm8-repl-canary-$stamp"
+              $obj = New-ADObject -Name $name -Type contact -Path "CN=Users,$domDN" `
+                       -OtherAttributes @{ description = 'multi-site replication canary; safe to delete' } -PassThru
+              $Ansible.Changed = $true
+              $Ansible.Result = @{
+                Name       = $name
+                DN         = $obj.DistinguishedName
+                CreatedUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+                OriginDC   = "$env:COMPUTERNAME"
+              }
+          register: canary
+
+        - name: "Round-trip | canary created on ADDC01"
+          ansible.builtin.debug:
+            var: canary.result
+
+        - name: "Round-trip | poll for the canary LOCALLY on the Branch replica (schedule-paced)"
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'SilentlyContinue'
+              $name = '{{ canary.result.Name }}'
+              $obj  = Get-ADObject -Filter "Name -eq '$name'"
+              $Ansible.Changed = $false
+              $Ansible.Result = @{
+                Found     = [bool]$obj
+                NowUtc    = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+                CheckedOn = "$env:COMPUTERNAME"
+              }
+          delegate_to: "{{ roundtrip_replica_host }}"
+          register: roundtrip_poll
+          until: roundtrip_poll.result.Found
+          retries: 36
+          delay: 30
+          changed_when: false
+
+        - name: "Round-trip | compute replication latency (seconds)"
+          ansible.builtin.set_fact:
+            roundtrip_latency_s: "{{ ((roundtrip_poll.result.NowUtc | to_datetime) - (canary.result.CreatedUtc | to_datetime)).total_seconds() | int }}"
+
+        - name: "Round-trip | RESULT"
+          ansible.builtin.debug:
+            msg:
+              - "canary:        {{ canary.result.Name }}"
+              - "created (UTC): {{ canary.result.CreatedUtc }} on {{ canary.result.OriginDC }}"
+              - "arrived (UTC): {{ roundtrip_poll.result.NowUtc }} on {{ roundtrip_poll.result.CheckedOn }}"
+              - "latency:       {{ roundtrip_latency_s }} s  (~{{ (roundtrip_latency_s | int / 60) | round(1) }} min)"
+              - >-
+                verdict: {{ 'SUSPECT: near-instant -> change-notification may be ON'
+                  if (roundtrip_latency_s | int) < (roundtrip_notify_suspect_seconds | int)
+                  else 'OK: site-link schedule honored' }}
+
+        - name: "Round-trip | assert arrival within the site-link schedule window"
+          ansible.builtin.assert:
+            that:
+              - "(roundtrip_latency_s | int) <= (roundtrip_ok_max_seconds | int)"
+            fail_msg: >-
+              ❌ canary took {{ roundtrip_latency_s }}s (> {{ roundtrip_ok_max_seconds }}s) --
+              site-link schedule not honored / replication stalled.
+            success_msg: >-
+              ✅ schedule honored: canary arrived in {{ roundtrip_latency_s }}s
+              (<= {{ roundtrip_ok_max_seconds }}s window)
+      always:
+        - name: "Round-trip | ALWAYS delete the canary on ADDC01 + verify gone"
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'SilentlyContinue'
+              $name = '{{ (canary.result.Name | default("")) }}'
+              if (-not $name) { $Ansible.Changed = $false; $Ansible.Result = @{ Skipped = $true }; return }
+              $obj = Get-ADObject -Filter "Name -eq '$name'"
+              $removed = $false
+              if ($obj) { Remove-ADObject -Identity $obj.DistinguishedName -Confirm:$false; $removed = $true }
+              $still = Get-ADObject -Filter "Name -eq '$name'"
+              $Ansible.Changed = $removed
+              $Ansible.Result = @{ Name = $name; Removed = $removed; StillPresentOnOrigin = [bool]$still }
+          register: roundtrip_cleanup
+          when: canary is defined
+
+        - name: "Round-trip | cleanup result"
+          ansible.builtin.debug:
+            var: roundtrip_cleanup.result
+          when: roundtrip_cleanup is defined
