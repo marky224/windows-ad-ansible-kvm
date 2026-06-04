@@ -60,3 +60,31 @@ fire_drill_winrm_pass: "{{ vault_named_admin_password }}"
 # Boot/connect waits.
 fire_drill_lease_retries: 24      # × 10s = up to 4 min for the NIC to DHCP
 fire_drill_winrm_timeout: 360     # seconds to wait for 5986 to open on the sandbox
+
+# --- SM9 DR drill scenario (ADR-058) ---------------------------------------
+# What the verify play DOES with the booted sandbox:
+#   smoke (default) — run the shared DC health checks (tasks/smoke-dc.yml). Today's
+#                     behavior; proves the snapshot/backup restores to a healthy DC.
+#   seize           — clone the REPLICA (-e fire_drill_source_vm=ADDC02-corp), then
+#                     ACTUALLY seize all 5 FSMO onto it against the absent ADDC01 and
+#                     rehearse the metadata-cleanup eviction (tasks/firedrill-seize.yml).
+# A seizure is a ONE-WAY door (DR-RUNBOOK.md): a *seized-from* DC must never rejoin the
+# forest. Rehearsing it on a network-ISOLATED clone is the only safe way — a clone is
+# still the source DC's identity, so corp-firedrill's isolation is the LOAD-BEARING
+# control (genid is defense-in-depth only, and is latent here: the live DCs expose no
+# <genid>, so the cloned NTDS has no baseline for the safeguard to fire against).
+fire_drill_scenario: smoke
+
+# seize: the SHORT NAME of the DC that RECEIVES the roles = the cloned source DC itself
+# (strip -corp). Fed verbatim to Move-ADDirectoryServerOperationMasterRole -Identity,
+# which MUST take the short name, never the FQDN (documented cmdlet bug — ADR-058 #1).
+fire_drill_seize_target: "{{ fire_drill_source_vm | regex_replace('-corp$', '') }}"
+
+# seize: the SHORT NAME of the lost FSMO holder being evicted in the cleanup rehearsal
+# (the HQ DC in this lab). The graceful-transfer attempt to it fails (it is absent on
+# the isolated net) → -Force seizes.
+fire_drill_seize_dead_dc: ADDC01
+
+# seize: minutes allowed for FSMO/genid reads to settle after boot, and to poll the
+# per-role seizure (each role waits out a transfer-attempt timeout before seizing).
+fire_drill_seize_settle_minutes: 5

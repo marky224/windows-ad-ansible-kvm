@@ -30,6 +30,26 @@ then tear everything down. Driven by `fire-drill.yml`. Implements **ADR-047**.
 5. **Always teardown** (pass *or* fail): destroy the sandbox VM, delete the workdir
    clones, undefine/destroy `corp-firedrill`. Host + `/mnt/dc-backups` untouched.
 
+## Scenarios (`fire_drill_scenario`)
+
+The sandbox lifecycle (isolated net → restore → 2-NIC boot → always-teardown) is shared;
+`fire_drill_scenario` selects what the verify play does with the booted clone:
+
+| Scenario | What it does | Gate |
+|---|---|---|
+| `smoke` (default) | Runs the shared DC health checks (`tasks/smoke-dc.yml`) — proves the snapshot/backup restores to a healthy DC. | DC passes smoke checks |
+| `seize` (SM9, [ADR-058](../../../_private/docs/DESIGN-DECISIONS.md)) | Clones the **replica** and **actually seizes all 5 FSMO** onto it against the absent ADDC01, then rehearses the metadata-cleanup eviction (`playbooks/tasks/firedrill-seize.yml`). The executable proof of `DR-RUNBOOK.md`. | (1) all 5 FSMO on the clone, ADDC01=0, still GC; (2) ADDC01 fully evicted |
+
+**Why `seize` is safe:** a clone is still the source DC's identity, so the seizure must
+never reach the live forest. The `corp-firedrill` **network isolation is the load-bearing
+control** (the clone's real IP is off-subnet/unroutable there; real DCs aren't on the net;
+teardown is unconditional). genid is defense-in-depth only and is *latent* here (the live
+DCs expose no `<genid>`, so there is no NTDS baseline for the safeguard to fire against —
+the rehearsal proves this empirically and gates on "no USN-rollback event 2095" instead).
+The seize runs under `become: runas` so a fresh logon token carries the **Schema Admins**
+membership it adds (which `madmin-da`'s DA+EA does **not** grant — the seize-the-Schema-master
+landmine). See `DR-RUNBOOK.md` + ADR-058 for the full landmine list.
+
 ## Sources
 
 | `fire_drill_source` | Status | What it proves |
@@ -48,6 +68,10 @@ ansible-playbook playbooks/fire-drill.yml -e fire_drill_label=m7-complete
 
 # Backup-media drill:
 ansible-playbook playbooks/fire-drill.yml -e fire_drill_source=backup
+
+# SM9 FSMO-seize rehearsal on an ISOLATED clone of the replica (ADR-058):
+ansible-playbook playbooks/fire-drill.yml \
+    -e fire_drill_scenario=seize -e fire_drill_source_vm=ADDC02-corp -e fire_drill_label=sm8-complete
 ```
 
 ## Safety
@@ -66,7 +90,8 @@ ansible-playbook playbooks/fire-drill.yml -e fire_drill_source=backup
 | Var | Default | Purpose |
 |---|---|---|
 | `fire_drill_source` | `snapshot` | `snapshot` \| `backup` |
-| `fire_drill_source_vm` | `ADDC01-corp` | Prod VM to drill (must be `*-corp`) |
+| `fire_drill_scenario` | `smoke` | `smoke` \| `seize` (SM9 FSMO-seize rehearsal) |
+| `fire_drill_source_vm` | `ADDC01-corp` | Prod VM to drill (must be `*-corp`; use `ADDC02-corp` for `seize`) |
 | `fire_drill_label` | `""` (newest) | Snapshot label to restore |
 | `fire_drill_vm_name` | `<src>-firedrill` | Sandbox VM name (never `*-corp`) |
 | `fire_drill_memory_mb` / `_vcpus` | `8192` / `4` | Sandbox compute |

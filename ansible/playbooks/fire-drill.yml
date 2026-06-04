@@ -7,6 +7,9 @@
 #   ansible-playbook playbooks/fire-drill.yml                          # latest snapshot
 #   ansible-playbook playbooks/fire-drill.yml -e fire_drill_label=m7-complete
 #   ansible-playbook playbooks/fire-drill.yml -e fire_drill_source=backup
+#   # SM9 (ADR-058) — FSMO-seize rehearsal on an ISOLATED clone of the replica:
+#   ansible-playbook playbooks/fire-drill.yml \
+#       -e fire_drill_scenario=seize -e fire_drill_source_vm=ADDC02-corp -e fire_drill_label=sm8-complete
 #
 # HOST SAFETY: host-side plays run on kvm_host (localhost) UNPRIVILEGED — only
 # virsh/qemu-img/cp + files under {{ vm_lab_root }}/firedrill, and an isolated
@@ -60,12 +63,21 @@
             delay: 5
             sleep: 10
 
+        # --- smoke scenario (default): prove the restored DC is healthy ---
         - name: "fire-drill | run the shared domain-controller health checks"
           ansible.builtin.include_tasks: tasks/smoke-dc.yml
+          when: fire_drill_scenario | default('smoke') == 'smoke'
 
         - name: "fire-drill | validate backup media (backup source only)"
           ansible.builtin.include_tasks: tasks/firedrill-backup-checks.yml
-          when: fire_drill_source | default('snapshot') == 'backup'
+          when:
+            - fire_drill_scenario | default('smoke') == 'smoke'
+            - fire_drill_source | default('snapshot') == 'backup'
+
+        # --- seize scenario (SM9 / ADR-058): rehearse the FSMO seizure + eviction ---
+        - name: "fire-drill | run the FSMO-seize rehearsal (DR-RUNBOOK.md procedures 1–4)"
+          ansible.builtin.include_tasks: tasks/firedrill-seize.yml
+          when: fire_drill_scenario | default('smoke') == 'seize'
 
         - name: "fire-drill | mark drill PASSED"
           ansible.builtin.set_fact:

@@ -1,0 +1,492 @@
+---
+# FSMO-seize rehearsal — Phase 6 SM9 (ADR-058). Runs against the ISOLATED ADDC02 clone
+# in the `firedrill` group (added by ops_firedrill). Included by fire-drill.yml Play 2
+# when `fire_drill_scenario == 'seize'`. This file ACTUALLY seizes all 5 FSMO onto the
+# clone against the absent ADDC01 and rehearses the metadata-cleanup eviction — the only
+# SAFE way to exercise a real seizure, because the corp-firedrill network isolation keeps
+# every mutation off the prod forest (DR-RUNBOOK.md). It is the executable proof of the
+# runbook.
+#
+# ── Why this is safe (the load-bearing control) ─────────────────────────────────
+# A clone is STILL ADDC02's identity (same NTDS InvocationID/DSA-GUID). The sandbox sits
+# on a <forward>-less 10.10.1.0/24 net; the clone's real static IP (10.20.0.10) is
+# off-subnet/unroutable there, and the real ADDC01/ADDC02 are not on this net — so the
+# seizure + eviction can never reach the live forest, and teardown always destroys the
+# clone. genid is defense-in-depth only, and is LATENT here (the live DCs expose no
+# <genid>, so the cloned NTDS has no baseline for event 2170 to fire against) — Stage A
+# proves this empirically rather than assuming it.
+#
+# ── House discipline ────────────────────────────────────────────────────────────
+# * The seizure runs LOCALLY on the clone (it targets itself; the transfer attempt to the
+#   absent ADDC01 fails → -Force seizes), so it is single-hop — EXCEPT the token refresh:
+#   seizing the Schema master needs Schema Admins, which `madmin-da` (DA+EA) lacks. We add
+#   it, then run the seize under `become: runas` so a FRESH logon token carries the new
+#   group (a persistent WinRM/NTLM session reuses the stale pre-add token; ADR-058 #2,
+#   researched 2026-06-04 — runas beats the buggy reset_connection, and is reliable
+#   because the logon authenticates against THIS same DC).
+# * The combined 5-role call is PARTIAL, not atomic: without Schema Admins it seizes 4 and
+#   fails Schema with "Access is denied". So we VERIFY each role landed authoritatively
+#   (Get-ADDomain/Get-ADForest), never trusting the cmdlet's exit alone (ADR-058 #1).
+# * -Force still PROMPTS per role on seize → we add -Confirm:$false for non-interactive.
+
+# ===========================================================================
+# STAGE A — boot-time evidence (genid safeguard) + the pre-seize topology
+# ===========================================================================
+- name: "fd/seize | A1 — capture the VM-GenerationID safeguard event family (Server 2025)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'SilentlyContinue'
+      function LastEvt($log, $id) {
+        $e = Get-WinEvent -FilterHashtable @{ LogName = $log; Id = $id } -MaxEvents 1 -ErrorAction SilentlyContinue
+        if ($e) { $e.TimeCreated.ToString('s') } else { $null }
+      }
+      # Directory Service log (provider Microsoft-Windows-ActiveDirectory_DomainService):
+      $e2168 = LastEvt 'Directory Service' 2168   # genid DETECTED (supported hypervisor)
+      $e2169 = LastEvt 'Directory Service' 2169   # NO genid detected (physical/unsupported)
+      $e2170 = LastEvt 'Directory Service' 2170   # genid CHANGE detected => safeguard FIRES
+      $e2179 = LastEvt 'Directory Service' 2179   # msDS-GenerationId SET (first-set/write-back)
+      $e1109 = LastEvt 'Directory Service' 1109   # InvocationID changed (downstream; AMBIGUOUS — also fires on backup restore)
+      $e2095 = LastEvt 'Directory Service' 2095   # USN ROLLBACK detected (the FAILURE event — MUST be absent)
+      $e16654 = LastEvt 'System' 16654            # RID pool invalidated (Directory-Services-SAM)
+      # Honest story: with no <genid> on the source DC, expect 2168 + first-set (2179) but
+      # NOT a change (2170); the safeguard stays latent and isolation is the sole control.
+      $story = if ($e2095) { 'USN-ROLLBACK detected — genid safeguard FAILED to protect (investigate!)' }
+               elseif ($e2170) { 'genid CHANGE detected (2170) — safeguard fired: InvocationID reset' }
+               elseif ($e2179 -or $e2168) { 'genid first-set / detected, no change (2170 absent) — safeguard LATENT; isolation is the sole control (expected: source DC has no <genid>)' }
+               else { 'no genid events — NTDS not genid-aware on this boot; isolation is the sole control' }
+      $Ansible.Result = @{
+        GenidDetected_2168   = $e2168
+        NoGenid_2169         = $e2169
+        GenidChanged_2170    = $e2170
+        GenidSet_2179        = $e2179
+        InvocIdChanged_1109  = $e1109
+        UsnRollback_2095     = $e2095
+        RidInvalidated_16654 = $e16654
+        UsnRollbackPresent   = [bool]$e2095
+        Story                = $story
+      }
+      $Ansible.Changed = $false
+  register: r_genid
+  changed_when: false
+
+- name: "fd/seize | A1 — show genid safeguard evidence"
+  ansible.builtin.debug:
+    var: r_genid.result
+
+- name: "fd/seize | A1 — assert NO USN rollback occurred (the real safety invariant; 2170 may be latent)"
+  ansible.builtin.assert:
+    that:
+      - "not (r_genid.result.UsnRollbackPresent | bool)"
+    fail_msg: >-
+      ❌ USN-rollback event 2095 present on the clone — the genid safeguard did NOT protect this
+      boot. The sandbox is isolated so prod is unaffected, but investigate the genid plumbing.
+    success_msg: "✅ No USN rollback (2095 absent). genid story: {{ r_genid.result.Story }}"
+
+- name: "fd/seize | A2 — pre-seize topology: ADDC01 holds all 5 FSMO, the clone holds 0"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $d = Get-ADDomain
+      $f = Get-ADForest
+      $holders = [ordered]@{
+        PDCEmulator          = ($d.PDCEmulator          -split '\.')[0]
+        RIDMaster            = ($d.RIDMaster            -split '\.')[0]
+        InfrastructureMaster = ($d.InfrastructureMaster -split '\.')[0]
+        SchemaMaster         = ($f.SchemaMaster         -split '\.')[0]
+        DomainNamingMaster   = ($f.DomainNamingMaster   -split '\.')[0]
+      }
+      $dcs    = @(Get-ADDomainController -Filter *)
+      $target = $dcs | Where-Object { $_.Name -eq '{{ fire_drill_seize_target }}' } | Select-Object -First 1
+      $dead   = $dcs | Where-Object { $_.Name -eq '{{ fire_drill_seize_dead_dc }}' } | Select-Object -First 1
+      $onDead   = @($holders.Values | Where-Object { $_ -eq '{{ fire_drill_seize_dead_dc }}' }).Count
+      $onTarget = @($holders.Values | Where-Object { $_ -eq '{{ fire_drill_seize_target }}' }).Count
+      # RID pool "next" (low DWORD of rIDAvailablePool) — captured to prove the +30k burn later.
+      $ridMgrDN = 'CN=RID Manager$,CN=System,' + $d.DistinguishedName
+      $ridNext  = [int64](Get-ADObject $ridMgrDN -Properties rIDAvailablePool).rIDAvailablePool -band 0xFFFFFFFF
+      $Ansible.Result = @{
+        Holders       = $holders
+        RolesOnDead   = $onDead
+        RolesOnTarget = $onTarget
+        TargetIsGC    = [bool]$target.IsGlobalCatalog
+        DeadPresent   = [bool]$dead
+        DcCount       = $dcs.Count
+        RidNext       = $ridNext
+      }
+      $Ansible.Changed = $false
+  register: r_pre
+  changed_when: false
+
+- name: "fd/seize | A2 — show pre-seize topology"
+  ansible.builtin.debug:
+    var: r_pre.result
+
+- name: "fd/seize | A2 — assert the starting topology (cloned the replica; ADDC01 = sole FSMO holder)"
+  ansible.builtin.assert:
+    that:
+      - "r_pre.result.DcCount | int == 2"
+      - "r_pre.result.DeadPresent | bool"
+      - "r_pre.result.RolesOnDead | int == 5"
+      - "r_pre.result.RolesOnTarget | int == 0"
+      - "r_pre.result.TargetIsGC | bool"
+    fail_msg: >-
+      ❌ Unexpected starting state — DCs={{ r_pre.result.DcCount }},
+      {{ fire_drill_seize_dead_dc }} holds {{ r_pre.result.RolesOnDead }} FSMO,
+      {{ fire_drill_seize_target }} holds {{ r_pre.result.RolesOnTarget }} (GC={{ r_pre.result.TargetIsGC }}).
+      Expected ADDC01=5 / clone=0. Did you clone the replica (-e fire_drill_source_vm=ADDC02-corp)?
+    success_msg: >-
+      ✅ Start: 2 DCs, {{ fire_drill_seize_dead_dc }} holds all 5 FSMO,
+      {{ fire_drill_seize_target }} holds 0 (GC), RID-next={{ r_pre.result.RidNext }}.
+
+# ===========================================================================
+# STAGE B — the privilege landmine: add Schema Admins (EA does NOT imply it)
+# ===========================================================================
+- name: "fd/seize | B — add {{ named_admin.sam }} to Schema Admins (needed to seize the Schema master; ADR-058 #2)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $me  = '{{ named_admin.sam }}'
+      $grp = 'Schema Admins'
+      $was = @(Get-ADGroupMember -Identity $grp -ErrorAction SilentlyContinue |
+               Where-Object { $_.SamAccountName -eq $me }).Count -gt 0
+      if (-not $was) { Add-ADGroupMember -Identity $grp -Members $me -ErrorAction Stop }
+      $now = @(Get-ADGroupMember -Identity $grp -ErrorAction Stop |
+               Where-Object { $_.SamAccountName -eq $me }).Count -gt 0
+      $Ansible.Result  = @{ Account = $me; WasAlreadyMember = $was; IsMemberNow = $now }
+      $Ansible.Changed = (-not $was)
+  register: r_schema_add
+
+- name: "fd/seize | B — show Schema Admins membership (EA is NOT sufficient — this is the seize landmine)"
+  ansible.builtin.debug:
+    msg: >-
+      {{ named_admin.sam }} Schema Admins: was_member={{ r_schema_add.result.WasAlreadyMember }},
+      is_member_now={{ r_schema_add.result.IsMemberNow }} (Enterprise Admins does not grant the
+      Schema-master seizure right — ADR-058 #2).
+
+- name: "fd/seize | B — assert {{ named_admin.sam }} is now in Schema Admins"
+  ansible.builtin.assert:
+    that:
+      - "r_schema_add.result.IsMemberNow | bool"
+    fail_msg: "❌ Could not place {{ named_admin.sam }} in Schema Admins — the Schema-master seizure will fail."
+    success_msg: "✅ {{ named_admin.sam }} is in Schema Admins."
+
+# ===========================================================================
+# STAGE C — seize all 5 FSMO under a FRESH runas logon, then verify per role
+# ===========================================================================
+- name: "fd/seize | STAGE C — seize under a fresh runas logon (token carries Schema Admins)"
+  # become:runas mints a NEW logon whose token re-evaluates group membership, so the
+  # just-added Schema Admins is present (the persistent WinRM/NTLM session would reuse the
+  # stale token). Reliable here because the logon authenticates against THIS DC. ADR-058 #2.
+  become: true
+  become_method: runas
+  become_user: "{{ ansible_user }}"
+  vars:
+    ansible_become_password: "{{ ansible_password }}"
+  block:
+    - name: "fd/seize | C1 — evidence: the runas token carries Schema Admins"
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+          $names = @()
+          foreach ($g in $id.Groups) {
+            try { $names += $g.Translate([System.Security.Principal.NTAccount]).Value } catch { $names += $g.Value }
+          }
+          $Ansible.Result = @{
+            RunAsUser       = $id.Name
+            HasSchemaAdmins = [bool](@($names | Where-Object { $_ -match 'Schema Admins' }).Count)
+            AdminGroups     = @($names | Where-Object { $_ -match 'Admins' })
+          }
+          $Ansible.Changed = $false
+      register: r_token
+      changed_when: false
+
+    - name: "fd/seize | C1 — show the runas token groups (proves the Schema Admins refresh worked)"
+      ansible.builtin.debug:
+        msg: >-
+          runas={{ r_token.result.RunAsUser }} HasSchemaAdmins={{ r_token.result.HasSchemaAdmins }}
+          groups={{ r_token.result.AdminGroups | join(', ') }}
+          {{ '' if r_token.result.HasSchemaAdmins
+             else '(⚠ Schema Admins NOT in token — the seize will likely fail on Schema; see the primary-group wrinkle in DR-RUNBOOK.md)' }}
+
+    - name: "fd/seize | C2 — SEIZE all 5 FSMO onto {{ fire_drill_seize_target }} (against the absent {{ fire_drill_seize_dead_dc }})"
+      ansible.windows.win_powershell:
+        script: |
+          # ErrorAction Continue: the call is processed role-by-role and is PARTIAL, not
+          # atomic — capture per-role errors instead of throwing, then verify (next task).
+          # -Identity is the RECEIVER + a SHORT name (FQDN cmdlet bug). -Force seizes when
+          # the holder is unreachable; -Confirm:$false suppresses the per-role prompt. Each
+          # role waits out a graceful-transfer timeout to the absent ADDC01 before seizing.
+          $ErrorActionPreference = 'Continue'
+          $seizeErr = $null
+          Move-ADDirectoryServerOperationMasterRole `
+            -Identity '{{ fire_drill_seize_target }}' `
+            -OperationMasterRole PDCEmulator,RIDMaster,InfrastructureMaster,SchemaMaster,DomainNamingMaster `
+            -Force -Confirm:$false -ErrorAction Continue -ErrorVariable seizeErr 2>&1 | Out-Null
+          $Ansible.Result = @{
+            Errors     = @($seizeErr | ForEach-Object { "$_" })
+            ErrorCount = @($seizeErr).Count
+          }
+          $Ansible.Changed = $true
+      register: r_seize
+      changed_when: true
+
+    - name: "fd/seize | C2 — show any seize errors (a Schema 'Access is denied' here proves landmine #2)"
+      ansible.builtin.debug:
+        msg: "{{ 'Seize reported no errors.' if (r_seize.result.ErrorCount | int) == 0 else r_seize.result.Errors }}"
+
+- name: "fd/seize | C3 — VERIFY (authoritative, LOCAL): all 5 FSMO landed on {{ fire_drill_seize_target }}"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $d = Get-ADDomain
+      $f = Get-ADForest
+      $holders = [ordered]@{
+        PDCEmulator          = ($d.PDCEmulator          -split '\.')[0]
+        RIDMaster            = ($d.RIDMaster            -split '\.')[0]
+        InfrastructureMaster = ($d.InfrastructureMaster -split '\.')[0]
+        SchemaMaster         = ($f.SchemaMaster         -split '\.')[0]
+        DomainNamingMaster   = ($f.DomainNamingMaster   -split '\.')[0]
+      }
+      $target  = '{{ fire_drill_seize_target }}'
+      $notOnTarget = @($holders.GetEnumerator() | Where-Object { $_.Value -ne $target } | ForEach-Object { "$($_.Key)=$($_.Value)" })
+      $dcs    = @(Get-ADDomainController -Filter *)
+      $tgtDC  = $dcs | Where-Object { $_.Name -eq $target } | Select-Object -First 1
+      $deadDC = $dcs | Where-Object { $_.Name -eq '{{ fire_drill_seize_dead_dc }}' } | Select-Object -First 1
+      $ridMgrDN = 'CN=RID Manager$,CN=System,' + $d.DistinguishedName
+      $ridNext  = [int64](Get-ADObject $ridMgrDN -Properties rIDAvailablePool).rIDAvailablePool -band 0xFFFFFFFF
+      $Ansible.Result = @{
+        Holders          = $holders
+        AllFiveOnTarget  = ($notOnTarget.Count -eq 0)
+        NotOnTarget      = $notOnTarget
+        RolesOnTarget    = @($holders.Values | Where-Object { $_ -eq $target }).Count
+        RolesOnDead      = @($holders.Values | Where-Object { $_ -eq '{{ fire_drill_seize_dead_dc }}' }).Count
+        TargetIsGC       = [bool]$tgtDC.IsGlobalCatalog
+        DeadStillHolds   = if ($deadDC) { @($deadDC.OperationMasterRoles).Count } else { 0 }
+        RidNext          = $ridNext
+        RidBurn          = $ridNext - {{ r_pre.result.RidNext | int }}
+      }
+      $Ansible.Changed = $false
+  register: r_post
+  changed_when: false
+
+- name: "fd/seize | C3 — show post-seize FSMO holders + RID burn"
+  ansible.builtin.debug:
+    var: r_post.result
+
+- name: "fd/seize | C3 — GATE 1: assert all 5 FSMO are on {{ fire_drill_seize_target }} (still GC)"
+  ansible.builtin.assert:
+    that:
+      - "r_post.result.AllFiveOnTarget | bool"
+      - "r_post.result.RolesOnTarget | int == 5"
+      - "r_post.result.RolesOnDead | int == 0"
+      - "r_post.result.TargetIsGC | bool"
+    fail_msg: >-
+      ❌ SEIZE INCOMPLETE — roles NOT on {{ fire_drill_seize_target }}: {{ r_post.result.NotOnTarget | join(', ') }}.
+      A lingering SchemaMaster on {{ fire_drill_seize_dead_dc }} means the Schema Admins token didn't take
+      (ADR-058 #2 / primary-group wrinkle — DR-RUNBOOK.md). RID burn was {{ r_post.result.RidBurn }}.
+    success_msg: >-
+      ✅ All 5 FSMO seized onto {{ fire_drill_seize_target }} (GC intact); {{ fire_drill_seize_dead_dc }}
+      now holds 0. RID pool burned +{{ r_post.result.RidBurn }} (≈30k expected — clean seizure, ADR-058 #3).
+
+# ===========================================================================
+# STAGE D — rehearse the metadata-cleanup eviction of the dead ADDC01
+# ===========================================================================
+- name: "fd/seize | D0 — resolve {{ fire_drill_seize_dead_dc }} objects + clear accidental-deletion protection"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $dead = '{{ fire_drill_seize_dead_dc }}'
+      $cfg  = (Get-ADRootDSE).configurationNamingContext
+      $srv  = Get-ADObject -SearchBase "CN=Sites,$cfg" -LDAPFilter "(&(objectClass=server)(cn=$dead))" -ErrorAction SilentlyContinue | Select-Object -First 1
+      $comp = Get-ADComputer -LDAPFilter "(cn=$dead)" -ErrorAction SilentlyContinue | Select-Object -First 1
+      # accidental-deletion protection would make ntdsutil / Remove-ADObject fail (the trap).
+      foreach ($o in @($srv, $comp)) {
+        if ($o) { try { Set-ADObject -Identity $o.DistinguishedName -ProtectedFromAccidentalDeletion $false -ErrorAction SilentlyContinue } catch { } }
+      }
+      $Ansible.Result = @{
+        ServerDN   = if ($srv)  { $srv.DistinguishedName }  else { '' }
+        ComputerDN = if ($comp) { $comp.DistinguishedName } else { '' }
+      }
+      $Ansible.Changed = $false
+  register: r_dead_objs
+  changed_when: false
+
+- name: "fd/seize | D1 — ntdsutil metadata cleanup (one-shot, auto-binds to localhost)"
+  ansible.windows.win_powershell:
+    script: |
+      # The modern one-shot form: "remove selected server <DN>" auto-binds to localhost —
+      # no connections/select-target submenus needed (ADR-058). Two quits = clean exit so
+      # the task never hangs. Idempotent: a re-run prints "object cannot be found" (benign).
+      $ErrorActionPreference = 'Continue'
+      $out = & ntdsutil "metadata cleanup" "remove selected server {{ r_dead_objs.result.ServerDN }}" quit quit 2>&1 | Out-String
+      $Ansible.Result  = @{ Output = $out.Trim() }
+      $Ansible.Changed = $true
+  register: r_ntdsutil
+  when: "r_dead_objs.result.ServerDN | length > 0"
+  changed_when: true
+
+- name: "fd/seize | D1 — show ntdsutil output (the canonical metadata-cleanup tool)"
+  ansible.builtin.debug:
+    var: r_ntdsutil.result.Output
+  when: "r_dead_objs.result.ServerDN | length > 0"
+
+- name: "fd/seize | D2 — remove the DFSR member object (ntdsutil is FRS-aware, NOT DFSR-aware; born-2025 SYSVOL)"
+  ansible.windows.win_powershell:
+    script: |
+      # SEARCH the Topology container — NEVER Get-ADObject -Identity on a maybe-missing DN:
+      # that throws a TERMINATING ADIdentityNotFoundException that -EA SilentlyContinue
+      # cannot suppress ([[feedback-ad-cmdlet-filter-not-identity]]; cost the first run).
+      # The msDFSR-Member CN is NOT guaranteed to be the DC short name, so match by CN OR by
+      # the (possibly-cleared) computer reference, and report ALL members for diagnosis.
+      $ErrorActionPreference = 'Stop'
+      $dead  = '{{ fire_drill_seize_dead_dc }}'
+      $domDN = (Get-ADDomain).DistinguishedName
+      $topo  = "CN=Topology,CN=Domain System Volume,CN=DFSR-GlobalSettings,CN=System,$domDN"
+      $members = @(Get-ADObject -SearchBase $topo -LDAPFilter '(objectClass=msDFSR-Member)' -Properties 'msDFSR-ComputerReference','name' -ErrorAction SilentlyContinue)
+      $allMembers  = @($members | ForEach-Object { "$($_.Name) -> $($_.'msDFSR-ComputerReference')" })
+      $deadMembers = @($members | Where-Object { ($_.Name -match $dead) -or ($_.'msDFSR-ComputerReference' -match $dead) })
+      $removed = @()
+      foreach ($m in $deadMembers) {
+        try { Set-ADObject $m.DistinguishedName -ProtectedFromAccidentalDeletion $false -ErrorAction SilentlyContinue } catch { }
+        Remove-ADObject $m.DistinguishedName -Recursive -Confirm:$false -ErrorAction Stop
+        $removed += $m.DistinguishedName
+      }
+      $Ansible.Result = @{
+        AllDfsrMembers = $allMembers
+        Removed        = $removed
+        AlreadyAbsent  = ($deadMembers.Count -eq 0)
+      }
+      $Ansible.Changed = ($removed.Count -gt 0)
+  register: r_dfsr
+
+- name: "fd/seize | D3 — sweep any leftover server + computer objects ntdsutil missed"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Continue'
+      $dead = '{{ fire_drill_seize_dead_dc }}'
+      $cfg  = (Get-ADRootDSE).configurationNamingContext
+      $removed = @()
+      $srv = Get-ADObject -SearchBase "CN=Sites,$cfg" -LDAPFilter "(&(objectClass=server)(cn=$dead))" -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($srv) {
+        try { Set-ADObject $srv.DistinguishedName -ProtectedFromAccidentalDeletion $false -ErrorAction SilentlyContinue } catch { }
+        Remove-ADObject $srv.DistinguishedName -Recursive -Confirm:$false -ErrorAction SilentlyContinue
+        $removed += "server:$($srv.DistinguishedName)"
+      }
+      $comp = Get-ADComputer -LDAPFilter "(cn=$dead)" -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($comp) {
+        try { Set-ADObject $comp.DistinguishedName -ProtectedFromAccidentalDeletion $false -ErrorAction SilentlyContinue } catch { }
+        Remove-ADObject $comp.DistinguishedName -Recursive -Confirm:$false -ErrorAction SilentlyContinue
+        $removed += "computer:$($comp.DistinguishedName)"
+      }
+      $Ansible.Result  = @{ RemovedLeftovers = $removed }
+      $Ansible.Changed = ($removed.Count -gt 0)
+  register: r_leftovers
+
+- name: "fd/seize | D4 — purge {{ fire_drill_seize_dead_dc }} DNS records (the _msdcs GUID CNAME, SRV, NS, A, PTR)"
+  ansible.windows.win_powershell:
+    script: |
+      # Metadata cleanup does NOT remove DNS — especially the _msdcs <DSA-GUID> CNAME alias
+      # that DC Locator chases by GUID (ADR-058 #4). Report-only count (DNS shape varies).
+      $ErrorActionPreference = 'Continue'
+      $dead  = '{{ fire_drill_seize_dead_dc }}'
+      $fqdn  = '{{ forest.fqdn }}'
+      $zones = @($fqdn, "_msdcs.$fqdn", '0.10.10.in-addr.arpa', '0.20.10.in-addr.arpa')
+      $purged = New-Object System.Collections.Generic.List[string]
+      foreach ($zone in $zones) {
+        $recs = Get-DnsServerResourceRecord -ZoneName $zone -ErrorAction SilentlyContinue
+        foreach ($r in $recs) {
+          $rd  = $r.RecordData
+          $hit = ($r.HostName -match $dead) -or ($rd.HostNameAlias -match $dead) -or ($rd.DomainName -match $dead) -or ($rd.NameServer -match $dead) -or ($rd.PtrDomainName -match $dead)
+          if ($hit) {
+            try {
+              Remove-DnsServerResourceRecord -ZoneName $zone -InputObject $r -Force -ErrorAction Stop
+              $purged.Add("$zone | $($r.HostName) | $($r.RecordType)")
+            } catch { }
+          }
+        }
+      }
+      $Ansible.Result  = @{ DnsRecordsPurged = @($purged); Count = $purged.Count }
+      $Ansible.Changed = ($purged.Count -gt 0)
+  register: r_dns
+
+- name: "fd/seize | D — show eviction artifacts (DFSR, leftovers, DNS)"
+  ansible.builtin.debug:
+    msg:
+      - "DFSR members (all): {{ r_dfsr.result.AllDfsrMembers | default([]) | join('; ') | default('none', true) }}"
+      - "DFSR members removed for {{ fire_drill_seize_dead_dc }}: {{ r_dfsr.result.Removed | default([]) | join(', ') | default('none (already absent — ntdsutil/2025 may handle DFSR)', true) }}"
+      - "Leftover objects removed: {{ r_leftovers.result.RemovedLeftovers | default([]) | join(', ') | default('none', true) }}"
+      - "DNS records purged ({{ r_dns.result.Count }}): {{ r_dns.result.DnsRecordsPurged | default([]) | join('; ') | default('none', true) }}"
+
+- name: "fd/seize | D5 — VERIFY eviction: only {{ fire_drill_seize_target }} remains as a DC"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $dead   = '{{ fire_drill_seize_dead_dc }}'
+      $target = '{{ fire_drill_seize_target }}'
+      $cfg    = (Get-ADRootDSE).configurationNamingContext
+      $domDN  = (Get-ADDomain).DistinguishedName
+      $dcs     = @(Get-ADDomainController -Filter *)
+      $dcNames = @($dcs | ForEach-Object { $_.Name } | Sort-Object)
+      $srvObj  = Get-ADObject -SearchBase "CN=Sites,$cfg" -LDAPFilter "(&(objectClass=server)(cn=$dead))" -ErrorAction SilentlyContinue | Select-Object -First 1
+      $compObj = Get-ADComputer -LDAPFilter "(cn=$dead)" -ErrorAction SilentlyContinue | Select-Object -First 1
+      # SEARCH (not -Identity) for any lingering DFSR member of the dead DC — see D2.
+      $topo    = "CN=Topology,CN=Domain System Volume,CN=DFSR-GlobalSettings,CN=System,$domDN"
+      $dfsrLeft = @(Get-ADObject -SearchBase $topo -LDAPFilter '(objectClass=msDFSR-Member)' -Properties 'msDFSR-ComputerReference','name' -ErrorAction SilentlyContinue |
+                    Where-Object { ($_.Name -match $dead) -or ($_.'msDFSR-ComputerReference' -match $dead) })
+      $Ansible.Result = @{
+        DcNames                = $dcNames
+        DcCount                = $dcs.Count
+        DeadStillListed        = [bool]($dcNames -contains $dead)
+        DeadServerObjectGone   = (-not [bool]$srvObj)
+        DeadComputerObjectGone = (-not [bool]$compObj)
+        DeadDfsrMemberGone     = ($dfsrLeft.Count -eq 0)
+        OnlyTargetRemains      = ($dcs.Count -eq 1 -and ($dcNames -contains $target))
+      }
+      $Ansible.Changed = $false
+  register: r_evict
+  changed_when: false
+
+- name: "fd/seize | D5 — show post-eviction DC inventory"
+  ansible.builtin.debug:
+    var: r_evict.result
+
+- name: "fd/seize | D5 — GATE 2: assert {{ fire_drill_seize_dead_dc }} is fully evicted"
+  ansible.builtin.assert:
+    that:
+      - "r_evict.result.OnlyTargetRemains | bool"
+      - "not (r_evict.result.DeadStillListed | bool)"
+      - "r_evict.result.DeadServerObjectGone | bool"
+      - "r_evict.result.DeadComputerObjectGone | bool"
+      - "r_evict.result.DeadDfsrMemberGone | bool"
+    fail_msg: >-
+      ❌ Eviction incomplete — DCs now {{ r_evict.result.DcNames | join(', ') }};
+      {{ fire_drill_seize_dead_dc }} server_gone={{ r_evict.result.DeadServerObjectGone }}
+      computer_gone={{ r_evict.result.DeadComputerObjectGone }} dfsr_gone={{ r_evict.result.DeadDfsrMemberGone }}.
+    success_msg: >-
+      ✅ {{ fire_drill_seize_dead_dc }} fully evicted — only {{ fire_drill_seize_target }} remains
+      (server/computer/DFSR-member objects gone). Recovery = rebuild a fresh DC, never reattach.
+
+# ===========================================================================
+# STAGE E — DHCP failover read-only report (NEVER create/modify here — ADR-058 #7)
+# ===========================================================================
+- name: "fd/seize | E — report DHCP failover state (read-only; do NOT create — no NTP → ±1-min gate)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'SilentlyContinue'
+      $fo   = @(Get-DhcpServerv4Failover -ErrorAction SilentlyContinue)
+      $rels = @($fo | ForEach-Object { "$($_.Name): State=$($_.State) Mode=$($_.Mode) Partner=$($_.PartnerServer)" })
+      $Ansible.Result  = @{ Count = $fo.Count; Relationships = $rels }
+      $Ansible.Changed = $false
+  register: r_dhcp_ro
+  changed_when: false
+
+- name: "fd/seize | E — show DHCP failover (COMM-INTERRUPTED with the partner absent is expected)"
+  ansible.builtin.debug:
+    msg: "{{ r_dhcp_ro.result.Relationships | default(['(none)'], true) }}"
+
+- name: "fd/seize | rehearsal complete"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ SM9 FSMO-seize rehearsal PASSED on the isolated clone of {{ fire_drill_source_vm }}:
+      all 5 FSMO seized onto {{ fire_drill_seize_target }} + {{ fire_drill_seize_dead_dc }} evicted.
+      This validates DR-RUNBOOK.md procedures 1–4. The clone will now be torn down.

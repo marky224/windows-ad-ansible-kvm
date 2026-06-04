@@ -112,6 +112,13 @@
     ansible_user: "{{ fire_drill_winrm_user }}"
     ansible_password: "{{ fire_drill_winrm_pass }}"
     fire_drill_source: "{{ fire_drill_source }}"
+    # SM9 (ADR-058): the seize scenario runs in Play 2 against this add_host'd sandbox,
+    # which doesn't otherwise load this role's defaults — so carry them explicitly.
+    fire_drill_scenario: "{{ fire_drill_scenario }}"
+    fire_drill_source_vm: "{{ fire_drill_source_vm }}"
+    fire_drill_seize_target: "{{ fire_drill_seize_target }}"
+    fire_drill_seize_dead_dc: "{{ fire_drill_seize_dead_dc }}"
+    fire_drill_seize_settle_minutes: "{{ fire_drill_seize_settle_minutes }}"
   changed_when: false
 
 - name: "ops_firedrill | sandbox is up"

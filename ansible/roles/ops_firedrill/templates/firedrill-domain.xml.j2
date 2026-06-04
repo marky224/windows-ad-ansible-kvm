@@ -5,11 +5,13 @@
   {# localtime, virtio-scsi. New name/UUID + a FRESH NIC MAC; WSUS/backup disks +     #}
   {# install CDs dropped. No TPM — the live DC runs without one. See ADR-047.         #}
   <name>{{ fire_drill_vm_name }}</name>
-  {# Fresh VM-GenerationID: a modern Windows DC (Server 2016+) reads this and, seeing #}
-  {# it differ from the value baked into the cloned NTDS.dit, resets its InvocationID #}
-  {# + discards the RID pool on boot — AD's own "I was restored" safeguard. Pure       #}
-  {# defense-in-depth BEHIND the network isolation (which already prevents USN         #}
-  {# rollback). Auto-generated each define. See ADR-047 (validation).                  #}
+  {# Fresh VM-GenerationID. The genid clone-safeguard (Server 2016+ resets InvocationID #}
+  {# + discards the RID pool when the booted genid differs from the value in NTDS.dit)  #}
+  {# is DEFENSE-IN-DEPTH ONLY, and is LATENT in this lab: the live DCs expose no <genid> #}
+  {# so the cloned NTDS has no baseline to differ from — SM9 (ADR-058) proved only       #}
+  {# events 2168+2179 fire on a clone boot, never the change event 2170 (and never the   #}
+  {# USN-rollback 2095). The corp-firedrill NETWORK ISOLATION is the LOAD-BEARING control #}
+  {# that prevents USN rollback. Auto-generated each define. See ADR-047 + ADR-058.       #}
   <genid/>
   <memory unit='MiB'>{{ fire_drill_memory_mb }}</memory>
   <currentMemory unit='MiB'>{{ fire_drill_memory_mb }}</currentMemory>

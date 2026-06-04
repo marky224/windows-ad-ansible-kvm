@@ -29,13 +29,30 @@
     success_msg: "✅ GUARD pass: {{ fire_drill_source }} drill of {{ fire_drill_source_vm }} → {{ fire_drill_vm_name }}."
   become: false
 
-- name: "ops_firedrill | SAFETY GUARD — isolated net is disjoint from corp-lab"
+- name: "ops_firedrill | SAFETY GUARD — isolated net is disjoint from corp-lab + branch"
   ansible.builtin.assert:
     that:
       - "fire_drill_network_name != corp_subnet.libvirt_network_name"
       - "fire_drill_bridge != corp_subnet.libvirt_bridge"
       - "fire_drill_vm_ip.split('.')[0:3] != corp_subnet.dc_ip.split('.')[0:3]"
       - "fire_drill_net_gateway.split('.')[0:3] != corp_subnet.gateway.split('.')[0:3]"
-    fail_msg: "❌ REFUSING: fire-drill network/IP overlaps production corp-lab — ADR-047 requires a separate subnet."
-    success_msg: "✅ GUARD pass: {{ fire_drill_network_name }} ({{ fire_drill_net_gateway }}/{{ fire_drill_bridge }}) is disjoint from corp-lab."
+      - "fire_drill_vm_ip.split('.')[0:3] != branch_subnet.dc_ip.split('.')[0:3]"
+    fail_msg: "❌ REFUSING: fire-drill network/IP overlaps production corp-lab or branch — ADR-047 requires a separate subnet."
+    success_msg: "✅ GUARD pass: {{ fire_drill_network_name }} ({{ fire_drill_net_gateway }}/{{ fire_drill_bridge }}) is disjoint from corp-lab + branch."
+  become: false
+
+- name: "ops_firedrill | SAFETY GUARD — valid drill scenario (SM9, ADR-058)"
+  ansible.builtin.assert:
+    that:
+      # seize ACTUALLY mutates AD on the clone (FSMO seizure + metadata cleanup). That
+      # is safe ONLY because the sandbox is network-isolated; the scenario allow-list +
+      # the disjoint-net guard above are what keep a real seizure off the prod forest.
+      - "fire_drill_scenario in ['smoke', 'seize']"
+      # Can't seize onto a DC and evict that same DC in one drill.
+      - "fire_drill_scenario != 'seize' or (fire_drill_seize_target != fire_drill_seize_dead_dc)"
+    fail_msg: >-
+      ❌ REFUSING: fire_drill_scenario ({{ fire_drill_scenario }}) must be smoke|seize;
+      for seize, the receiver ({{ fire_drill_seize_target }}) must differ from the
+      evicted dead DC ({{ fire_drill_seize_dead_dc }}).
+    success_msg: "✅ GUARD pass: scenario={{ fire_drill_scenario }}{{ ' (seize ' ~ fire_drill_seize_target ~ ' ← evict ' ~ fire_drill_seize_dead_dc ~ ')' if fire_drill_scenario == 'seize' else '' }}."
   become: false
