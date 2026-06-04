@@ -1,0 +1,548 @@
+---
+# DR LIVE FAILOVER DRILL — Phase 6 SM9 (ADR-058). The live, NON-DESTRUCTIVE complement
+# to the isolated-sandbox FSMO-seize rehearsal (fire-drill.yml -e fire_drill_scenario=seize).
+#
+# Gracefully powers off the LIVE ADDC01, proves ADDC02 carries the HQ site's AUTH + DNS +
+# DHCP (incl. a relayed cross-link lease after declaring DHCP PARTNER DOWN), then powers
+# ADDC01 back on and confirms the forest re-converges. NO FSMO seizure: a graceful
+# power-cycle is NOT a USN-rollback trigger (only restoring/reverting an older DB is), so
+# this is fully reversible. See _private/docs/DR-RUNBOOK.md ("How the lab rehearses this").
+#
+#   cd ansible && ansible-playbook playbooks/dr-failover-drill.yml
+#   # preview first:  ansible-playbook playbooks/dr-failover-drill.yml --list-hosts
+#
+# ⛔ HOST SAFETY (CLAUDE.md #5): the power-cycle is host-side `virsh shutdown/start` of the
+# EXPLICIT ADDC01-corp name (kvm_host plays, like ops_snapshot) — never the host OS, never a
+# wildcard. ALL guest verification targets the clients / dc_replica groups — NEVER
+# localhost/all. Show --list-hosts + get go-ahead before running (it briefly downs the live
+# HQ DC). Rollback insurance: the ADDC01 sm8-complete snapshot.
+#
+# RECOVERY GUARANTEE: ADDC01 is powered back on in the kvm_host "always-recover" play.
+# Guest-side verification failures remove only the guest from the run (Ansible's default),
+# never localhost — so that play always executes; Play 1 self-recovers on a downing error.
+# If the run is INTERRUPTED mid-outage, recover by hand:
+#   virsh -c qemu:///system start ADDC01-corp     (or restore the sm8-complete snapshot)
+#
+# RESEARCH-BACKED (3-agent pass 2026-06-04; ADR-058):
+#  * Reservations are served IMMEDIATELY in PARTNER DOWN (no MCLT wait) — so the lease proof
+#    uses CLIENT02's reservation and needs no 1h wait during the outage.
+#  * NORMAL -> COMMUNICATION INTERRUPTED is AUTOMATIC; `-PartnerDown` requires COMM-INTERRUPTED
+#    first -> we poll for it. Declaring it is a LOCAL state change on ADDC02 (no double-hop).
+#  * Recovery is FULLY AUTOMATIC (RECOVER -> RECOVERWAIT[~1h MCLT] -> NORMAL; no -PartnerUp
+#    cmdlet exists) -> we verify recovery is UNDERWAY + AD replication re-converges, and do
+#    NOT block for failover State=Normal (it auto-completes after the recover-wait).
+#  * `ipconfig /release` over WinRM kills our own session -> a detached one-shot SYSTEM
+#    scheduled task fires release/renew; we prove the lease SERVER-SIDE (ServerIP=ADDC02).
+
+# ===========================================================================
+# PLAY 0a — host-side preflight (abort BEFORE any outage if unsafe)
+# ===========================================================================
+- name: "DR drill — Play 0a — host preflight (target VM running + snapshot insurance)"
+  hosts: kvm_host
+  gather_facts: false
+  any_errors_fatal: true
+  vars: &dr_vars
+    dr_target_dc_vm: ADDC01-corp                       # the HQ DC to gracefully down (host-side, explicit)
+    dr_hq_failover_name: "HQ-ADDC01-ADDC02"            # relationship: ADDC01 Active, ADDC02 Standby for the HQ scope
+    dr_hq_scope_id: "10.10.0.0"
+    dr_addc02_ip: "{{ branch_subnet.dc_ip }}"          # 10.20.0.10 — the failover server that must serve the relayed lease
+    dr_proof_client_host: CLIENT02-corp                # the relayed-lease prover (release/renew); CLIENT01 stays the auth prover
+    dr_proof_client_ip: "10.10.0.51"                   # clients.yml client_dhcp_reservations[CLIENT02-corp]
+    dr_proof_client_mac: "52:54:00:11:11:02"
+    dr_addc01_snapshot_label: "sm8-complete"
+  tasks:
+    - name: "DR | SAFETY — kvm_host (local) only, target is exactly ADDC01-corp"
+      ansible.builtin.assert:
+        that:
+          - "inventory_hostname in groups.get('kvm_host', [])"
+          - "ansible_connection == 'local'"
+          - "dr_target_dc_vm == 'ADDC01-corp'"
+        fail_msg: "❌ DR drill must run on kvm_host (local connection) and target ADDC01-corp only."
+        success_msg: "✅ GUARD pass: host-side, target {{ dr_target_dc_vm }}."
+      become: false
+
+    - name: "DR | ADDC01-corp must be defined + currently running (drill starts from the healthy 2-DC state)"
+      ansible.builtin.command: "virsh -c qemu:///system domstate {{ dr_target_dc_vm }}"
+      register: r_dr_domstate
+      changed_when: false
+
+    - name: "DR | assert ADDC01-corp is running"
+      ansible.builtin.assert:
+        that: "'running' in r_dr_domstate.stdout"
+        fail_msg: "❌ {{ dr_target_dc_vm }} is '{{ r_dr_domstate.stdout | trim }}', not running — start the lab first."
+      become: false
+
+    - name: "DR | rollback-insurance snapshot must exist"
+      ansible.builtin.stat:
+        path: "{{ vm_lab_root }}/disks/{{ dr_target_dc_vm }}.qcow2.{{ dr_addc01_snapshot_label }}"
+      register: r_dr_snap
+
+    - name: "DR | assert the {{ dr_addc01_snapshot_label }} snapshot is present"
+      ansible.builtin.assert:
+        that: "r_dr_snap.stat.exists"
+        fail_msg: "❌ No {{ dr_target_dc_vm }}.qcow2.{{ dr_addc01_snapshot_label }} (rollback insurance) — snapshot before drilling."
+        success_msg: "✅ Rollback insurance present: {{ dr_target_dc_vm }}.qcow2.{{ dr_addc01_snapshot_label }}."
+      become: false
+
+# ===========================================================================
+# PLAY 0b — DC preflight (healthy 2-DC, HQ failover Normal, reservation on ADDC02)
+# ===========================================================================
+- name: "DR drill — Play 0b — DC preflight (LOCAL reads on both DCs)"
+  hosts: dc:dc_replica
+  gather_facts: false
+  any_errors_fatal: true
+  vars: *dr_vars
+  tasks:
+    - name: "DR | LOCAL replication + HQ failover state"
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $showrepl = (repadmin /showrepl 2>&1 | Out-String)
+          $fails = ([regex]::Matches($showrepl, 'failed|was not successful')).Count
+          $hq = Get-DhcpServerv4Failover -Name '{{ dr_hq_failover_name }}' -ErrorAction SilentlyContinue
+          $Ansible.Result = @{ ReplFails = $fails; HqState = "$($hq.State)"; HqMode = "$($hq.Mode)" }
+          $Ansible.Changed = $false
+      register: r_dr_pre
+      changed_when: false
+
+    - name: "DR | assert {{ inventory_hostname }} is drill-ready (clean repl + HQ failover Normal)"
+      ansible.builtin.assert:
+        that:
+          - "r_dr_pre.result.ReplFails | int == 0"
+          - "r_dr_pre.result.HqState == 'Normal'"
+        fail_msg: "❌ {{ inventory_hostname }} not ready: replFails={{ r_dr_pre.result.ReplFails }}, HQ failover={{ r_dr_pre.result.HqState }} (need Normal)."
+        success_msg: "✅ {{ inventory_hostname }}: replication clean, HQ failover {{ r_dr_pre.result.HqState }}/{{ r_dr_pre.result.HqMode }}."
+
+    - name: "DR | (ADDC02) CLIENT02 reservation must be present on the standby (reservations don't auto-replicate)"
+      when: "inventory_hostname in groups.get('dc_replica', [])"
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $r = Get-DhcpServerv4Reservation -ScopeId '{{ dr_hq_scope_id }}' -ErrorAction SilentlyContinue |
+               Where-Object { $_.IPAddress -eq '{{ dr_proof_client_ip }}' }
+          $Ansible.Result = @{ Found = [bool]$r; ClientId = "$($r.ClientId)"; IP = "$($r.IPAddress)" }
+          $Ansible.Changed = $false
+      register: r_dr_res
+      changed_when: false
+
+    - name: "DR | (ADDC02) assert CLIENT02's reservation is on the standby"
+      when: "inventory_hostname in groups.get('dc_replica', [])"
+      ansible.builtin.assert:
+        that: "r_dr_res.result.Found | bool"
+        fail_msg: "❌ CLIENT02 reservation {{ dr_proof_client_ip }} NOT on ADDC02 — run 17-dhcp-failover (replicate) first; the relayed-lease proof needs it."
+        success_msg: "✅ CLIENT02 reservation {{ dr_proof_client_ip }} ({{ r_dr_res.result.ClientId }}) present on ADDC02."
+
+# ===========================================================================
+# PLAY 1 — the simulated outage: gracefully power off the LIVE ADDC01
+# ===========================================================================
+- name: "DR drill — Play 1 — gracefully power off the LIVE ADDC01 (self-recovers on error)"
+  hosts: kvm_host
+  gather_facts: false
+  vars: *dr_vars
+  tasks:
+    - name: "DR | down {{ dr_target_dc_vm }} (graceful ACPI)"
+      block:
+        - name: "DR | ACPI shutdown request (1st press)"
+          ansible.builtin.command: "virsh -c qemu:///system shutdown {{ dr_target_dc_vm }}"
+          changed_when: true
+
+        - name: "DR | wait up to ~90s for shut off"
+          ansible.builtin.command: "virsh -c qemu:///system domstate {{ dr_target_dc_vm }}"
+          register: r_dr_s1
+          until: "'shut off' in r_dr_s1.stdout"
+          retries: 9
+          delay: 10
+          changed_when: false
+          failed_when: false
+
+        # Server 2025 at the lock screen may ignore the first ACPI press (it only wakes the
+        # secure desktop — 0 lifecycle events). [[reference-virsh-shutdown-server2025-lockscreen]]
+        - name: "DR | 2nd ACPI press if still up"
+          ansible.builtin.command: "virsh -c qemu:///system shutdown {{ dr_target_dc_vm }}"
+          when: "'shut off' not in r_dr_s1.stdout"
+          changed_when: true
+          failed_when: false
+
+        - name: "DR | wait up to ~180s more for shut off"
+          ansible.builtin.command: "virsh -c qemu:///system domstate {{ dr_target_dc_vm }}"
+          register: r_dr_s2
+          until: "'shut off' in r_dr_s2.stdout"
+          retries: 18
+          delay: 10
+          changed_when: false
+          failed_when: false
+
+        - name: "DR | confirm ADDC01 is down (else self-recover)"
+          ansible.builtin.assert:
+            that: "'shut off' in r_dr_s2.stdout"
+            fail_msg: "❌ {{ dr_target_dc_vm }} did not shut off gracefully (state: {{ r_dr_s2.stdout | trim }})."
+            success_msg: "✅ {{ dr_target_dc_vm }} is shut off — the HQ outage has begun."
+          become: false
+      rescue:
+        - name: "DR | downing failed — power ADDC01 back on"
+          ansible.builtin.command: "virsh -c qemu:///system start {{ dr_target_dc_vm }}"
+          changed_when: true
+          failed_when: false
+        - name: "DR | abort the drill (ADDC01 restored)"
+          ansible.builtin.fail:
+            msg: "❌ Could not gracefully down {{ dr_target_dc_vm }} — it has been powered back on; drill aborted before verification."
+
+# ===========================================================================
+# PLAY 2 — ADDC02 declares DHCP PARTNER DOWN for the HQ scope (LOCAL; no runas)
+# ===========================================================================
+- name: "DR drill — Play 2 — ADDC02 declares DHCP PARTNER DOWN for the HQ scope"
+  hosts: dc_replica
+  gather_facts: false
+  ignore_unreachable: true
+  vars: *dr_vars
+  tasks:
+    - name: "DR | declare + verify PARTNER DOWN (captured; never aborts the run)"
+      block:
+        - name: "DR | poll until ADDC02 sees the HQ relationship CommunicationInterrupted (automatic)"
+          ansible.windows.win_powershell:
+            script: |
+              $f = Get-DhcpServerv4Failover -Name '{{ dr_hq_failover_name }}' -ErrorAction Stop
+              $Ansible.Result = @{ State = "$($f.State)" }
+              $Ansible.Changed = $false
+          register: r_ci
+          until: "r_ci.result.State in ['CommunicationInterrupted', 'PartnerDown']"
+          retries: 12
+          delay: 10
+          changed_when: false
+
+        - name: "DR | declare PARTNER DOWN (LOCAL state change on ADDC02 — no double-hop)"
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Stop'
+              $f = Get-DhcpServerv4Failover -Name '{{ dr_hq_failover_name }}'
+              if ($f.State -ne 'PartnerDown') {
+                Set-DhcpServerv4Failover -Name '{{ dr_hq_failover_name }}' -PartnerDown -Force -ErrorAction Stop
+              }
+              $after = Get-DhcpServerv4Failover -Name '{{ dr_hq_failover_name }}'
+              $Ansible.Result = @{ State = "$($after.State)" }
+              $Ansible.Changed = $true
+          register: r_pd
+          changed_when: true
+
+        - name: "DR | assert ADDC02 is now PARTNER DOWN (authoritative for the HQ scope)"
+          ansible.builtin.assert:
+            that: "r_pd.result.State == 'PartnerDown'"
+            fail_msg: "❌ ADDC02 HQ relationship is {{ r_pd.result.State }}, expected PartnerDown."
+            success_msg: "✅ ADDC02 declared PARTNER DOWN for {{ dr_hq_failover_name }}."
+
+        - name: "DR | record DHCP-failover step PASSED"
+          ansible.builtin.set_fact:
+            dr_dhcp_failover_ok: true
+      rescue:
+        - name: "DR | DHCP-failover step FAILED (captured; recovery still runs)"
+          ansible.builtin.set_fact:
+            dr_dhcp_failover_ok: false
+
+# ===========================================================================
+# PLAY 3 — HQ clients survive on ADDC02: auth/DNS (CLIENT01) + relayed lease (CLIENT02)
+# ===========================================================================
+- name: "DR drill — Play 3 — prove HQ clients survive the outage on ADDC02"
+  hosts: clients
+  gather_facts: false
+  ignore_unreachable: true
+  vars: *dr_vars
+  tasks:
+    # --- CLIENT01: auth + DNS still work via the surviving DC (ADDC02). The checks use
+    #     Netlogon-locator / machine-account / local-DNS-client context (no delegated
+    #     creds), so they are single-hop-safe (no WinRM double-hop). ---
+    - name: "DR | (CLIENT01) auth + DNS via the surviving DC"
+      when: "inventory_hostname == 'CLIENT01-corp'"
+      block:
+        - name: "DR | CLIENT01 locates a DC + secure channel + DNS + GC"
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Continue'
+              $dc = (nltest /dsgetdc:{{ forest.fqdn }} /force 2>&1 | Out-String)
+              $sc = $false; try { $sc = Test-ComputerSecureChannel -ErrorAction Stop } catch { $sc = $false }
+              $dns = $null; try { $dns = (Resolve-DnsName -Name '{{ forest.fqdn }}' -Type A -ErrorAction Stop | Select-Object -First 1).IPAddress } catch { }
+              $gc = $null;  try { $gc  = (Resolve-DnsName -Name '_gc._tcp.{{ forest.fqdn }}' -Type SRV -ErrorAction Stop | Select-Object -First 1).NameTarget } catch { }
+              $Ansible.Result = @{
+                DsGetDc        = $dc.Trim()
+                ServedByAddc02 = [bool]($dc -match 'ADDC02')
+                SecureChannel  = [bool]$sc
+                DnsResolved    = [bool]$dns
+                GcSrv          = "$gc"
+              }
+              $Ansible.Changed = $false
+          register: r_c1
+          changed_when: false
+
+        - name: "DR | show CLIENT01 survival evidence"
+          ansible.builtin.debug:
+            var: r_c1.result
+
+        - name: "DR | assert CLIENT01 keeps auth + DNS through the ADDC01 outage"
+          ansible.builtin.assert:
+            that:
+              - "r_c1.result.SecureChannel | bool"
+              - "r_c1.result.DnsResolved | bool"
+            fail_msg: "❌ CLIENT01 lost auth/DNS during the outage: {{ r_c1.result }}"
+            success_msg: "✅ CLIENT01 OK — secure channel up, DNS resolves; DC located: {{ 'ADDC02' if r_c1.result.ServedByAddc02 else (r_c1.result.GcSrv | default('see evidence')) }}"
+
+        - name: "DR | record CLIENT01 auth/DNS PASSED"
+          ansible.builtin.set_fact:
+            dr_auth_ok: true
+      rescue:
+        - name: "DR | CLIENT01 auth/DNS FAILED (captured)"
+          ansible.builtin.set_fact:
+            dr_auth_ok: false
+
+    # --- CLIENT02: force a broadcast DISCOVER (release/renew) so ADDC02 leases it across
+    #     the VyOS relay. Done via a DETACHED one-shot SYSTEM scheduled task because
+    #     `ipconfig /release` drops CLIENT02's IP and would kill this WinRM session. The
+    #     proof is verified SERVER-SIDE on ADDC02 (next play). ---
+    - name: "DR | (CLIENT02) fire a detached release/renew to force a relayed lease"
+      when: "inventory_hostname == 'CLIENT02-corp'"
+      block:
+        - name: "DR | stage the one-shot release/renew script on CLIENT02"
+          ansible.windows.win_copy:
+            dest: 'C:\Windows\Temp\dr-releaserenew.ps1'
+            content: |
+              Start-Sleep -Seconds 5
+              ipconfig /release
+              Start-Sleep -Seconds 2
+              ipconfig /renew
+              Unregister-ScheduledTask -TaskName 'DR-ReleaseRenew' -Confirm:$false
+
+        - name: "DR | register a one-shot SYSTEM task that fires on registration (outlives WinRM)"
+          community.windows.win_scheduled_task:
+            name: DR-ReleaseRenew
+            description: "SM9 DR drill — one-shot DHCP release/renew to force a relayed lease"
+            actions:
+              - path: powershell.exe
+                arguments: '-NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\dr-releaserenew.ps1'
+            triggers:
+              - type: registration
+            username: SYSTEM
+            run_level: highest
+            state: present
+            enabled: true
+
+        - name: "DR | release/renew fired (proof is server-side on ADDC02)"
+          ansible.builtin.debug:
+            msg: "CLIENT02 will release+renew in ~5s; its WinRM drops then recovers. Verifying on ADDC02 next."
+      rescue:
+        - name: "DR | CLIENT02 trigger FAILED (captured; lease proof will report not-served)"
+          ansible.builtin.debug:
+            msg: "⚠ Could not arm CLIENT02 release/renew — the relayed-lease check will likely fail."
+
+# ===========================================================================
+# PLAY 4 — verify the relayed lease landed on ADDC02 (the cross-link DHCP proof)
+# ===========================================================================
+- name: "DR drill — Play 4 — verify ADDC02 served CLIENT02 across the relay"
+  hosts: dc_replica
+  gather_facts: false
+  ignore_unreachable: true
+  vars: *dr_vars
+  tasks:
+    - name: "DR | prove + capture the relayed lease (never aborts the run)"
+      block:
+        - name: "DR | poll ADDC02 for CLIENT02's fresh lease SERVED BY ADDC02 (ServerIP)"
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Continue'
+              $macHex = ('{{ dr_proof_client_mac }}' -replace '[:-]', '').ToLower()
+              $lease = Get-DhcpServerv4Lease -ScopeId '{{ dr_hq_scope_id }}' -ErrorAction SilentlyContinue |
+                       Where-Object { (($_.ClientId) -replace '[:-]', '').ToLower() -eq $macHex }
+              $served = if ($lease) { "$($lease.ServerIP)" } else { '' }
+              $Ansible.Result = @{
+                Found    = [bool]$lease
+                IP       = "$($lease.IPAddress)"
+                ClientId = "$($lease.ClientId)"
+                ServerIP = $served
+                State    = "$($lease.AddressState)"
+                ByAddc02 = [bool]($served -eq '{{ dr_addc02_ip }}')
+              }
+              $Ansible.Changed = $false
+          register: r_lease
+          until: "(r_lease.result.Found | bool) and (r_lease.result.ByAddc02 | bool)"
+          retries: 15
+          delay: 10
+          changed_when: false
+
+        - name: "DR | DhcpSrvLog evidence — Event ID 10 (lease granted) for CLIENT02 (report-only)"
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Continue'
+              $day = (Get-Date).DayOfWeek.ToString().Substring(0, 3)
+              $log = "C:\Windows\System32\dhcp\DhcpSrvLog-$day.log"
+              $macHex = ('{{ dr_proof_client_mac }}' -replace '[:-]', '').ToUpper()
+              $hits = @()
+              if (Test-Path $log) {
+                $hits = @(Get-Content $log | Where-Object { $_ -match '^10,' -and (($_ -replace '[:-]', '') -match $macHex) } | Select-Object -Last 3)
+              }
+              $Ansible.Result = @{ Event10Hits = $hits; LogPath = $log }
+              $Ansible.Changed = $false
+          register: r_dhcplog
+          changed_when: false
+
+        - name: "DR | show the relayed-lease proof"
+          ansible.builtin.debug:
+            msg:
+              - "Lease: IP={{ r_lease.result.IP }} ClientId={{ r_lease.result.ClientId }} State={{ r_lease.result.State }} ServedBy(ServerIP)={{ r_lease.result.ServerIP }}"
+              - "DhcpSrvLog Event 10: {{ r_dhcplog.result.Event10Hits | default([]) | join(' || ') | default('(none parsed — ServerIP is the primary proof)', true) }}"
+
+        - name: "DR | assert ADDC02 leased CLIENT02 across the VyOS relay"
+          ansible.builtin.assert:
+            that:
+              - "r_lease.result.Found | bool"
+              - "r_lease.result.ByAddc02 | bool"
+              - "r_lease.result.IP == dr_proof_client_ip"
+            fail_msg: "❌ No relayed-lease proof: found={{ r_lease.result.Found }} ip={{ r_lease.result.IP }} servedBy={{ r_lease.result.ServerIP }} (want {{ dr_addc02_ip }})."
+            success_msg: "✅ ADDC02 ({{ dr_addc02_ip }}) leased {{ r_lease.result.IP }} to CLIENT02 across the VyOS relay — ServerIP proves the failover server; ADDC02 is off-segment so the path is the relay."
+
+        - name: "DR | record relayed-lease step PASSED"
+          ansible.builtin.set_fact:
+            dr_lease_ok: true
+      rescue:
+        - name: "DR | relayed-lease step FAILED (captured; recovery still runs)"
+          ansible.builtin.set_fact:
+            dr_lease_ok: false
+
+# ===========================================================================
+# PLAY 5 — ALWAYS power ADDC01 back on (end the outage)
+# ===========================================================================
+- name: "DR drill — Play 5 — power ADDC01 back on (always)"
+  hosts: kvm_host
+  gather_facts: false
+  vars: *dr_vars
+  tasks:
+    - name: "DR | start {{ dr_target_dc_vm }}"
+      ansible.builtin.command: "virsh -c qemu:///system start {{ dr_target_dc_vm }}"
+      register: r_dr_start
+      changed_when: "'started' in (r_dr_start.stdout | default(''))"
+      failed_when: false   # 'already active' must not abort the recovery
+
+    - name: "DR | confirm ADDC01 is running again"
+      ansible.builtin.command: "virsh -c qemu:///system domstate {{ dr_target_dc_vm }}"
+      register: r_dr_runstate
+      until: "'running' in r_dr_runstate.stdout"
+      retries: 6
+      delay: 5
+      changed_when: false
+
+# ===========================================================================
+# PLAY 6 — recovery: ADDC01 back, AD replication re-converges, failover auto-recovers
+# ===========================================================================
+- name: "DR drill — Play 6 — verify recovery (LOCAL per DC; double-hop-safe)"
+  hosts: dc:dc_replica
+  gather_facts: false
+  vars: *dr_vars
+  tasks:
+    - name: "DR | (ADDC01) wait for it to return as an authenticating DC (boot + Netlogon window)"
+      ansible.builtin.wait_for_connection:
+        delay: 15
+        timeout: 600
+      when: "inventory_hostname in groups.get('dc', [])"
+
+    # Inter-site replication is schedule-bound (15-min, change-notification OFF), so a
+    # recovered DC would otherwise wait for the next window. Nudge an immediate re-sync via
+    # the LOCAL DRA (machine-account context — no WinRM double-hop), so re-convergence is
+    # prompt + verifiable now. Best-effort (the poll below is the real gate).
+    - name: "DR | (ADDC01) force immediate re-sync after recovery (local DRA; bypass the site schedule)"
+      ansible.windows.win_command: repadmin /syncall /AdeP
+      when: "inventory_hostname in groups.get('dc', [])"
+      register: r_rec_sync
+      changed_when: false
+      failed_when: false
+
+    - name: "DR | LOCAL replication health after recovery (poll to clean)"
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Continue'
+          $showrepl = (repadmin /showrepl 2>&1 | Out-String)
+          $fails = ([regex]::Matches($showrepl, 'failed|was not successful')).Count
+          $ok    = ([regex]::Matches($showrepl, 'was successful')).Count
+          $Ansible.Result = @{ ReplFails = $fails; ReplOk = $ok }
+          $Ansible.Changed = $false
+      register: r_rec_repl
+      until: "(r_rec_repl.result.ReplFails | int == 0) and (r_rec_repl.result.ReplOk | int >= 1)"
+      retries: 18
+      delay: 20
+      changed_when: false
+
+    - name: "DR | assert replication re-converged on {{ inventory_hostname }}"
+      ansible.builtin.assert:
+        that: "r_rec_repl.result.ReplFails | int == 0"
+        fail_msg: "❌ {{ inventory_hostname }} replication still failing after recovery: {{ r_rec_repl.result.ReplFails }} failed."
+        success_msg: "✅ {{ inventory_hostname }} replication re-converged ({{ r_rec_repl.result.ReplOk }} inbound OK)."
+
+    - name: "DR | DHCP failover recovery state (auto-completes to Normal after the MCLT recover-wait)"
+      ansible.windows.win_powershell:
+        script: |
+          $f = Get-DhcpServerv4Failover -Name '{{ dr_hq_failover_name }}' -ErrorAction SilentlyContinue
+          $Ansible.Result = @{ State = "$($f.State)" }
+          $Ansible.Changed = $false
+      register: r_rec_fo
+      changed_when: false
+
+    - name: "DR | report failover recovery state (no manual step needed; not gated)"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} HQ failover: {{ r_rec_fo.result.State }} —
+          {{ 'fully recovered ✅' if r_rec_fo.result.State == 'Normal'
+             else 'auto-recovering (ADDC01 Recover→RecoverWait[~1h MCLT]→Normal; ADDC02 PartnerDown→Normal); no -PartnerUp cmdlet exists, no action needed' }}
+
+# ===========================================================================
+# PLAY 7 — CLIENT02 reconnect: confirm it recovered its reserved IP
+# ===========================================================================
+- name: "DR drill — Play 7 — CLIENT02 recovered its reserved IP"
+  hosts: clients
+  gather_facts: false
+  vars: *dr_vars
+  tasks:
+    - name: "DR | (CLIENT02) reconnect + confirm reserved IP"
+      when: "inventory_hostname == 'CLIENT02-corp'"
+      block:
+        - name: "DR | wait for CLIENT02 WinRM after its release/renew IP flap"
+          ansible.builtin.wait_for_connection:
+            delay: 15
+            timeout: 240
+
+        - name: "DR | read CLIENT02's current IPv4"
+          ansible.windows.win_powershell:
+            script: |
+              $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                     Where-Object { $_.IPAddress -like '10.10.0.*' } | Select-Object -First 1).IPAddress
+              $Ansible.Result = @{ IPv4 = "$ip" }
+              $Ansible.Changed = $false
+          register: r_c2ip
+          changed_when: false
+
+        - name: "DR | assert CLIENT02 holds its reserved {{ dr_proof_client_ip }}"
+          ansible.builtin.assert:
+            that: "r_c2ip.result.IPv4 == dr_proof_client_ip"
+            fail_msg: "❌ CLIENT02 IPv4 is {{ r_c2ip.result.IPv4 }}, expected {{ dr_proof_client_ip }}."
+            success_msg: "✅ CLIENT02 recovered its reserved IP {{ r_c2ip.result.IPv4 }}."
+
+# ===========================================================================
+# PLAY 8 — final verdict (reads the captured per-host facts)
+# ===========================================================================
+- name: "DR drill — Play 8 — verdict"
+  hosts: kvm_host
+  gather_facts: false
+  vars: *dr_vars
+  tasks:
+    - name: "DR | FINAL VERDICT"
+      vars:
+        fo_ok: "{{ hostvars['ADDC02-corp'].dr_dhcp_failover_ok | default(false) | bool }}"
+        auth_ok: "{{ hostvars['CLIENT01-corp'].dr_auth_ok | default(false) | bool }}"
+        lease_ok: "{{ hostvars['ADDC02-corp'].dr_lease_ok | default(false) | bool }}"
+      ansible.builtin.assert:
+        that:
+          - "fo_ok"
+          - "auth_ok"
+          - "lease_ok"
+        fail_msg: >-
+          ❌ DR DRILL had failures — partner-down={{ fo_ok }}, client auth/DNS={{ auth_ok }},
+          relayed lease={{ lease_ok }}. ADDC01 has been powered back on; review the plays above.
+        success_msg: >-
+          ✅ DR DRILL PASSED — through a live ADDC01 outage, ADDC02 carried auth + DNS and
+          served a relayed cross-link DHCP lease (PARTNER DOWN); on recovery the forest
+          re-converged and DHCP failover is auto-returning to Normal. Validates DR-RUNBOOK.md.
+      become: false
