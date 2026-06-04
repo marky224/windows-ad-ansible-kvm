@@ -24,6 +24,7 @@ Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution o
 | `16-branch-dhcp.yml` | **Phase 6** (ADR-056): Branch DHCP scope `10.20.0.0/24` on ADDC02 (`ad_dhcp` via `group_vars/dc_replica.yml` overrides) |
 | `17-dhcp-failover.yml` | **Phase 6** (ADR-056): reciprocal hot-standby DHCP failover — preflight gate → HQ create on ADDC01 → Branch create on ADDC02 → poll to `State=Normal`; `become: runas` for the partner second-hop |
 | `verify-multisite.yml` | **Phase 6** (SM8): read-only HQ/Branch verification on **both** DCs — per-DC replication + dcdiag (run LOCALLY = double-hop-safe), DC inventory/FSMO/GC/site placement, `HQ-Branch` link cost/freq/change-notif, subnet→site maps, DHCP failover `State=Normal` (shared checks in `tasks/verify-multisite.yml`) |
+| `verify-multisite-roundtrip.yml` | **Phase 6** (SM8, **opt-in** — run explicitly; writes then self-deletes): proves the `HQ-Branch` site-link **schedule is honored** — creates a throwaway canary on ADDC01, polls for it locally on ADDC02 (no force-replicate), asserts arrival within the ~15-min window, then always deletes it. Kept out of the read-only gate + `site.yml` |
 | `99-smoke-test.yml` | End-to-end verification: DNS, AD, DHCP, CA, NTP, login (shared DC checks in `tasks/smoke-dc.yml`) |
 | `snapshot.yml` | Take a disk-level snapshot of one or more VMs (`ops_snapshot`) |
 | `rollback.yml` | Restore a VM from a named snapshot (`ops_snapshot`) |
