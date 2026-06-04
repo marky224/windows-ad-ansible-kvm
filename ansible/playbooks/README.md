@@ -23,6 +23,7 @@ Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution o
 | `15-branch-dns-forwarders.yml` | **Phase 6** (ADR-055(c)): ADDC02 forward-only DNS → ADDC01 (hub) + root-hints off (the isolated branch has no internet path) |
 | `16-branch-dhcp.yml` | **Phase 6** (ADR-056): Branch DHCP scope `10.20.0.0/24` on ADDC02 (`ad_dhcp` via `group_vars/dc_replica.yml` overrides) |
 | `17-dhcp-failover.yml` | **Phase 6** (ADR-056): reciprocal hot-standby DHCP failover — preflight gate → HQ create on ADDC01 → Branch create on ADDC02 → poll to `State=Normal`; `become: runas` for the partner second-hop |
+| `verify-multisite.yml` | **Phase 6** (SM8): read-only HQ/Branch verification on **both** DCs — per-DC replication + dcdiag (run LOCALLY = double-hop-safe), DC inventory/FSMO/GC/site placement, `HQ-Branch` link cost/freq/change-notif, subnet→site maps, DHCP failover `State=Normal` (shared checks in `tasks/verify-multisite.yml`) |
 | `99-smoke-test.yml` | End-to-end verification: DNS, AD, DHCP, CA, NTP, login (shared DC checks in `tasks/smoke-dc.yml`) |
 | `snapshot.yml` | Take a disk-level snapshot of one or more VMs (`ops_snapshot`) |
 | `rollback.yml` | Restore a VM from a named snapshot (`ops_snapshot`) |
@@ -32,4 +33,4 @@ Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution o
 | `teardown.yml` | Destroy `*-corp` VMs + their live disks; preview unless `-e confirm=DESTROY`; preserves `/mnt/dc-backups` + `.<label>` snapshots (`ops_teardown`, ADR-048) |
 | `site.yml` | Orchestrator for the **base lab**: static-imports `00 → 08` + `99-smoke-test` (NOT the Phase 6 `09→17` — those have interactive + one-shot steps); fail-fast preflight + phase tags (`network`/`dc`/`services`/`advanced`/`clients`/`linux`/`smoke`) (ADR-049/050) |
 
-Shared task files live in `tasks/` — e.g. `smoke-dc.yml`, the "healthy DC" checks reused by both `99-smoke-test.yml` and `fire-drill.yml`.
+Shared task files live in `tasks/` — `smoke-dc.yml` (the "healthy DC" checks reused by both `99-smoke-test.yml` and `fire-drill.yml`) and `verify-multisite.yml` (the "healthy two-site topology" checks driven by `verify-multisite.yml`). Both are read-only (`changed_when: false`).

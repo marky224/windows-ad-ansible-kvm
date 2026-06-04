@@ -1,0 +1,30 @@
+---
+# Multi-site (Phase 6) verification — READ-ONLY. Asserts the HQ/Branch two-site AD topology is
+# correct + healthy from BOTH DCs' local perspective (ADR-052 sites, ADR-055 double-hop discipline,
+# ADR-056 DHCP failover). The actual checks live in tasks/verify-multisite.yml so they stay the
+# single source of truth for "a healthy two-site topology" (same pattern as tasks/smoke-dc.yml).
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ HOST SAFETY: targets the DC groups ONLY (dc:dc_replica = ADDC01, ADDC02).  │
+# │ Read-only (changed_when: false), no `become`, no writes. Pre-run the gate: │
+# │   ansible-playbook playbooks/verify-multisite.yml --list-hosts             │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# NOTE: the one-time replication ROUND-TRIP proof (create a canary on ADDC01, watch it arrive on
+# ADDC02 honoring the 15-min site-link schedule — ~7-min arrival measured at SM8) is a WRITE and is
+# deliberately NOT part of this read-only gate. See the SM8 record / handoff for that artifact.
+- name: "Verify multi-site AD topology + health (HQ + Branch)"
+  hosts: dc:dc_replica
+  gather_facts: false
+  vars:
+    # The multi-site SPEC this gate verifies against — a mirror of
+    # roles/ad_sites/defaults/main.yml (ADR-052). Asserting against an independently-stated
+    # spec (not by re-reading the role's own var) is what makes this a real verification.
+    expected_hq_site: "HQ-Site"
+    expected_branch_site: "Branch-Site"
+    expected_link_name: "HQ-Branch"
+    expected_link_cost: 100
+    expected_link_freq: 15
+  tasks:
+    - name: "Multi-site | run the shared HQ/Branch verification checks"
+      ansible.builtin.include_tasks: tasks/verify-multisite.yml

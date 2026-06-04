@@ -1,0 +1,194 @@
+---
+# Multi-site (Phase 6) verification checks — the single source of truth for "a healthy
+# HQ + Branch two-site topology". READ-ONLY (every task is changed_when: false).
+# Included by:
+#   - verify-multisite.yml  (against the live `dc:dc_replica` groups = ADDC01 + ADDC02)
+#
+# DOUBLE-HOP DISCIPLINE (ADR-055): every check runs LOCALLY on its DC (target = self) —
+# repadmin reads this DC's own metadata, Get-AD*/Get-Dhcp* read the local (replicated) copy.
+# NO check binds to the partner, so it is safe under WinRM/NTLM with no `become`. The two
+# cross-DC dcdiag tests are deliberately handled:
+#   * KnowsOfRoleHolders — OMITTED: RPC-binds to the remote role holder => Access-denied under
+#                          NTLM on a non-FSMO DC (proven benign via become:runas this session).
+#   * SystemLog          — OMITTED: trips on the benign Secure-Boot 1801 advisory (not AD).
+# Relies on group_vars/all (forest.*, corp_subnet.*, branch_subnet.*) + the expected_* spec
+# vars set by the calling play (mirror of roles/ad_sites/defaults — ADR-052).
+
+# ---------------------------------------------------------------------------
+# 1. Per-DC replication + DC health (LOCAL reads only)
+# ---------------------------------------------------------------------------
+- name: "Multi-site | per-DC replication status + dcdiag (LOCAL, no 2nd hop)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Continue'
+      # Inbound replication status — this DC's own metadata (no partner bind).
+      $showrepl  = (repadmin /showrepl 2>&1 | Out-String)
+      $replFails = ([regex]::Matches($showrepl, 'failed|was not successful')).Count
+      $replOk    = ([regex]::Matches($showrepl, 'was successful')).Count
+      $queue     = (repadmin /queue 2>&1 | Out-String)
+      $queueLen  = if ($queue -match 'Queue contains (\d+)') { [int]$Matches[1] } else { -1 }
+      # dcdiag CORE tests (/q prints ONLY failures => empty string == clean).
+      $core = (dcdiag /test:Connectivity /test:Advertising /test:Services /test:NetLogons /test:Replications /test:SysVolCheck /q 2>&1 | Out-String).Trim()
+      # DFSREvent kept SEPARATE + report-only: benign 24h-window noise (DFSR 5008->5004) right
+      # after a partner reboot/snapshot would otherwise false-fail this gate.
+      $dfsr = (dcdiag /test:DFSREvent /q 2>&1 | Out-String).Trim()
+      $Ansible.Changed = $false
+      $Ansible.Result = @{
+        ReplOk    = $replOk
+        ReplFails = $replFails
+        QueueLen  = $queueLen
+        CoreClean = [bool]([string]::IsNullOrWhiteSpace($core))
+        CoreOut   = $core
+        DfsrClean = [bool]([string]::IsNullOrWhiteSpace($dfsr))
+        DfsrOut   = $dfsr
+      }
+  register: r_health
+  changed_when: false
+
+- name: "Multi-site | assert inbound replication healthy"
+  ansible.builtin.assert:
+    that:
+      - "r_health.result.ReplFails | int == 0"
+      - "r_health.result.ReplOk | int >= 1"
+      - "r_health.result.QueueLen | int >= 0"
+      - "r_health.result.QueueLen | int < 10"
+    fail_msg: >-
+      ❌ {{ inventory_hostname }} replication unhealthy:
+      {{ r_health.result.ReplOk }} OK / {{ r_health.result.ReplFails }} failed, queue {{ r_health.result.QueueLen }}
+    success_msg: >-
+      ✅ {{ inventory_hostname }} replication: {{ r_health.result.ReplOk }} inbound OK,
+      {{ r_health.result.ReplFails }} failed, queue {{ r_health.result.QueueLen }}
+
+- name: "Multi-site | assert dcdiag core tests clean"
+  ansible.builtin.assert:
+    that:
+      - "r_health.result.CoreClean"
+    fail_msg: "❌ {{ inventory_hostname }} dcdiag core failures: {{ r_health.result.CoreOut }}"
+    success_msg: >-
+      ✅ {{ inventory_hostname }} dcdiag clean
+      (Connectivity/Advertising/Services/NetLogons/Replications/SysVolCheck)
+
+- name: "Multi-site | report dcdiag DFSREvent (benign post-reboot noise is expected)"
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} dcdiag DFSREvent:
+      {{ 'clean ✅' if r_health.result.DfsrClean
+         else ('non-clean — a DFSR 5008→5004 pair in the 24h after a partner reboot is benign; review: '
+               ~ r_health.result.DfsrOut) }}
+
+# ---------------------------------------------------------------------------
+# 2. Replicated topology — DC inventory, FSMO, GC, site placement, site link, subnets
+#    (Get-AD* read the local copy of the replicated config NC; running on BOTH DCs
+#     also proves the two DCs agree — a free cross-DC consistency check.)
+# ---------------------------------------------------------------------------
+- name: "Multi-site | gather replicated topology (LOCAL LDAP read)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $dcs    = Get-ADDomainController -Filter *
+      $addc01 = $dcs | Where-Object { $_.Name -eq 'ADDC01' } | Select-Object -First 1
+      $addc02 = $dcs | Where-Object { $_.Name -eq 'ADDC02' } | Select-Object -First 1
+      # Site link by NAME (never -First 1 — that returns the inert DEFAULTIPSITELINK).
+      $link = Get-ADReplicationSiteLink -Filter "Name -eq '{{ expected_link_name }}'" -Properties Options
+      $opts = if ($link) { $link.Options } else { $null }
+      $linkSites = if ($link) { @($link.SitesIncluded | ForEach-Object { ($_ -split ',')[0] -replace '^CN=','' }) } else { @() }
+      $subnets = Get-ADReplicationSubnet -Filter * | ForEach-Object {
+        [pscustomobject]@{ Name = "$($_.Name)"; Site = (($_.Site -split ',')[0] -replace '^CN=','') }
+      }
+      $hqSub = $subnets | Where-Object { $_.Name -eq '{{ corp_subnet.cidr }}' }   | Select-Object -First 1
+      $brSub = $subnets | Where-Object { $_.Name -eq '{{ branch_subnet.cidr }}' } | Select-Object -First 1
+      $Ansible.Changed = $false
+      $Ansible.Result = @{
+        DcCount           = @($dcs).Count
+        Addc01Site        = "$($addc01.Site)"
+        Addc02Site        = "$($addc02.Site)"
+        Addc01FsmoCount   = @($addc01.OperationMasterRoles).Count
+        Addc02FsmoCount   = @($addc02.OperationMasterRoles).Count
+        Addc01Gc          = [bool]$addc01.IsGlobalCatalog
+        Addc02Gc          = [bool]$addc02.IsGlobalCatalog
+        LinkExists        = [bool]$link
+        LinkCost          = if ($link) { [int]$link.Cost } else { -1 }
+        LinkFreq          = if ($link) { [int]$link.ReplicationFrequencyInMinutes } else { -1 }
+        LinkChangeNotifOn = [bool]($null -ne $opts -and ([int]$opts -band 1))
+        LinkSites         = @($linkSites | Sort-Object)
+        HqSubnetSite      = "$($hqSub.Site)"
+        BrSubnetSite      = "$($brSub.Site)"
+      }
+  register: r_topo
+  changed_when: false
+
+- name: "Multi-site | assert DC inventory, FSMO, GC, site placement"
+  ansible.builtin.assert:
+    that:
+      - "r_topo.result.DcCount | int == 2"
+      - "r_topo.result.Addc01Site == expected_hq_site"
+      - "r_topo.result.Addc02Site == expected_branch_site"
+      - "r_topo.result.Addc01FsmoCount | int == 5"
+      - "r_topo.result.Addc02FsmoCount | int == 0"
+      - "r_topo.result.Addc01Gc | bool"
+      - "r_topo.result.Addc02Gc | bool"
+    fail_msg: >-
+      ❌ topology drift seen from {{ inventory_hostname }}: DCs={{ r_topo.result.DcCount }}
+      ADDC01[site={{ r_topo.result.Addc01Site }} fsmo={{ r_topo.result.Addc01FsmoCount }} gc={{ r_topo.result.Addc01Gc }}]
+      ADDC02[site={{ r_topo.result.Addc02Site }} fsmo={{ r_topo.result.Addc02FsmoCount }} gc={{ r_topo.result.Addc02Gc }}]
+    success_msg: >-
+      ✅ (per {{ inventory_hostname }}) 2 DCs — ADDC01∈{{ expected_hq_site }} (5 FSMO, GC),
+      ADDC02∈{{ expected_branch_site }} (0 FSMO, GC)
+
+- name: "Multi-site | assert HQ-Branch site link matches spec"
+  ansible.builtin.assert:
+    that:
+      - "r_topo.result.LinkExists | bool"
+      - "r_topo.result.LinkCost | int == expected_link_cost"
+      - "r_topo.result.LinkFreq | int == expected_link_freq"
+      - "not (r_topo.result.LinkChangeNotifOn | bool)"
+      - "expected_hq_site in r_topo.result.LinkSites"
+      - "expected_branch_site in r_topo.result.LinkSites"
+    fail_msg: >-
+      ❌ {{ expected_link_name }} drift (per {{ inventory_hostname }}): exists={{ r_topo.result.LinkExists }}
+      cost={{ r_topo.result.LinkCost }} freq={{ r_topo.result.LinkFreq }}
+      changeNotifOn={{ r_topo.result.LinkChangeNotifOn }} sites={{ r_topo.result.LinkSites | join('+') }}
+    success_msg: >-
+      ✅ (per {{ inventory_hostname }}) site link {{ expected_link_name }}: cost {{ r_topo.result.LinkCost }},
+      freq {{ r_topo.result.LinkFreq }}m, change-notif OFF, sites {{ r_topo.result.LinkSites | join('+') }}
+
+- name: "Multi-site | assert subnet → site mappings"
+  ansible.builtin.assert:
+    that:
+      - "r_topo.result.HqSubnetSite == expected_hq_site"
+      - "r_topo.result.BrSubnetSite == expected_branch_site"
+    fail_msg: >-
+      ❌ subnet mapping drift (per {{ inventory_hostname }}):
+      {{ corp_subnet.cidr }}→{{ r_topo.result.HqSubnetSite }}, {{ branch_subnet.cidr }}→{{ r_topo.result.BrSubnetSite }}
+    success_msg: >-
+      ✅ (per {{ inventory_hostname }}) subnets {{ corp_subnet.cidr }}→{{ expected_hq_site }},
+      {{ branch_subnet.cidr }}→{{ expected_branch_site }}
+
+# ---------------------------------------------------------------------------
+# 3. Cross-site DHCP failover (the Phase-6 resilience feature; SM7 / ADR-056).
+#    Get-DhcpServerv4Failover reads this server's own relationship config (cached State) —
+#    a LOCAL read, no partner bind. Closes the handoff's "re-verify State=Normal" loop.
+# ---------------------------------------------------------------------------
+- name: "Multi-site | gather DHCP failover relationship state (LOCAL)"
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $fo   = @(Get-DhcpServerv4Failover -ErrorAction SilentlyContinue)
+      $rels = @($fo | ForEach-Object { "{0}: State={1} Mode={2} Partner={3}" -f $_.Name, $_.State, $_.Mode, $_.PartnerServer })
+      $bad  = @($fo | Where-Object { "$($_.State)" -ne 'Normal' })
+      $Ansible.Changed = $false
+      $Ansible.Result = @{
+        Count         = @($fo).Count
+        Relationships = $rels
+        AllNormal     = [bool](@($fo).Count -ge 1 -and @($bad).Count -eq 0)
+      }
+  register: r_failover
+  changed_when: false
+
+- name: "Multi-site | assert DHCP failover relationship(s) State=Normal"
+  ansible.builtin.assert:
+    that:
+      - "r_failover.result.Count | int >= 1"
+      - "r_failover.result.AllNormal | bool"
+    fail_msg: "❌ {{ inventory_hostname }} DHCP failover not all-Normal: {{ r_failover.result.Relationships | join('; ') }}"
+    success_msg: "✅ {{ inventory_hostname }} DHCP failover: {{ r_failover.result.Relationships | join('; ') }}"
