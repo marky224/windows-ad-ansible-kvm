@@ -1,6 +1,6 @@
 # Playbooks
 
-Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution order for a full build (`99-` is verification). The `00→08` chain plus `99` builds the base lab end-to-end; `09→17` are the **Phase 6** (multi-site) build steps; the rest are operational utilities.
+Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution order for a full build (`99-` is verification). The `00→08` chain plus `99` builds the base lab end-to-end; `09→18` are the **Phase 6** (multi-site) build steps; the rest are operational utilities.
 
 | File | Purpose |
 |---|---|
@@ -23,6 +23,7 @@ Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution o
 | `15-branch-dns-forwarders.yml` | **Phase 6** (ADR-055(c)): ADDC02 forward-only DNS → ADDC01 (hub) + root-hints off (the isolated branch has no internet path) |
 | `16-branch-dhcp.yml` | **Phase 6** (ADR-056): Branch DHCP scope `10.20.0.0/24` on ADDC02 (`ad_dhcp` via `group_vars/dc_replica.yml` overrides) |
 | `17-dhcp-failover.yml` | **Phase 6** (ADR-056): reciprocal hot-standby DHCP failover — preflight gate → HQ create on ADDC01 → Branch create on ADDC02 → poll to `State=Normal`; `become: runas` for the partner second-hop |
+| `18-dhcp-relay.yml` | **Phase 6** (SM9, ADR-058): VyOS cross-site DHCP relay — HQ (`eth0`) broadcasts → ADDC02 (`10.20.0.10`) via `eth1`, so the hot-standby can lease HQ clients across the link once `PARTNER-DOWN` is declared; harmless while failover is `Normal` (standby silent). T5679 N/A (different listen/upstream interfaces) |
 | `verify-multisite.yml` | **Phase 6** (SM8): read-only HQ/Branch verification on **both** DCs — per-DC replication + dcdiag (run LOCALLY = double-hop-safe), DC inventory/FSMO/GC/site placement, `HQ-Branch` link cost/freq/change-notif, subnet→site maps, DHCP failover `State=Normal` (shared checks in `tasks/verify-multisite.yml`) |
 | `verify-multisite-roundtrip.yml` | **Phase 6** (SM8, **opt-in** — run explicitly; writes then self-deletes): proves the `HQ-Branch` site-link **schedule is honored** — creates a throwaway canary on ADDC01, polls for it locally on ADDC02 (no force-replicate), asserts arrival within the ~15-min window, then always deletes it. Kept out of the read-only gate + `site.yml` |
 | `99-smoke-test.yml` | End-to-end verification: DNS, AD, DHCP, CA, NTP, login (shared DC checks in `tasks/smoke-dc.yml`) |

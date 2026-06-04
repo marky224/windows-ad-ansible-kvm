@@ -1,0 +1,96 @@
+---
+# Phase 6 SM9 — cross-site DHCP relay (the HQ-standby reachability piece of the DR design).
+#
+# WHY: HQ clients broadcast their DHCP DISCOVER on 10.10.0.0/24. ADDC01 (active for the HQ
+# scope) answers on-segment. The hot-standby partner ADDC02 lives on 10.20.0.0/24 across VyOS
+# and will NEVER see an HQ broadcast — so when ADDC01 is down and the operator declares
+# PARTNER-DOWN, an HQ client can only be leased by ADDC02 if its broadcast is relayed across the
+# link. This installs the permanent ip-helper that does that: a DHCP relay on VyOS eth0 (HQ leg)
+# forwarding to ADDC02 (10.20.0.10) out eth1 (Branch leg).
+#
+# T5679 DOES NOT APPLY. The VyOS "DHCP relay broken when listen- and upstream-interface are the
+# SAME" bug (vyos.dev/T5679, Wontfix) only bites the same-interface case; ours listens on eth0 and
+# upstreams via eth1 — different interfaces, the explicitly-working topology. (ADR-058 / ADR-054.)
+#
+# HARMLESS IN NORMAL STATE. While the failover relationship is Normal, the standby (ADDC02) does
+# NOT answer client requests (MS hot-standby) — so the relayed HQ broadcasts reach a silent
+# ADDC02 and the client uses ADDC01's on-segment OFFER. The relay only becomes load-bearing once
+# ADDC01 is down + PARTNER-DOWN is declared (see dr-failover-drill.yml / DR-RUNBOOK.md), at which
+# point ADDC02 selects the HQ scope by giaddr (10.10.0.2 ∈ 10.10.0.0/24) and serves the lease.
+#
+# RECIPROCAL Branch->ADDC01 is deliberately NOT configured: there are no branch clients yet, and a
+# single VyOS dhcp-relay instance forwards to all servers from all interfaces (can't cleanly do
+# both directions without cross-talk). Deferred + documented (ADR-058).
+#
+# Idempotent: re-running is changed=0 once converged (same as 12-configure-vyos.yml).
+#
+# ── HOST SAFETY ─────────────────────────────────────────────────────────────────
+# Targets ONLY `routers` (VYOS01) over SSH (vyos.vyos network_cli). Never localhost/DCs.
+# REQUIRED pre-run check (must list ONLY VYOS01):
+#   ansible-playbook -i inventory/lab.yml playbooks/18-dhcp-relay.yml --list-hosts
+#   ansible-playbook -i inventory/lab.yml playbooks/18-dhcp-relay.yml --check
+# Run: ansible-playbook -i inventory/lab.yml playbooks/18-dhcp-relay.yml
+
+- name: "Configure the cross-site DHCP relay on VYOS01 (HQ -> ADDC02 standby, Phase 6 SM9)"
+  hosts: routers
+  gather_facts: false
+  vars:
+    # eth0 = HQ leg (10.10.0.2) — where HQ clients broadcast. eth1 = Branch leg (10.20.0.1) —
+    # the path to ADDC02. (net_router_vyos lists the HQ network FIRST so it enumerates as eth0;
+    # hw-id pins in 12-configure-vyos.yml anchor the mapping across reboots.)
+    dhcp_relay_listen_if: eth0
+    dhcp_relay_upstream_if: eth1
+    dhcp_relay_upstream_server: "{{ branch_subnet.dc_ip }}"   # ADDC02 = 10.20.0.10
+  tasks:
+    - name: "vyos | confirm reachable + capture version (evidence)"
+      vyos.vyos.vyos_command:
+        commands:
+          - show version
+      register: r_vyos_version
+
+    - name: "vyos | configure the DHCP relay (listen HQ eth0 -> upstream ADDC02 via eth1)"
+      vyos.vyos.vyos_config:
+        lines:
+          - "set service dhcp-relay listen-interface {{ dhcp_relay_listen_if }}"
+          - "set service dhcp-relay upstream-interface {{ dhcp_relay_upstream_if }}"
+          - "set service dhcp-relay server {{ dhcp_relay_upstream_server }}"
+      register: r_relay_apply
+
+    - name: "vyos | persist running config to boot config (save — vyos_config does NOT persist)"
+      vyos.vyos.vyos_config:
+        save: true
+
+    - name: "vyos | read back the running config (evidence + verify)"
+      vyos.vyos.vyos_command:
+        commands:
+          - show configuration commands
+      register: r_relay_cfg
+      changed_when: false
+      when: not ansible_check_mode    # post-apply verify; nothing to read back in a dry run
+
+    - name: "vyos | assert the relay is present in the running config (listen + upstream + server)"
+      when: not ansible_check_mode
+      vars:
+        # `show configuration commands` single-quotes values (…listen-interface 'eth0'); strip
+        # quotes so the substring matches are quote-insensitive.
+        _cfg: '{{ r_relay_cfg.stdout[0] | replace("''", "") }}'
+      ansible.builtin.assert:
+        that:
+          - "'dhcp-relay listen-interface ' ~ dhcp_relay_listen_if in _cfg"
+          - "'dhcp-relay upstream-interface ' ~ dhcp_relay_upstream_if in _cfg"
+          - "'dhcp-relay server ' ~ dhcp_relay_upstream_server in _cfg"
+        fail_msg: >-
+          DHCP relay not fully present in VYOS01 running config — expected listen
+          {{ dhcp_relay_listen_if }} / upstream {{ dhcp_relay_upstream_if }} / server
+          {{ dhcp_relay_upstream_server }}.
+        success_msg: >-
+          ✅ DHCP relay live on VYOS01: HQ ({{ dhcp_relay_listen_if }}) broadcasts ->
+          ADDC02 ({{ dhcp_relay_upstream_server }}) via {{ dhcp_relay_upstream_if }}.
+          Harmless while failover is Normal (standby silent); serves HQ on PARTNER-DOWN.
+
+    - name: "vyos | relay summary"
+      ansible.builtin.debug:
+        msg: >-
+          DHCP relay {{ 'applied (changed)' if r_relay_apply.changed else 'already converged (changed=0)' }}.
+          Functional proof (a lease served by ADDC02 across the link) is exercised by
+          dr-failover-drill.yml under a simulated ADDC01 outage. Reciprocal Branch->ADDC01 deferred.
