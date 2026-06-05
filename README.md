@@ -86,7 +86,12 @@ flowchart TB
     VYOS --- ADDC02
     ADDC01 -.->|AD replication, 15-min schedule| ADDC02
     ADDC01 -.->|hot-standby DHCP failover| ADDC02
-    C1 -.->|cross-site DNS and auth failover route| ADDC02
+    C1 -->|DNS and auth - primary| ADDC01
+    C2 --> ADDC01
+    U1 --> ADDC01
+    C1 -.->|cross-site DNS and auth - failover| ADDC02
+    C2 -.-> ADDC02
+    U1 -.-> ADDC02
 ```
 
 ---
