@@ -15,49 +15,7 @@ boundary enforced in the roles themselves.
 
 ## Architecture
 
-The forest is **complete and verified end to end**: ~25 Ansible roles build it from bare install media
-— idempotently (two-run gates), in about 60–75 minutes, mostly unattended — and an end-to-end smoke test
-gates every component. Here is the shape, then how it comes together.
-
-```mermaid
-flowchart TB
-    INET([Internet])
-    HOST["KVM/libvirt host - Ansible control node<br/>HQ NAT gateway 10.10.0.1 - branch mgmt leg 10.20.0.2"]
-    INET --- HOST
-
-    subgraph HQ["HQ-Site - 10.10.0.0/24"]
-        ADDC01["ADDC01 - 10.10.0.10<br/>DC - 5 FSMO - GC<br/>DNS - DHCP - AD CS - WSUS - NTP"]
-        C1["CLIENT01 - .50<br/>Windows 11 Enterprise"]
-        C2["CLIENT02 - .51<br/>Windows 11 Enterprise"]
-        U1["UBUNTU01 - .60<br/>Ubuntu 24.04 - realmd/sssd"]
-    end
-
-    subgraph BR["Branch-Site - 10.20.0.0/24 - isolated"]
-        ADDC02["ADDC02 - 10.20.0.10<br/>Replica DC - GC<br/>DNS forward-to-hub - DHCP standby"]
-    end
-
-    VYOS["VyOS router<br/>eth0 10.10.0.2 - eth1 10.20.0.1<br/>~40 ms WAN - DHCP relay"]
-
-    HOST --- ADDC01
-    ADDC01 --- VYOS
-    VYOS --- ADDC02
-    ADDC01 -.->|AD replication, 15-min schedule| ADDC02
-    ADDC01 -.->|hot-standby DHCP failover| ADDC02
-    C1 -.->|cross-site DNS and auth failover route| ADDC02
-```
-
-| VM | Role | OS | Site · IP |
-|---|---|---|---|
-| `ADDC01-corp` | Primary DC — AD DS, DNS, DHCP, AD CS (Enterprise Root CA), NTP, WSUS; **all 5 FSMO + GC** | Windows Server 2025 | HQ · `10.10.0.10` |
-| `ADDC02-corp` | **Branch replica DC + GC**; branch DNS + DHCP (HQ-scope hot-standby) | Windows Server 2025 | Branch · `10.20.0.10` |
-| `CLIENT01` / `CLIENT02` | Domain-joined workstations — real **vTPM 2.0**, machine-cert **autoenrollment** | Windows 11 Enterprise | HQ · `10.10.0.50` / `.51` |
-| `UBUNTU01-corp` | Domain-joined Linux server — `realmd` + `sssd`, AD identity + sudo | Ubuntu 24.04 LTS | HQ · `10.10.0.60` |
-| `VYOS01` | Inter-site router — routes HQ⇄Branch, DHCP relay, ~40 ms `netem` WAN | VyOS rolling (free OSS) | `10.10.0.2` / `10.20.0.1` |
-
-Forest `corp.markandrewmarquez.com` (NetBIOS `CORP`) · HQ `10.10.0.0/24` (host gateway `.1`) ·
-Branch `10.20.0.0/24` (isolated; VyOS gateway `.1`).
-
-### How it comes together
+### Component walkthrough
 
 **Born unattended.** Every machine starts from a per-VM install ISO — a Windows `Autounattend.xml` or a
 Linux cloud-init seed — that boots, installs, and brings up WinRM or SSH with no one at the console. The
@@ -100,6 +58,36 @@ resolving AD identities with `id` and honoring Domain Admins for `sudo`.
 Sites & Services with a costed, scheduled site link; and self-first DNS plus reciprocal hot-standby DHCP
 failover let the branch ride out a WAN cut — or the loss of HQ entirely, which is what the
 [disaster-recovery drills](#disaster-recovery) below put to the test.
+
+All of it — both sites, every role — is built from bare install media in about 60–75 minutes,
+idempotently (two-run gates), mostly unattended, and gated end to end by a smoke test. The full topology:
+
+```mermaid
+flowchart TB
+    INET([Internet])
+    HOST["KVM/libvirt host - Ansible control node<br/>HQ NAT gateway 10.10.0.1 - branch mgmt leg 10.20.0.2"]
+    INET --- HOST
+
+    subgraph HQ["HQ-Site - 10.10.0.0/24"]
+        ADDC01["ADDC01 - 10.10.0.10<br/>DC - 5 FSMO - GC<br/>DNS - DHCP - AD CS - WSUS - NTP"]
+        C1["CLIENT01 - .50<br/>Windows 11 Enterprise"]
+        C2["CLIENT02 - .51<br/>Windows 11 Enterprise"]
+        U1["UBUNTU01 - .60<br/>Ubuntu 24.04 - realmd/sssd"]
+    end
+
+    subgraph BR["Branch-Site - 10.20.0.0/24 - isolated"]
+        ADDC02["ADDC02 - 10.20.0.10<br/>Replica DC - GC<br/>DNS forward-to-hub - DHCP standby"]
+    end
+
+    VYOS["VyOS router<br/>eth0 10.10.0.2 - eth1 10.20.0.1<br/>~40 ms WAN - DHCP relay"]
+
+    HOST --- ADDC01
+    ADDC01 --- VYOS
+    VYOS --- ADDC02
+    ADDC01 -.->|AD replication, 15-min schedule| ADDC02
+    ADDC01 -.->|hot-standby DHCP failover| ADDC02
+    C1 -.->|cross-site DNS and auth failover route| ADDC02
+```
 
 ---
 
