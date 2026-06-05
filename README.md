@@ -173,14 +173,7 @@ windows-ad-ansible-kvm/
 │   │   ├── dr-failover-drill.yml   # live, non-destructive DR drill
 │   │   ├── snapshot.yml · backup-ad.yml · fire-drill.yml · teardown.yml   # operations
 │   │   └── 99-smoke-test.yml       # end-to-end verification gate
-│   ├── roles/                      # 23 roles, grouped by purpose:
-│   │   ├── kvm_network · kvm_windows_vm · kvm_linux_vm · kvm_iso_slipstream         # provisioning: libvirt, VMs, ISO slipstream
-│   │   ├── ad_dc · ad_admins · ad_harden_builtin_admin · ad_dns · ad_dhcp · ad_ntp  # core DC + directory services
-│   │   ├── ad_cs · ad_gpo · ad_wsus                                                 # PKI, GPO baseline, updates
-│   │   ├── ad_sites · ad_dc_replica · net_router_vyos                               # multi-site: sites, branch replica, router
-│   │   ├── domain_join_windows · domain_join_linux                                  # endpoint domain join
-│   │   ├── ops_backup · ops_snapshot · ops_firedrill · ops_teardown                 # operations + DR tooling
-│   │   └── _common                                                                  # shared defaults / handlers
+│   ├── roles/                      # 23 roles — see Roles below
 │   └── files/                      # templates, GPO baseline backups, seed assets
 ├── docs/
 │   ├── screenshots/                # provisioning milestones (shown above)
@@ -191,6 +184,36 @@ windows-ad-ansible-kvm/
 ├── LICENSE
 └── README.md
 ```
+
+---
+
+## Roles
+
+| Role | What it does |
+|---|---|
+| `kvm_network` | Define the libvirt networks — NAT HQ + isolated branch |
+| `kvm_windows_vm` | Provision a Windows VM from a custom install ISO; bootstrap WinRM/HTTPS |
+| `kvm_linux_vm` | Provision a Linux VM from a cloud image + cloud-init seed |
+| `kvm_iso_slipstream` | DISM-slipstream cumulative updates into the Server 2025 ISO |
+| `ad_dc` | Install AD DS and create the forest; verify with `dcdiag` |
+| `ad_admins` | Create the named domain admin (`madmin-da`) |
+| `ad_harden_builtin_admin` | RID-500 hardening of the built-in Administrator |
+| `ad_dns` | Forwarders, reverse zone, record scavenging |
+| `ad_dhcp` | Scope, exclusions, MAC reservations, options; cross-site failover + relay + option 121 |
+| `ad_ntp` | PDC emulator as the authoritative time source |
+| `ad_cs` | Enterprise Root CA, templates, machine autoenrollment |
+| `ad_gpo` | Microsoft SCT baseline + delta + autoenrollment GPOs |
+| `ad_wsus` | WSUS install, product/classification selection, sync |
+| `ad_sites` | AD Sites & Services — sites, subnets, costed/scheduled link |
+| `ad_dc_replica` | Promote ADDC02 as a Branch replica DC + Global Catalog |
+| `net_router_vyos` | VyOS inter-site routing, DHCP relay, ~40 ms `netem` WAN |
+| `domain_join_windows` | Join Windows 11 clients to the domain |
+| `domain_join_linux` | Join Ubuntu via `realmd`/`sssd` |
+| `ops_backup` | AD system-state backup (`wbadmin`) + config exports |
+| `ops_snapshot` | Disk snapshot / list / rollback |
+| `ops_firedrill` | Restore into an isolated sandbox, verify, always tear down |
+| `ops_teardown` | Destroy the fleet's VMs + disks (guarded, preview by default) |
+| `_common` | Shared defaults and handlers |
 
 ---
 
