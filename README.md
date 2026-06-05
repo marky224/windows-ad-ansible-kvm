@@ -1,20 +1,34 @@
 # windows-ad-ansible-kvm
 
-**Ansible Infrastructure-as-Code for a production-quality, two-site Active Directory lab on KVM/libvirt — built from bare ISOs, and drilled until disaster recovery actually works.**
+**Ansible Infrastructure-as-Code for a production-quality, two-site Active Directory environment on KVM/libvirt — provisioned from bare ISOs and verified end to end.**
 
-Active Directory is still the identity backbone of most enterprise and MSP environments, and the
-skills that separate operators from engineers are designing it for **resilience**, automating it so
-it's **reproducible**, and **proving it recovers** when a controller fails. This project builds a
-complete two-site AD forest entirely as Ansible IaC on a single Linux KVM/libvirt host — domain
-controllers, DNS, DHCP, AD CS, WSUS, GPO baselines, Windows + Linux domain members, and a second
-**isolated** branch site with cross-site replication and DHCP failover — then drills the
-disaster-recovery path until it genuinely survives losing a domain controller. One hard rule
-throughout: the lab **never mutates its control host** (a daily-driver PC).
+Active Directory is still the identity backbone of most enterprise and MSP environments, and what
+separates operators from engineers is designing it for **resilience**, automating it so it's
+**reproducible**, and **proving it recovers** when a controller fails. This project delivers a complete
+two-site AD forest as Ansible Infrastructure-as-Code on a single Linux KVM/libvirt host — domain
+controllers, DNS, DHCP, AD CS, WSUS, GPO baselines, Windows and Linux domain members, and a second
+**isolated** branch site with cross-site replication and DHCP failover — provisioned from bare install
+media and verified end to end. The control host is never modified by the automation — a hard safety
+boundary enforced in the roles themselves.
 
-What makes it more than a build script: the disaster-recovery path is **drilled, not assumed**. The
-live HQ domain controller is gracefully powered off and the branch site is proven to carry
-authentication, DNS, and DHCP on its own — then recover and re-converge cleanly. See
-[Disaster recovery, drilled](#disaster-recovery-drilled).
+---
+
+## Status
+
+**Complete.** The full two-site forest builds and verifies end to end — idempotently (two-run gates),
+in roughly 60–75 minutes, mostly unattended — then snapshots itself at each phase. Every capability
+below is built and validated by an end-to-end smoke test.
+
+| Area | What's working |
+|---|---|
+| Core directory | Forest `corp.markandrewmarquez.com`, ADDC01 holding all 5 FSMO roles + Global Catalog, a named-admin model, and RID-500 hardening |
+| Directory services | AD-integrated DNS (forwarders, reverse zone, scavenging), DHCP (scope + exclusions + MAC reservations), and authoritative NTP |
+| Security & PKI | Enterprise Root CA with machine-certificate **autoenrollment**, a Microsoft Security Compliance Toolkit GPO baseline, and WSUS |
+| Endpoints | Two Windows 11 Enterprise workstations (real vTPM 2.0, domain-joined, autoenrolled) and an Ubuntu 24.04 member server (`realmd`/`sssd`) |
+| Multi-site | Second isolated branch site: ADDC02 replica DC + GC, AD Sites & Services, a VyOS inter-site router (~40 ms WAN), and self-first DNS |
+| Resilience | Reciprocal hot-standby DHCP failover, cross-site DHCP relay, and option-121 classless static routes for cross-site reachability |
+| Disaster recovery | A documented FSMO-seizure runbook plus two rehearsals — an isolated-clone seizure and a live, non-destructive failover |
+| Operations | Snapshot / backup / fire-drill / teardown tooling and a `site.yml` orchestrator with fail-fast (`any_errors_fatal`) |
 
 ---
 
@@ -22,38 +36,36 @@ authentication, DNS, and DHCP on its own — then recover and re-converge cleanl
 
 From bare install media, ~25 Ansible roles provision a Windows Server 2025 domain controller (AD DS,
 DNS, DHCP, AD CS, WSUS, NTP), two Windows 11 Enterprise clients, an Ubuntu 24.04 member server, a
-**second replica DC in an isolated branch site**, and a **VyOS router** that joins the two sites over
-a latency-shaped WAN link. Everything runs on q35 + OVMF UEFI Secure Boot + TPM 2.0; Windows installs
-are unattended from slipstreamed media; the Linux host doubles as the Ansible control node and is, by
-hard rule, never touched by the lab.
+**second replica DC in an isolated branch site**, and a **VyOS router** that joins the two sites over a
+latency-shaped WAN link. Everything runs on q35 + OVMF UEFI Secure Boot + TPM 2.0; Windows installs are
+unattended from slipstreamed media; the Linux host doubles as the Ansible control node and is never
+modified by the automation.
 
 ```mermaid
 flowchart TB
     INET([Internet])
-    HOST["Linux KVM/libvirt host — Ansible control node<br/>NAT gateway 10.10.0.1 · passive branch mgmt leg 10.20.0.2<br/>the lab never mutates this host"]
-
-    subgraph HQ["HQ-Site · 10.10.0.0/24 · NAT to internet"]
-        direction TB
-        ADDC01["ADDC01 · 10.10.0.10<br/>DC · all 5 FSMO · GC<br/>DNS · DHCP · AD CS · WSUS · PDC/NTP"]
-        C1["CLIENT01 · .50<br/>Windows 11 Enterprise"]
-        C2["CLIENT02 · .51<br/>Windows 11 Enterprise"]
-        U1["UBUNTU01 · .60<br/>Ubuntu 24.04 · realmd/sssd"]
-    end
-
-    subgraph BR["Branch-Site · 10.20.0.0/24 · ISOLATED (no internet)"]
-        direction TB
-        ADDC02["ADDC02 · 10.20.0.10<br/>Replica DC · GC<br/>DNS (forward to hub) · DHCP (hot-standby)"]
-    end
-
-    VYOS["VyOS01 router<br/>eth0 10.10.0.2 · eth1 10.20.0.1<br/>~40 ms netem WAN · cross-site DHCP relay"]
-
+    HOST["KVM/libvirt host - Ansible control node<br/>HQ NAT gateway 10.10.0.1 - branch mgmt leg 10.20.0.2"]
     INET --- HOST
-    HOST --- HQ
-    HQ <-->|routed inter-site link| VYOS
-    VYOS <--> BR
-    ADDC01 <-.->|AD replication · 15-min site link| ADDC02
-    ADDC01 <-.->|reciprocal hot-standby DHCP failover| ADDC02
-    C1 -.->|DNS/auth failover via DHCP-delivered branch route| ADDC02
+
+    subgraph HQ["HQ-Site - 10.10.0.0/24"]
+        ADDC01["ADDC01 - 10.10.0.10<br/>DC - 5 FSMO - GC<br/>DNS - DHCP - AD CS - WSUS - NTP"]
+        C1["CLIENT01 - .50<br/>Windows 11 Enterprise"]
+        C2["CLIENT02 - .51<br/>Windows 11 Enterprise"]
+        U1["UBUNTU01 - .60<br/>Ubuntu 24.04 - realmd/sssd"]
+    end
+
+    subgraph BR["Branch-Site - 10.20.0.0/24 - isolated"]
+        ADDC02["ADDC02 - 10.20.0.10<br/>Replica DC - GC<br/>DNS forward-to-hub - DHCP standby"]
+    end
+
+    VYOS["VyOS router<br/>eth0 10.10.0.2 - eth1 10.20.0.1<br/>~40 ms WAN - DHCP relay"]
+
+    HOST --- ADDC01
+    ADDC01 --- VYOS
+    VYOS --- ADDC02
+    ADDC01 -.->|AD replication, 15-min schedule| ADDC02
+    ADDC01 -.->|hot-standby DHCP failover| ADDC02
+    C1 -.->|cross-site DNS and auth failover route| ADDC02
 ```
 
 | VM | Role | OS | Site · IP |
@@ -65,80 +77,129 @@ flowchart TB
 | `VYOS01` | Inter-site router — routes HQ⇄Branch, DHCP relay, ~40 ms `netem` WAN | VyOS rolling (free OSS) | `10.10.0.2` / `10.20.0.1` |
 
 Forest `corp.markandrewmarquez.com` (NetBIOS `CORP`) · HQ `10.10.0.0/24` (host gateway `.1`) ·
-Branch `10.20.0.0/24` (isolated; VyOS gateway `.1`). The whole fleet builds **and verifies**
-end-to-end — idempotently (two-run gates), in ~60–75 minutes, mostly unattended — across AD, DNS,
-DHCP, AD CS (including machine-certificate autoenrollment), NTP, WSUS, Windows domain membership, and
-Linux realm membership.
+Branch `10.20.0.0/24` (isolated; VyOS gateway `.1`).
 
-## Disaster recovery, drilled
+---
 
-Multi-site redundancy is only real if it survives the failure it's designed for — so the lab
-**rehearses** that failure rather than asserting it. Two complementary drills, backed by a documented
-FSMO-seizure runbook:
+## From install media to a domain-joined fleet
+
+Each VM is built unattended: a per-VM install ISO (Windows `Autounattend.xml` or Linux cloud-init)
+boots, installs, and bootstraps WinRM/SSH with no interaction, then Ansible roles configure it. A clean
+provision — from bare ISOs to a fully domain-joined, validated fleet — takes about 60–75 minutes,
+mostly unattended.
+
+| Stage | |
+|---|---|
+| Unattended Windows Server 2025 install begins | ![Setup launching](docs/screenshots/milestone2-01-setup-launching.png) |
+| Install proceeds without intervention (~12 min, cold boot to desktop) | ![Installing](docs/screenshots/milestone2-03-installing-83pct.png) |
+| OOBE auto-skipped to the desktop; WinRM over HTTPS listening | ![Desktop](docs/screenshots/milestone2-04-desktop-after-autologon.png) |
+| Patched build `26100.32860`, slipstreamed at install time | ![Patched](docs/screenshots/milestone-3.5-patched-pre-promotion.png) |
+| Forest live — ADDC01 holds all FSMO roles; the named admin is established | ![DC promoted](docs/screenshots/milestone-3-dc-promoted.png) |
+| `CLIENT01` — Windows 11 Enterprise, domain-joined, machine-cert autoenrolled | ![Windows 11 joined](docs/screenshots/milestone-6-client01-win11-desktop.png) |
+| `UBUNTU01` — Ubuntu 24.04 domain-joined via `realmd`/`sssd` | ![Ubuntu joined](docs/screenshots/milestone-6-ubuntu01-domain-joined.png) |
+
+---
+
+## Disaster recovery
+
+Multi-site redundancy is only real if it survives the failure it's designed for — so that failure is
+**rehearsed**, not assumed. Two complementary drills, backed by a documented FSMO-seizure runbook:
 
 - a **live, non-destructive failover drill** that gracefully powers off the live HQ DC and proves the
-  branch DC carries authentication, DNS, and DHCP (then recovers and re-converges), and
-- an **isolated-sandbox FSMO-seize rehearsal** that clones the branch DC into a `<forward>`-less
-  network and *actually* seizes all five FSMO roles — the only safe way to execute a real seizure,
-  since a seized-from DC must never rejoin the domain.
+  branch DC carries authentication, DNS, and DHCP, then recovers and re-converges, and
+- an **isolated-sandbox FSMO-seize rehearsal** that clones the branch DC into an isolated network and
+  *actually* seizes all five FSMO roles — the only safe way to execute a real seizure, since a
+  seized-from DC must never rejoin the domain.
 
 The sequence below is the live failover drill, end to end:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C1 as CLIENT01 (HQ)
-    participant A1 as ADDC01 (HQ · all FSMO)
-    participant V as VyOS WAN (~40 ms)
-    participant A2 as ADDC02 (Branch · GC)
-    Note over A1: ADDC01 outage — graceful power-off (drill; snapshot-insured)
-    C1->>V: DNS query + Kerberos auth, routed via the option-121 branch route
+    participant C1 as CLIENT01 HQ
+    participant A1 as ADDC01 HQ FSMO
+    participant V as VyOS WAN
+    participant A2 as ADDC02 Branch GC
+    Note over A1: ADDC01 outage - graceful power-off
+    C1->>V: DNS and Kerberos auth via the option-121 branch route
     V->>A2: forwarded across the inter-site link
-    A2-->>C1: resolves corp.* and authenticates (GC logon) — failover works
-    Note over A2: declares DHCP PARTNER DOWN · serves a relayed cross-link lease
+    A2-->>C1: resolves the forest and authenticates via the GC
+    Note over A2: declares DHCP PARTNER DOWN, serves a relayed lease
     Note over A1,A2: ADDC01 returns
-    A1->>A2: replication re-converges both directions (5 inbound OK each)
-    Note over A1,A2: DHCP failover auto-returns to State=Normal
+    A1->>A2: replication re-converges in both directions
+    Note over A1,A2: DHCP failover returns to State=Normal
 ```
 
 Cross-site failover depends on HQ clients being able to *reach* the branch DC across the link. Because
-the branch network is isolated and HQ clients' gateway is the host, the lab delivers the branch route
-to every HQ client centrally via **DHCP option 121** (classless static routes) — chosen over the
-legacy option 249 for Windows 11 24H2 option-type safety, with the default route encoded per RFC 3442
-so clients keep internet, and scoped so it rides DHCP-failover replication to the standby. The result
-below is CLIENT01 with the branch route installed — reaching the branch DC across the inter-site link
-and resolving the forest via it: the path that carries DNS and authentication when the HQ DC is
-offline.
+the branch network is isolated and HQ clients' gateway is the host, the branch route is delivered to
+every HQ client centrally via **DHCP option 121** (classless static routes) — chosen over the legacy
+option 249 for Windows 11 24H2 option-type safety, with the default route encoded per RFC 3442 so
+clients keep internet, and replicated to the standby DHCP server. The result below is CLIENT01 with the
+branch route installed — reaching the branch DC across the inter-site link and resolving the forest via
+it: the path that carries DNS and authentication when the HQ DC is offline.
 
 ![CLIENT01 reaching the branch DC across the inter-site link and resolving the forest via it — the cross-site DNS/auth failover path](docs/assets/cross-site-failover-client01.png)
+
+---
 
 ## What this demonstrates
 
 **Active Directory, in depth.** Multi-site design (Sites/Subnets/site-links, with the replication
 schedule honored — proven by an object round-trip, not assumed), replication topology, FSMO + Global
 Catalog, AD-integrated DNS, AD CS with machine-certificate autoenrollment, GPO baselines (Microsoft
-Security Compliance Toolkit), and WSUS. **DR:** a documented FSMO-seizure runbook plus *two*
-rehearsals — an isolated-clone seizure and a live, non-destructive failover.
+Security Compliance Toolkit), and WSUS.
 
-**Networking.** Subnetting and an explicit IP plan, inter-site routing on VyOS, WAN-latency
-simulation (`netem`), and DHCP end-to-end — scopes, exclusions, MAC reservations, **hot-standby
-failover**, cross-site **relay**, and **classless static routes (option 121)** — alongside
-self-first / local-first DNS resilience for a WAN-separated, one-DC-per-site topology.
+**Networking.** Subnetting and an explicit IP plan, inter-site routing on VyOS, WAN-latency simulation
+(`netem`), and DHCP end to end — scopes, exclusions, MAC reservations, **hot-standby failover**,
+cross-site **relay**, and **classless static routes (option 121)** — alongside self-first / local-first
+DNS resilience for a WAN-separated, one-DC-per-site topology.
 
-**IaC & automation.** ~25 Ansible roles and playbooks with strict idempotency (two-run gates),
-Windows configuration via inline `win_powershell` where no native module exists, `ansible-vault`
-from day one, a `site.yml` orchestrator with fail-fast (`any_errors_fatal`), and CI guardrails
-(`ansible-lint` + `gitleaks`).
+**IaC & automation.** ~25 Ansible roles and playbooks with strict idempotency (two-run gates), Windows
+configuration via inline `win_powershell` where no native module exists, `ansible-vault` from day one, a
+`site.yml` orchestrator with fail-fast (`any_errors_fatal`), and CI guardrails (`ansible-lint` +
+`gitleaks`).
 
-**Virtualization.** KVM/libvirt with q35 / UEFI Secure Boot / TPM 2.0, unattended Windows Server
-2025 and Windows 11 installs from slipstreamed media, and snapshot / backup / fire-drill / teardown
-tooling.
+**Virtualization.** KVM/libvirt with q35 / UEFI Secure Boot / TPM 2.0, unattended Windows Server 2025
+and Windows 11 installs from slipstreamed media, and snapshot / backup / fire-drill / teardown tooling.
 
-**Production judgment.** ADR-driven decisions (58 ADRs), a hard **host-safety discipline** (the lab
-never mutates its control host — guards baked into the riskiest roles), and production-correct
-resilience choices throughout — hot-standby (not load-balance) DHCP failover for a WAN-separated
-partner, self-first DNS for a one-DC-per-site topology, and option-121 (not legacy 249) classless
-static routes for 24H2-safe cross-site routing.
+---
+
+## Project structure
+
+```
+windows-ad-ansible-kvm/
+├── ansible/
+│   ├── ansible.cfg                 # inventory, vault, and connection defaults
+│   ├── requirements.yml            # collections: microsoft.ad, ansible.windows, community.{windows,libvirt}, vyos.vyos, ...
+│   ├── inventory/
+│   │   ├── lab.yml                 # the fleet
+│   │   └── group_vars/             # all/ (+ vault), dc, dc_replica, clients, linux_clients, routers, windows
+│   ├── playbooks/                  # NN-verb-noun.yml, ordered for full builds
+│   │   ├── site.yml                # one-command orchestrator (00 -> 99) with fail-fast
+│   │   ├── 00..08-*.yml            # base build: network -> DC -> services -> clients -> linux -> join
+│   │   ├── 09..18-*.yml            # multi-site: AD sites, ADDC02 replica, VyOS, DNS cross-point, branch DHCP + failover + relay
+│   │   ├── verify-multisite*.yml   # read-only two-site health + schedule round-trip proof
+│   │   ├── dr-failover-drill.yml   # live, non-destructive DR drill
+│   │   ├── snapshot.yml · backup-ad.yml · fire-drill.yml · teardown.yml   # operations
+│   │   └── 99-smoke-test.yml       # end-to-end verification gate
+│   ├── roles/                      # 23 roles, grouped by purpose:
+│   │   ├── kvm_network · kvm_windows_vm · kvm_linux_vm · kvm_iso_slipstream         # provisioning: libvirt, VMs, ISO slipstream
+│   │   ├── ad_dc · ad_admins · ad_harden_builtin_admin · ad_dns · ad_dhcp · ad_ntp  # core DC + directory services
+│   │   ├── ad_cs · ad_gpo · ad_wsus                                                 # PKI, GPO baseline, updates
+│   │   ├── ad_sites · ad_dc_replica · net_router_vyos                               # multi-site: sites, branch replica, router
+│   │   ├── domain_join_windows · domain_join_linux                                  # endpoint domain join
+│   │   ├── ops_backup · ops_snapshot · ops_firedrill · ops_teardown                 # operations + DR tooling
+│   │   └── _common                                                                  # shared defaults / handlers
+│   └── files/                      # templates, GPO baseline backups, seed assets
+├── docs/
+│   ├── screenshots/                # provisioning milestones (shown above)
+│   └── assets/                     # architecture + cross-site failover proof images
+├── .github/                        # CI: gitleaks secret scan
+├── .pre-commit-config.yaml         # gitleaks pre-commit hook
+├── .gitleaks.toml
+├── LICENSE
+└── README.md
+```
 
 ---
 
