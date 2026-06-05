@@ -13,33 +13,11 @@ boundary enforced in the roles themselves.
 
 ---
 
-## Status
+## Architecture
 
-**Complete.** The full two-site forest builds and verifies end to end — idempotently (two-run gates),
-in roughly 60–75 minutes, mostly unattended — then snapshots itself at each phase. Every capability
-below is built and validated by an end-to-end smoke test.
-
-| Area | What's working |
-|---|---|
-| Core directory | Forest `corp.markandrewmarquez.com`, ADDC01 holding all 5 FSMO roles + Global Catalog, a named-admin model, and RID-500 hardening |
-| Directory services | AD-integrated DNS (forwarders, reverse zone, scavenging), DHCP (scope + exclusions + MAC reservations), and authoritative NTP |
-| Security & PKI | Enterprise Root CA with machine-certificate **autoenrollment**, a Microsoft Security Compliance Toolkit GPO baseline, and WSUS |
-| Endpoints | Two Windows 11 Enterprise workstations (real vTPM 2.0, domain-joined, autoenrolled) and an Ubuntu 24.04 member server (`realmd`/`sssd`) |
-| Multi-site | Second isolated branch site: ADDC02 replica DC + GC, AD Sites & Services, a VyOS inter-site router (~40 ms WAN), and self-first DNS |
-| Resilience | Reciprocal hot-standby DHCP failover, cross-site DHCP relay, and option-121 classless static routes for cross-site reachability |
-| Disaster recovery | A documented FSMO-seizure runbook plus two rehearsals — an isolated-clone seizure and a live, non-destructive failover |
-| Operations | Snapshot / backup / fire-drill / teardown tooling and a `site.yml` orchestrator with fail-fast (`any_errors_fatal`) |
-
----
-
-## Architecture at a glance
-
-From bare install media, ~25 Ansible roles provision a Windows Server 2025 domain controller (AD DS,
-DNS, DHCP, AD CS, WSUS, NTP), two Windows 11 Enterprise clients, an Ubuntu 24.04 member server, a
-**second replica DC in an isolated branch site**, and a **VyOS router** that joins the two sites over a
-latency-shaped WAN link. Everything runs on q35 + OVMF UEFI Secure Boot + TPM 2.0; Windows installs are
-unattended from slipstreamed media; the Linux host doubles as the Ansible control node and is never
-modified by the automation.
+The forest is **complete and verified end to end**: ~25 Ansible roles build it from bare install media
+— idempotently (two-run gates), in about 60–75 minutes, mostly unattended — and an end-to-end smoke test
+gates every component. Here is the shape, then how it comes together.
 
 ```mermaid
 flowchart TB
@@ -79,24 +57,49 @@ flowchart TB
 Forest `corp.markandrewmarquez.com` (NetBIOS `CORP`) · HQ `10.10.0.0/24` (host gateway `.1`) ·
 Branch `10.20.0.0/24` (isolated; VyOS gateway `.1`).
 
----
+### How it comes together
 
-## From install media to a domain-joined fleet
+**Born unattended.** Every machine starts from a per-VM install ISO — a Windows `Autounattend.xml` or a
+Linux cloud-init seed — that boots, installs, and brings up WinRM or SSH with no one at the console. The
+`kvm_windows_vm` and `kvm_linux_vm` roles define each libvirt domain (q35 + UEFI Secure Boot + TPM 2.0),
+attach the media, and wait for the management channel to answer — about twelve minutes from cold boot to
+a working desktop.
 
-Each VM is built unattended: a per-VM install ISO (Windows `Autounattend.xml` or Linux cloud-init)
-boots, installs, and bootstraps WinRM/SSH with no interaction, then Ansible roles configure it. A clean
-provision — from bare ISOs to a fully domain-joined, validated fleet — takes about 60–75 minutes,
-mostly unattended.
+![Unattended Windows Server 2025 install begins](docs/screenshots/milestone2-01-setup-launching.png)
+![Install proceeds without intervention](docs/screenshots/milestone2-03-installing-83pct.png)
+![OOBE auto-skipped to the desktop, WinRM over HTTPS listening](docs/screenshots/milestone2-04-desktop-after-autologon.png)
 
-| Stage | |
-|---|---|
-| Unattended Windows Server 2025 install begins | ![Setup launching](docs/screenshots/milestone2-01-setup-launching.png) |
-| Install proceeds without intervention (~12 min, cold boot to desktop) | ![Installing](docs/screenshots/milestone2-03-installing-83pct.png) |
-| OOBE auto-skipped to the desktop; WinRM over HTTPS listening | ![Desktop](docs/screenshots/milestone2-04-desktop-after-autologon.png) |
-| Patched build `26100.32860`, slipstreamed at install time | ![Patched](docs/screenshots/milestone-3.5-patched-pre-promotion.png) |
-| Forest live — ADDC01 holds all FSMO roles; the named admin is established | ![DC promoted](docs/screenshots/milestone-3-dc-promoted.png) |
-| `CLIENT01` — Windows 11 Enterprise, domain-joined, machine-cert autoenrolled | ![Windows 11 joined](docs/screenshots/milestone-6-client01-win11-desktop.png) |
-| `UBUNTU01` — Ubuntu 24.04 domain-joined via `realmd`/`sssd` | ![Ubuntu joined](docs/screenshots/milestone-6-ubuntu01-domain-joined.png) |
+**Patched before it ever runs.** The Server 2025 media is DISM-slipstreamed (`kvm_iso_slipstream`) so the
+controller boots already at build `26100.32860` — current on day one, with no post-install patch window.
+
+![Patched Server 2025 build, slipstreamed at install time](docs/screenshots/milestone-3.5-patched-pre-promotion.png)
+
+**One controller, the services a real site needs.** `ad_dc` promotes ADDC01 into the forest
+`corp.markandrewmarquez.com` — all five FSMO roles and a Global Catalog — then a named-admin role and
+RID-500 hardening lock down the built-in Administrator. Focused roles layer the services on top:
+AD-integrated DNS (`ad_dns`), DHCP with reservations (`ad_dhcp`), an Enterprise Root CA (`ad_cs`), a
+Microsoft Security Compliance Toolkit GPO baseline (`ad_gpo`), authoritative time (`ad_ntp`), and WSUS
+(`ad_wsus`).
+
+![Forest live — ADDC01 holds all FSMO roles, named admin established](docs/screenshots/milestone-3-dc-promoted.png)
+
+**Endpoints that actually join.** Two Windows 11 Enterprise workstations join the domain with a real
+vTPM 2.0 and pick up a machine certificate by **autoenrollment** from the CA (`domain_join_windows`) —
+GPO-driven, with no manual request.
+
+![CLIENT01 — Windows 11 Enterprise, domain-joined and autoenrolled](docs/screenshots/milestone-6-client01-win11-desktop.png)
+
+The *same* forest serves Linux: an Ubuntu 24.04 server joins through `realmd`/`sssd` (`domain_join_linux`),
+resolving AD identities with `id` and honoring Domain Admins for `sudo`.
+
+![UBUNTU01 — Ubuntu 24.04 domain-joined via realmd/sssd](docs/screenshots/milestone-6-ubuntu01-domain-joined.png)
+
+**A second site — not a second subnet on paper.** A genuinely isolated branch sits on its own
+`10.20.0.0/24` network, reachable from HQ only through a VyOS router (`net_router_vyos`) that shapes a
+~40 ms WAN. `ad_dc_replica` promotes ADDC02 as a replica DC + Global Catalog; `ad_sites` lays down AD
+Sites & Services with a costed, scheduled site link; and self-first DNS plus reciprocal hot-standby DHCP
+failover let the branch ride out a WAN cut — or the loss of HQ entirely, which is what the
+[disaster-recovery drills](#disaster-recovery) below put to the test.
 
 ---
 
