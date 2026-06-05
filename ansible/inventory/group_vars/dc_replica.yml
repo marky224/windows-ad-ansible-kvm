@@ -88,6 +88,13 @@ ad_dhcp_scope_options:
   dns_domain_name: "{{ forest.fqdn }}"
   ntp_servers:
     - "{{ branch_subnet.dc_ip }}"                # ADDC02 (syncs time from the PDC down the domain hierarchy)
+
+# Branch clients need NO classless static routes (option 121/249): their default gateway already
+# IS VyOS (branch_subnet.gateway = 10.20.0.1), which routes to HQ (directly connected) and to the
+# internet (its own default route → host). The HQ scope needs them only because HQ clients' gateway
+# is the host, not VyOS (ad_dhcp/defaults, SM9/ADR-058). Override the HQ default to empty here.
+ad_dhcp_classless_static_routes: []
+
 ad_dhcp_reservations: {}                          # no branch clients yet
 
 # --- Phase 6 SM7 part 2: DHCP failover — ADDC02 is ACTIVE for the Branch scope ───

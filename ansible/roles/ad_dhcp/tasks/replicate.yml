@@ -3,8 +3,9 @@
 #
 # WHY: DHCP failover replicates scope options/reservations to the partner ONLY at relationship
 # CREATE time and on an EXPLICIT Invoke-DhcpServerv4FailoverReplication. A post-create option edit
-# (e.g. the local-first option-006 DNS-resilience change) does NOT auto-reach the standby, so a NEW
-# client leased by the standby during a failover would otherwise get the OLD (single-DC) option set.
+# (e.g. the local-first option-006 DNS-resilience change, or the SM9 option-121 cross-site branch
+# route) does NOT auto-reach the standby, so a NEW client leased by the standby during a failover
+# would otherwise get the OLD (single-DC) option set. We diff options 006 + 121 to decide.
 # This step pushes the current config to the standby, idempotently.
 #
 # DIRECTION (the foot-gun): Invoke-DhcpServerv4FailoverReplication is a DESTRUCTIVE one-way overwrite
@@ -24,7 +25,7 @@
 # DOUBLE-HOP: the partner read (-ComputerName) and the Invoke both contact the PARTNER over WinRM =
 # a second hop -> become:runas (same pattern as failover.yml; proven SM7/ADR-055). The local Get-
 # reads need no hop. NO shared secret is involved (the relationship already carries it) -> fully
-# visible (no no_log). Idempotent: only pushes when the partner's option 006 differs from local.
+# visible (no no_log). Idempotent: only pushes when the partner's option 006/121 drift from local.
 
 - name: "Re-replicate active scope {{ ad_dhcp_scope_id }} to the hot-standby partner (idempotent)"
   become: true
@@ -68,23 +69,31 @@
           }
           $partner = "$($rel.PartnerServer)"
 
-          function Get-Opt6 {
+          # Compare the resilience-relevant SCOPE options that don't auto-replicate after create:
+          # 006 (DNS servers, local-first — ADR-056) + 121 (classless static routes / the cross-site
+          # branch route — SM9/ADR-058). One comparable signature string per server; any drift across
+          # the set triggers the (whole-scope) push below.
+          function Get-OptSig {
               param([string]$Computer, [string]$Scope)
-              if ($Computer) {
-                  $v = Get-DhcpServerv4OptionValue -ComputerName $Computer -ScopeId $Scope -OptionId 6 -ErrorAction SilentlyContinue
-              } else {
-                  $v = Get-DhcpServerv4OptionValue -ScopeId $Scope -OptionId 6 -ErrorAction SilentlyContinue
+              $parts = @()
+              foreach ($id in 6, 121) {
+                  if ($Computer) {
+                      $v = Get-DhcpServerv4OptionValue -ComputerName $Computer -ScopeId $Scope -OptionId $id -ErrorAction SilentlyContinue
+                  } else {
+                      $v = Get-DhcpServerv4OptionValue -ScopeId $Scope -OptionId $id -ErrorAction SilentlyContinue
+                  }
+                  $vals = if ($v) { @($v.Value) } else { @() }
+                  $parts += "$id=[$(($vals) -join ',')]"
               }
-              if (-not $v) { return @() }
-              return @($v.Value)
+              return ($parts -join ';')
           }
 
-          $local         = Get-Opt6 -Computer ''       -Scope $ScopeId   # local = ACTIVE copy (source of truth)
-          $partnerBefore = Get-Opt6 -Computer $partner -Scope $ScopeId   # partner = STANDBY copy (second hop)
+          $local         = Get-OptSig -Computer ''       -Scope $ScopeId   # local = ACTIVE copy (source of truth)
+          $partnerBefore = Get-OptSig -Computer $partner -Scope $ScopeId   # partner = STANDBY copy (second hop)
 
-          if ((($local) -join ',') -eq (($partnerBefore) -join ',')) {
+          if ($local -eq $partnerBefore) {
               $Ansible.Changed = $false
-              $Ansible.Result  = @{ Action = 'in-sync'; ScopeId = $ScopeId; Relationship = "$($rel.Name)"; Partner = $partner; Option6 = $local }
+              $Ansible.Result  = @{ Action = 'in-sync'; ScopeId = $ScopeId; Relationship = "$($rel.Name)"; Partner = $partner; Options = $local }
               return
           }
 
@@ -102,15 +111,15 @@
           # Post-write verify. The config push is synchronous, but the partner read-back timing is
           # not contractually documented -> confirm with a short bounded retry, not a single read
           # (avoids a spurious whole-run abort on any sub-second settle).
-          $partnerAfter = @()
+          $partnerAfter = ''
           $match = $false
           foreach ($attempt in 1..3) {
-              $partnerAfter = Get-Opt6 -Computer $partner -Scope $ScopeId
-              if ((($local) -join ',') -eq (($partnerAfter) -join ',')) { $match = $true; break }
+              $partnerAfter = Get-OptSig -Computer $partner -Scope $ScopeId
+              if ($local -eq $partnerAfter) { $match = $true; break }
               Start-Sleep -Milliseconds 500
           }
           if (-not $match) {
-              throw "Scope $ScopeId replicated but partner opt-006 differs after 3 reads: local=$(($local) -join ',') partner=$(($partnerAfter) -join ',')"
+              throw "Scope $ScopeId replicated but partner options differ after 3 reads: local=$local partner=$partnerAfter"
           }
           $Ansible.Changed = $true
           $Ansible.Result  = @{
@@ -118,7 +127,7 @@
               ScopeId       = $ScopeId
               Relationship  = "$($rel.Name)"
               Partner       = $partner
-              Option6       = $local
+              Options       = $local
               PartnerBefore = $partnerBefore
               PartnerAfter  = $partnerAfter
               ReplReported  = $replReported

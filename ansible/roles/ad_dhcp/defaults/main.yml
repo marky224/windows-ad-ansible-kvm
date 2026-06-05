@@ -55,6 +55,32 @@ ad_dhcp_scope_options:
   ntp_servers:
     - "{{ corp_subnet.dc_ip }}"
 
+# --- Phase 6 SM9 (ADR-058 amendment): classless static routes (DHCP option 121) ---
+# HQ clients' default gateway is the HOST (corp_subnet.gateway, 10.10.0.1), which deliberately
+# does NOT route into the ISOLATED branch net — so without an explicit route they cannot reach
+# ADDC02 (the cross-site DNS/auth failover target, option 006 alternate per ADR-056). The SM9
+# live DR drill PROVED this gap: an HQ client couldn't reach ADDC02 on ANY port — `tracert` died
+# at hop 1 ("10.10.0.1 reports: Destination protocol unreachable"). Resolver order was correct;
+# it just had nowhere to route. This hands HQ clients the branch route via the VyOS HQ leg
+# (vyos.hq_ip, 10.10.0.2) — the same next-hop ADDC01 itself uses (12-configure-vyos.yml).
+#
+# ⚠ RFC 3442: a client that receives option 121 MUST IGNORE option 003 (Router), so the DEFAULT
+# route is listed FIRST here — omitting it would strip the client's gateway/internet. Set at SCOPE
+# level so it rides DHCP failover replication to the standby (ADR-056). Option **121 only** — NOT the
+# legacy Microsoft twin option 249: Win11 honours 121, and Win11 24H2 turned STRICT on DHCP option
+# types (a wrongly-typed option → the client fails DHCP / lands on APIPA), so we ride Windows'
+# PREDEFINED, correctly-typed `BinaryData` option 121 and avoid adding a second custom option that
+# buys nothing on a Win11-only fleet. Each route encodes per RFC 3442 as [prefix byte][significant
+# network octets = ceil(prefix/8)][4 gateway octets] — done in tasks/main.yml. Branch clients need
+# NONE (their default gateway already IS VyOS) → the dc_replica group overrides this to [].
+ad_dhcp_classless_static_routes:
+  - network: "0.0.0.0"                                   # default route — RFC 3442 requires it when 121 is present
+    prefix: 0
+    gateway: "{{ corp_subnet.gateway }}"                 # → host (NAT / internet), unchanged
+  - network: "{{ branch_subnet.cidr.split('/')[0] }}"    # 10.20.0.0 — the isolated branch subnet
+    prefix: "{{ branch_subnet.cidr.split('/')[1] | int }}"
+    gateway: "{{ vyos.hq_ip }}"                          # → VyOS HQ leg (10.10.0.2), routes across to ADDC02
+
 # Reservation source. Defaults compose the two existing group_vars dicts
 # (client_dhcp_reservations from clients.yml, linux_client_dhcp_reservations
 # from linux_clients.yml) into one dict keyed by hostname. The role looks

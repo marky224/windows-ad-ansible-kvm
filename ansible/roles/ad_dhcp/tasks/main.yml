@@ -255,6 +255,109 @@
       $Ansible.Result = @{ Changed = $changed }
   register: r_dhcp_options
 
+# --- Phase 6 SM9 (ADR-058): classless static routes (DHCP option 121) ---
+# Push the cross-site branch route to clients via DHCP. WHY this is needed + the RFC 3442
+# default-gateway-suppression caveat: see ad_dhcp_classless_static_routes in defaults/main.yml.
+# Option 121 is PREDEFINED on Windows DHCP as BinaryData (we only Add it as a fallback). Value goes
+# IN as decimal byte strings; it reads BACK as 0xHH hex strings (verified live) — so the idempotency
+# compare normalizes both to integers. Empty route list (branch scope, dc_replica) → ensure no value
+# is set (no-op there). Option 121 ONLY — not the legacy 249 (24H2 option-type strictness; see below).
+- name: "Set classless static routes (option 121) — {{ ad_dhcp_classless_static_routes | default([]) | length }} route(s)"
+  ansible.windows.win_powershell:
+    parameters:
+      ScopeId: "{{ ad_dhcp_scope_id }}"
+      Routes: "{{ ad_dhcp_classless_static_routes | default([]) }}"
+    script: |
+      param(
+          [string]$ScopeId,
+          [hashtable[]]$Routes
+      )
+      $ErrorActionPreference = 'Stop'
+
+      # Build the RFC 3442 binary blob: per route [mask-width byte][ceil(prefix/8) significant net
+      # octets][4 gateway octets]; a /0 default route contributes zero network octets. Built INLINE
+      # into one List[int] on purpose — a helper that returns an array gets nested under the caller's
+      # @(...) (PowerShell array-return quirk), which corrupts the blob and makes Windows reject
+      # option 121 as malformed. Goes to Set-DhcpServerv4OptionValue as decimal byte strings (the
+      # accepted input form for this single-valued BinaryData option; reads back as 0xHH).
+      $desiredList = New-Object System.Collections.Generic.List[int]
+      foreach ($r in $Routes) {
+          $prefix = [int]$r.prefix
+          $sig    = [int][Math]::Ceiling($prefix / 8.0)
+          [void]$desiredList.Add($prefix)
+          $net = @("$($r.network)" -split '\.' | ForEach-Object { [int]$_ })
+          for ($i = 0; $i -lt $sig; $i++) { [void]$desiredList.Add($net[$i]) }
+          foreach ($g in ("$($r.gateway)" -split '\.')) { [void]$desiredList.Add([int]$g) }
+      }
+      $desired    = $desiredList.ToArray()
+      $desiredStr = @($desired | ForEach-Object { "$_" })   # decimal byte strings = the INPUT format
+
+      # Normalize a read-back option value (elements come back as "0xHH") to a plain int array.
+      function ConvertTo-IntList {
+          param($vals)
+          $list = New-Object System.Collections.Generic.List[int]
+          foreach ($v in @($vals)) {
+              if ($null -eq $v) { continue }
+              $s = ("$v").Trim()
+              if ($s -eq '') { continue }
+              if     ($s -match '^0[xX]')   { [void]$list.Add([Convert]::ToInt32($s.Substring(2), 16)) }
+              elseif ($s -match '[A-Fa-f]') { [void]$list.Add([Convert]::ToInt32($s, 16)) }
+              else                          { [void]$list.Add([int]$s) }
+          }
+          return $list.ToArray()
+      }
+      $changed  = @()
+      $verified = @{}
+      $optId    = 121      # option 121 ONLY — see the 24H2 note below; no legacy option 249.
+
+      $curVal = (Get-DhcpServerv4OptionValue -ScopeId $ScopeId -OptionId $optId -ErrorAction SilentlyContinue).Value
+
+      if ($desired.Count -eq 0) {
+          # Branch scope (or any scope with no routes desired): ensure no stale value remains.
+          if ($curVal) {
+              Remove-DhcpServerv4OptionValue -ScopeId $ScopeId -OptionId $optId -ErrorAction SilentlyContinue
+              $changed += "clear-$optId"
+          }
+      } else {
+          # Option 121 is PREDEFINED on Windows DHCP as type BinaryData — the RFC-compliant type.
+          # Windows 11 24H2 got STRICT about DHCP option types: a wrongly-typed option makes the
+          # client fail DHCP outright (APIPA, no lease). So we rely on the predefined BinaryData
+          # definition (recreating it as BinaryData only on the off chance a build lacks it) and do
+          # NOT add the legacy Microsoft option 249 — there are no down-level clients (Win11 honours
+          # 121), and a second custom option is just another 24H2 type-mismatch hazard for no gain.
+          if (-not (Get-DhcpServerv4OptionDefinition -OptionId $optId -ErrorAction SilentlyContinue)) {
+              Add-DhcpServerv4OptionDefinition -OptionId $optId -Name 'Classless Static Routes' -Type BinaryData `
+                  -Description 'RFC 3442 classless static routes (SM9 cross-site reachability)' -ErrorAction Stop | Out-Null
+              $changed += "define-$optId"
+          }
+
+          $cur = @(ConvertTo-IntList $curVal)
+          if ((@($cur) -join ',') -ne (@($desired) -join ',')) {
+              Set-DhcpServerv4OptionValue -ScopeId $ScopeId -OptionId $optId -Value $desiredStr -Force -ErrorAction Stop
+              $changed += "set-$optId"
+          }
+
+          # Post-write verify — read it back and confirm the exact desired bytes landed.
+          $after = @(ConvertTo-IntList (Get-DhcpServerv4OptionValue -ScopeId $ScopeId -OptionId $optId -ErrorAction Stop).Value)
+          if ((@($after) -join ',') -ne (@($desired) -join ',')) {
+              throw "Option $optId on scope $ScopeId is [$(@($after) -join ',')], expected [$(@($desired) -join ',')]."
+          }
+          $verified["Opt$optId"] = (@($after) -join ',')
+      }
+
+      $Ansible.Changed = ($changed.Count -gt 0)
+      $Ansible.Result  = @{
+          Changed      = $changed
+          RouteCount   = @($Routes).Count
+          DesiredBytes = (@($desired) -join ',')
+          Verified     = $verified
+      }
+  register: r_dhcp_classless_routes
+
+- name: "Show classless static routes (option 121) state"
+  ansible.builtin.debug:
+    var: r_dhcp_classless_routes.result
+
 - name: "Apply MAC-tied reservations ({{ ad_dhcp_reservations | length }} entries)"
   ansible.windows.win_powershell:
     parameters:
