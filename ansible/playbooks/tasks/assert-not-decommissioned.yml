@@ -1,0 +1,27 @@
+---
+# Decommission gate. Imported by every playbook that PROVISIONS infrastructure or
+# rebuilds staged install media (00/01/05/07/10/11, slipstream-iso + site.yml
+# preflight), so a stray run cannot silently rebuild a lab that was torn down on
+# purpose. Config-only playbooks are deliberately NOT gated: with no VMs defined they
+# simply fail to connect, which is already a safe outcome. fire-drill.yml is not
+# gated either: its isolated sandbox always tears itself down.
+#
+# Off by default (group_vars/all/main.yml: lab_decommissioned: false). To turn it on
+# for one host, set this in the gitignored inventory/host_vars/localhost.yml:
+#     lab_decommissioned: true
+# To rebuild deliberately, remove that line (or set it to false), or override it for
+# a single run:
+#     ansible-playbook playbooks/site.yml -e lab_decommissioned=false
+
+- name: "guard | refuse to provision while the lab is decommissioned"
+  ansible.builtin.assert:
+    that:
+      - "not (lab_decommissioned | default(false) | bool)"
+    fail_msg: >-
+      🛑 REFUSING — lab_decommissioned is true, so provisioning is blocked and a
+      stray run cannot rebuild a torn-down lab unattended. To rebuild: remove
+      `lab_decommissioned: true` from inventory/host_vars/localhost.yml (where it
+      is normally set), or pass -e lab_decommissioned=false.
+    success_msg: "✅ GUARD pass: lab_decommissioned is false — provisioning allowed."
+    quiet: true
+  become: false

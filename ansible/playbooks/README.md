@@ -35,4 +35,9 @@ Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution o
 | `teardown.yml` | Destroy `*-corp` VMs + their live disks; preview unless `-e confirm=DESTROY`; preserves `/mnt/dc-backups` + `.<label>` snapshots (`ops_teardown`, ADR-048) |
 | `site.yml` | Orchestrator for the **base lab**: static-imports `00 → 08` + `99-smoke-test` (NOT the Phase 6 `09→17` — those have interactive + one-shot steps); fail-fast preflight + phase tags (`network`/`dc`/`services`/`advanced`/`clients`/`linux`/`smoke`) (ADR-049/050) |
 
-Shared task files live in `tasks/` — `smoke-dc.yml` (the "healthy DC" checks reused by both `99-smoke-test.yml` and `fire-drill.yml`) and `verify-multisite.yml` (the "healthy two-site topology" checks driven by `verify-multisite.yml`). Both are read-only (`changed_when: false`).
+Shared task files live in `tasks/`:
+
+- `smoke-dc.yml`: the "healthy DC" checks reused by both `99-smoke-test.yml` and `fire-drill.yml`. Read-only (`changed_when: false`).
+- `verify-multisite.yml`: the "healthy two-site topology" checks driven by `verify-multisite.yml`. Read-only (`changed_when: false`).
+- `firedrill-backup-checks.yml` and `firedrill-seize.yml`: `fire-drill.yml`'s backup-media check and FSMO-seize rehearsal, run only against the isolated sandbox.
+- `assert-not-decommissioned.yml`: the decommission gate, imported first by every provisioning playbook (`00`/`01`/`05`/`07`/`10`/`11`, `slipstream-iso.yml` and `site.yml`'s preflight). Off by default; set `lab_decommissioned: true` in the gitignored `inventory/host_vars/localhost.yml` to make those playbooks refuse on that host, or pass `-e lab_decommissioned=false` to override it for one run.

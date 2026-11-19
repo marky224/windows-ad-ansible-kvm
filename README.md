@@ -152,8 +152,9 @@ DNS resilience for a WAN-separated, one-DC-per-site topology.
 
 **IaC & automation.** ~25 Ansible roles and playbooks with strict idempotency (two-run gates), Windows
 configuration via inline `win_powershell` where no native module exists, `ansible-vault` from day one, a
-`site.yml` orchestrator with fail-fast (`any_errors_fatal`), and CI guardrails (`ansible-lint` +
-`gitleaks`).
+`site.yml` orchestrator with fail-fast (`any_errors_fatal`), a per-host decommission gate that makes every
+provisioning playbook refuse once a host sets `lab_decommissioned: true`, and CI guardrails
+(`ansible-lint` + `gitleaks`).
 
 **Virtualization.** KVM/libvirt with q35 / UEFI Secure Boot / TPM 2.0, unattended Windows Server 2025
 and Windows 11 installs from slipstreamed media, and snapshot / backup / fire-drill / teardown tooling.

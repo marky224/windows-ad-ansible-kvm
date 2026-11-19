@@ -54,5 +54,8 @@
     ansible_user: Administrator
     ansible_password: "{{ vault_dc_admin_password }}"
 
+  pre_tasks:
+    - ansible.builtin.import_tasks: tasks/assert-not-decommissioned.yml
+
   roles:
     - kvm_iso_slipstream

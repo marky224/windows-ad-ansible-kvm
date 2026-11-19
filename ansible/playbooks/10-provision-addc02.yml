@@ -54,5 +54,8 @@
     # unattended install + Windows Setup's natural reboots + bootstrap, not just a
     # post-eject window. 40 min gives comfortable margin over the ~16-20 min reality.
     vm_winrm_timeout: 2400
+  pre_tasks:
+    - ansible.builtin.import_tasks: tasks/assert-not-decommissioned.yml
+
   roles:
     - kvm_windows_vm

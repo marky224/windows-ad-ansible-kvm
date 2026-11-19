@@ -77,6 +77,8 @@
   gather_facts: false
   tags: always
   tasks:
+    - ansible.builtin.import_tasks: tasks/assert-not-decommissioned.yml
+
     - name: "preflight | HOST-SAFETY assert -- host-side plays run on the control host only"
       ansible.builtin.assert:
         that:

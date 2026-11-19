@@ -47,6 +47,9 @@
     # "Win 11 doesn't need the eject" call was wrong — it was a lucky race.
     # Allow up to 60 min for WinRM (several OOBE reboots).
     vm_winrm_timeout: 3600
+  pre_tasks:
+    - ansible.builtin.import_tasks: tasks/assert-not-decommissioned.yml
+
   tasks:
     - name: "Build each Win 11 client via kvm_windows_vm"
       ansible.builtin.include_role:
