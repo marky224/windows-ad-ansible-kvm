@@ -31,5 +31,8 @@
     # Secure Boot enabled. OVMF_VARS_4M.ms.fd has pre-enrolled MS keys
     # (verified 2026-05-26 via virt-fw-vars -p).
     vm_secure_boot: true
+  pre_tasks:
+    - ansible.builtin.import_tasks: tasks/assert-not-decommissioned.yml
+
   roles:
     - kvm_windows_vm

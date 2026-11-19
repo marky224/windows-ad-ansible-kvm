@@ -17,5 +17,8 @@
   gather_facts: false
   vars:
     vm_name: "{{ vyos.hostname }}"   # VYOS01 — the libvirt domain name
+  pre_tasks:
+    - ansible.builtin.import_tasks: tasks/assert-not-decommissioned.yml
+
   roles:
     - net_router_vyos

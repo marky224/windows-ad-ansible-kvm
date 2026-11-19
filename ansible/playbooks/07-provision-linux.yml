@@ -14,6 +14,9 @@
   any_errors_fatal: true   # site.yml fail-fast: abort the whole run on any failure (ADR-050)
   vars:
     ubuntu_vm: UBUNTU01-corp
+  pre_tasks:
+    - ansible.builtin.import_tasks: tasks/assert-not-decommissioned.yml
+
   tasks:
     - name: "Build UBUNTU01 via kvm_linux_vm"
       ansible.builtin.include_role:

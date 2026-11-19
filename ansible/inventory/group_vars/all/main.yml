@@ -96,6 +96,15 @@ libvirt_pools:
   disks: corp-disks    # backed by {{ vm_lab_root }}/disks
   iso: corp-iso        # backed by {{ vm_lab_root }}/iso
 
+# --- Decommission gate ---
+# true => the provisioning playbooks (00/01/05/07/10/11, slipstream-iso + site.yml
+# preflight) REFUSE to run, via playbooks/tasks/assert-not-decommissioned.yml.
+# Off by default, so a fresh clone builds normally. To block provisioning on a host
+# whose lab was torn down on purpose, set lab_decommissioned: true in the gitignored
+# inventory/host_vars/localhost.yml (host_vars beat group_vars/all); pass
+# -e lab_decommissioned=false to override it for one deliberate rebuild.
+lab_decommissioned: false
+
 # --- Host paths (control node = same host as KVM hypervisor) ---
 # Default resolves to $HOME/vm-lab on the control node.
 # Override in inventory/host_vars/localhost.yml if a different layout is needed.

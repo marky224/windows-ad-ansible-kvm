@@ -14,3 +14,9 @@
 # (i.e. ~/vm-lab for whoever runs ansible-playbook).
 #
 # vm_lab_root: /srv/lab/kvm
+
+# Decommission gate (playbooks/tasks/assert-not-decommissioned.yml). Set true once
+# this host's lab has been torn down, so a stray provisioning run refuses instead of
+# rebuilding it; -e lab_decommissioned=false overrides it for one run.
+#
+# lab_decommissioned: true
