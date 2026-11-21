@@ -10,7 +10,7 @@ Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution o
 | `02-configure-dc.yml` | `ad_dc` (forest promotion) → `ad_admins` (named domain admin) → `ad_harden_builtin_admin` (RID 500) |
 | `03-configure-services.yml` | DC-resident services: `ad_dns` → `ad_dhcp` → `ad_ntp` |
 | `04-configure-services-advanced.yml` | Advanced services: `ad_cs` → `ad_gpo` → `ad_wsus` |
-| `05-provision-clients.yml` | Build CLIENT01/02 Win 11 VMs in parallel |
+| `05-provision-clients.yml` | Build CLIENT01/02 Win 11 VMs, one at a time |
 | `06-join-domain.yml` | Domain-join the Windows clients (`domain_join_windows`) |
 | `07-provision-linux.yml` | Build UBUNTU01 from cloud-img + cloud-init |
 | `08-join-linux.yml` | realmd / sssd / adcli on UBUNTU01 (`domain_join_linux`) |
@@ -33,7 +33,7 @@ Each playbook is named `NN-verb-noun.yml`; the numeric prefix is the execution o
 | `backup-ad.yml` | AD state backup to the dedicated drive (`ops_backup`, ADR-046) |
 | `fire-drill.yml` | Restore a snapshot/backup into an isolated sandbox, smoke-test, always tear down (`ops_firedrill`, ADR-047) |
 | `teardown.yml` | Destroy `*-corp` VMs + their live disks; preview unless `-e confirm=DESTROY`; preserves `/mnt/dc-backups` + `.<label>` snapshots (`ops_teardown`, ADR-048) |
-| `site.yml` | Orchestrator for the **base lab**: static-imports `00 → 08` + `99-smoke-test` (NOT the Phase 6 `09→17` — those have interactive + one-shot steps); fail-fast preflight + phase tags (`network`/`dc`/`services`/`advanced`/`clients`/`linux`/`smoke`) (ADR-049/050) |
+| `site.yml` | Orchestrator for the **base lab**: static-imports `00 → 08` + `99-smoke-test` (NOT the Phase 6 `09→18` — those have interactive + one-shot steps); fail-fast preflight + phase tags (`network`/`dc`/`services`/`advanced`/`clients`/`linux`/`smoke`) (ADR-049/050) |
 
 Shared task files live in `tasks/`:
 
